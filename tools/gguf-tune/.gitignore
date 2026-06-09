@@ -1,0 +1,5 @@
+# generated outputs — don't commit profiles to this repo
+profiles/*/
+!profiles/.gitkeep
+__pycache__/
+*.pyc

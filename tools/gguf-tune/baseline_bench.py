@@ -148,21 +148,30 @@ def bench_sgemm(hip, blas, handle, M: int, N: int, K: int) -> dict:
 
 def get_device_info(hip) -> dict:
     # hipGetDeviceProperties is complex to call via ctypes — use rocminfo instead
-    import subprocess
+    import subprocess, re
     rocminfo = ROCM_PATH / "bin" / "rocminfo"
+    env = {**os.environ, "LD_LIBRARY_PATH": str(ROCM_PATH / "lib")}
     try:
-        out = subprocess.check_output([str(rocminfo)], stderr=subprocess.DEVNULL, text=True)
-        name = ""
-        gfx  = ""
-        vram = ""
-        for line in out.splitlines():
-            if "Marketing Name" in line and not name:
-                name = line.split(":", 1)[1].strip()
-            if "Name:" in line and "gfx" in line:
-                gfx = line.split(":", 1)[1].strip()
-            if "Memory" in line and "Size" in line:
-                vram = line.split(":", 1)[1].strip()
-        return {"name": name, "gfx": gfx, "vram": vram}
+        out = subprocess.check_output(
+            [str(rocminfo)], stderr=subprocess.DEVNULL, text=True, env=env
+        )
+        # rocminfo lists CPU agents first, then GPU agents. Split by agent block
+        # and return info from the first block whose Name: field contains "gfx".
+        for agent in out.split("*******"):
+            gfx = name = vram = ""
+            for line in agent.splitlines():
+                line = line.strip()
+                if line.startswith("Name:") and "gfx" in line and not gfx:
+                    raw = line.split(":", 1)[1].strip()
+                    m = re.search(r"gfx\d+", raw)
+                    gfx = m.group(0) if m else raw
+                if "Marketing Name" in line:
+                    name = line.split(":", 1)[1].strip()
+                if "Memory" in line and "Size" in line:
+                    vram = line.split(":", 1)[1].strip()
+            if gfx:
+                return {"name": name, "gfx": gfx, "vram": vram}
+        return {}
     except Exception:
         return {}
 
@@ -229,6 +238,7 @@ def main():
 
     output = {
         "model": shape_data["model"],
+        "model_arch": shape_data.get("architecture", "unknown"),
         "device": device,
         "rocm_path": str(ROCM_PATH),
         "tuned": False,
