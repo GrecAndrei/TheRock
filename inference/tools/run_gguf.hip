@@ -451,8 +451,128 @@ kern_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
   }
 }
 
-// Single-query attention (decode): one wavefront per query head
-// Q: [n_heads * head_dim], K_cache: [seq_len * n_kv_heads * head_dim], same for V
+// Flash decoding with split-K: two-phase approach
+// Phase 1: N wavefronts per head, each processes a chunk of KV tokens → partial (m, l, o) to global
+// Phase 2: reduce across splits
+// This parallelizes the KV scan across wavefronts, letting the GPU overlap memory latency.
+
+static constexpr int ATTN_SPLIT_SIZE = 64; // tokens per split
+
+// Phase 1: each wavefront handles one head × one chunk of tokens
+// Grid: (n_q_heads, n_splits), Block: (32)
+// Output: split_buf[split][head][head_dim] (partial output), split_ml[split][head][2] (m, l)
+__global__ void __launch_bounds__(WAVE)
+kern_attn_split(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                uint32_t seq_len, float scale,
+                const __half * __restrict__ q,
+                const __half * __restrict__ k_cache,
+                const __half * __restrict__ v_cache,
+                float        * __restrict__ split_o,   // [n_splits × n_q_heads × head_dim]
+                float        * __restrict__ split_ml)  // [n_splits × n_q_heads × 2]
+{
+  int qh = blockIdx.x;
+  int split_id = blockIdx.y;
+  if (qh >= (int)n_q_heads) return;
+  int kvh = qh / (n_q_heads / n_kv_heads);
+  int tid = threadIdx.x;
+  uint32_t ept = head_dim / WAVE;
+
+  uint32_t t_start = split_id * ATTN_SPLIT_SIZE;
+  uint32_t t_end = min(t_start + ATTN_SPLIT_SIZE, seq_len);
+  if (t_start >= seq_len) {
+    // Empty split: write sentinel
+    if (tid == 0) {
+      uint32_t ml_idx = split_id * n_q_heads * 2 + qh * 2;
+      split_ml[ml_idx] = -1e9f;
+      split_ml[ml_idx + 1] = 0.0f;
+    }
+    return;
+  }
+
+  float q_reg[16];
+  for (uint32_t i = 0; i < ept; i++)
+    q_reg[i] = __half2float(q[qh * head_dim + tid * ept + i]);
+
+  float m = -1e9f, l = 0.0f;
+  float o[16] = {};
+
+  for (uint32_t t = t_start; t < t_end; t++) {
+    const __half *kt = k_cache + t * n_kv_heads * head_dim + kvh * head_dim;
+    const __half *vt = v_cache + t * n_kv_heads * head_dim + kvh * head_dim;
+
+    float dot = 0.0f;
+    for (uint32_t i = 0; i < ept; i++)
+      dot += q_reg[i] * __half2float(kt[tid * ept + i]);
+    dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+    dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+
+    float s_val = dot * scale;
+    float m_new = fmaxf(m, s_val);
+    float exp_shift = expf(m - m_new);
+    float exp_s = expf(s_val - m_new);
+    l = exp_shift * l + exp_s;
+    for (uint32_t i = 0; i < ept; i++) {
+      float vi = __half2float(vt[tid * ept + i]);
+      o[i] = exp_shift * o[i] + exp_s * vi;
+    }
+    m = m_new;
+  }
+
+  // Write partial results to global memory
+  uint32_t o_base = (split_id * n_q_heads + qh) * head_dim + tid * ept;
+  for (uint32_t i = 0; i < ept; i++)
+    split_o[o_base + i] = o[i];
+
+  if (tid == 0) {
+    uint32_t ml_idx = split_id * n_q_heads * 2 + qh * 2;
+    split_ml[ml_idx] = m;
+    split_ml[ml_idx + 1] = l;
+  }
+}
+
+// Phase 2: reduce across splits. One wavefront per head.
+// Grid: (n_q_heads), Block: (32)
+__global__ void __launch_bounds__(WAVE)
+kern_attn_reduce(uint32_t n_q_heads, uint32_t head_dim, uint32_t n_splits,
+                 const float * __restrict__ split_o,
+                 const float * __restrict__ split_ml,
+                 __half      * __restrict__ out) {
+  int qh = blockIdx.x;
+  if (qh >= (int)n_q_heads) return;
+  int tid = threadIdx.x;
+  uint32_t ept = head_dim / WAVE;
+
+  // Find global max across all splits
+  float global_m = -1e9f;
+  for (uint32_t s = 0; s < n_splits; s++) {
+    float sm = split_ml[s * n_q_heads * 2 + qh * 2];
+    global_m = fmaxf(global_m, sm);
+  }
+  // Broadcast global_m from lane 0 (all lanes should have same value since split_ml is per-head)
+
+  // Compute global_l and accumulate corrected outputs
+  float global_l = 0.0f;
+  float o[16] = {};
+
+  for (uint32_t s = 0; s < n_splits; s++) {
+    float sm = split_ml[s * n_q_heads * 2 + qh * 2];
+    float sl = split_ml[s * n_q_heads * 2 + qh * 2 + 1];
+    if (sl <= 0.0f) continue; // empty split
+
+    float corr = expf(sm - global_m);
+    global_l += corr * sl;
+
+    uint32_t o_base = (s * n_q_heads + qh) * head_dim + tid * ept;
+    for (uint32_t i = 0; i < ept; i++)
+      o[i] += corr * split_o[o_base + i];
+  }
+
+  float l_inv = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
+  for (uint32_t i = 0; i < ept; i++)
+    out[qh * head_dim + tid * ept + i] = __float2half(o[i] * l_inv);
+}
+
+// Original single-wave attention (used when seq_len is short enough)
 __global__ void __launch_bounds__(WAVE)
 kern_attn_decode(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
                  uint32_t seq_len, float scale,
@@ -465,7 +585,6 @@ kern_attn_decode(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
   int kvh = qh / (n_q_heads / n_kv_heads);
   int tid = threadIdx.x;
 
-  const int EPT = 16; // elements per thread (head_dim / WAVE for head_dim up to 512)
   float q_reg[16];
   for (int i = 0; i < (int)head_dim / WAVE; i++)
     q_reg[i] = __half2float(q[qh * head_dim + tid * (head_dim / WAVE) + i]);
@@ -1235,6 +1354,10 @@ struct Model {
   __half **kv_k; // per-layer K cache
   __half **kv_v; // per-layer V cache
   uint32_t max_seq;
+
+  // Split attention scratch buffers
+  float *attn_split_o;   // [max_splits × max_q_heads × max_head_dim]
+  float *attn_split_ml;  // [max_splits × max_q_heads × 2]
 };
 
 // ============================================================================
@@ -1479,8 +1602,43 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     total_gpu_bytes += (swa_size + global_size) * 2 * sizeof(float);
   }
 
+  // Split attention scratch: max_splits = max_seq / ATTN_SPLIT_SIZE + 1
+  {
+    uint32_t max_splits = (model->max_seq + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
+    uint32_t max_q_heads = 16;
+    uint32_t max_head_dim = 512;
+    size_t split_o_bytes = (size_t)max_splits * max_q_heads * max_head_dim * sizeof(float);
+    size_t split_ml_bytes = (size_t)max_splits * max_q_heads * 2 * sizeof(float);
+    HIP_CHECK(hipMalloc(&model->attn_split_o, split_o_bytes));
+    HIP_CHECK(hipMalloc(&model->attn_split_ml, split_ml_bytes));
+    total_gpu_bytes += split_o_bytes + split_ml_bytes;
+  }
+
   printf("Total GPU memory: %.2f GB\n", total_gpu_bytes / 1e9);
   return true;
+}
+
+// Dispatch attention: uses split-K for long sequences, single wave for short
+static constexpr uint32_t ATTN_SPLIT_THRESHOLD = 64;
+
+static void dispatch_attention(hipStream_t s, Model *model,
+                               uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                               uint32_t seq_len, float scale,
+                               const __half *q, const __half *k_cache, const __half *v_cache,
+                               __half *out) {
+  if (seq_len <= ATTN_SPLIT_THRESHOLD) {
+    hipLaunchKernelGGL(kern_attn_decode, dim3(n_q_heads), dim3(WAVE), 0, s,
+                       n_q_heads, n_kv_heads, head_dim, seq_len, scale,
+                       q, k_cache, v_cache, out);
+  } else {
+    uint32_t n_splits = (seq_len + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
+    hipLaunchKernelGGL(kern_attn_split, dim3(n_q_heads, n_splits), dim3(WAVE), 0, s,
+                       n_q_heads, n_kv_heads, head_dim, seq_len, scale,
+                       q, k_cache, v_cache, model->attn_split_o, model->attn_split_ml);
+    hipLaunchKernelGGL(kern_attn_reduce, dim3(n_q_heads), dim3(WAVE), 0, s,
+                       n_q_heads, head_dim, n_splits,
+                       model->attn_split_o, model->attn_split_ml, out);
+  }
 }
 
 // ============================================================================
@@ -1574,15 +1732,11 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
                                hipMemcpyDeviceToDevice, s));
     }
 
-    // 6. Attention
+    // 6. Attention (split-K for long context)
     uint32_t seq_len = pos + 1;
-    hipLaunchKernelGGL(kern_attn_decode, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
-                       lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                       seq_len, 1.0f,
-                       state->scratch_q,
-                       model->kv_k[l],
-                       model->kv_v[l],
-                       state->scratch_attn);
+    dispatch_attention(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                       seq_len, 1.0f, state->scratch_q,
+                       model->kv_k[l], model->kv_v[l], state->scratch_attn);
 
     // 7. Output projection
     hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
@@ -1590,7 +1744,6 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
                        state->scratch_attn, (const Q4_0Block*)lw.wo, state->residual);
 
     // 8. FUSED: post-attn-norm + residual add (+ layer scale folded in at end)
-    //    hidden = (hidden + rmsnorm(residual)) * 1.0  (scale applied at end of layer)
     hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
                        HIDDEN, state->hidden, state->residual, lw.post_attn_norm, EPS, 1.0f);
 
@@ -1749,12 +1902,9 @@ static void forward_prefill_batch(Model *model, RunState *state,
 
       // Attention (causal: token t sees positions 0..pos+t)
       uint32_t seq_len = pos + 1;
-      hipLaunchKernelGGL(kern_attn_decode, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
-                         lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                         seq_len, 1.0f,
-                         state->batch_q + t * lw.q_dim,
-                         model->kv_k[l], model->kv_v[l],
-                         state->scratch_attn);
+      dispatch_attention(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                         seq_len, 1.0f, state->batch_q + t * lw.q_dim,
+                         model->kv_k[l], model->kv_v[l], state->scratch_attn);
 
       // Output projection for this token: [1 × q_dim] × [HIDDEN × q_dim]^T → [1 × HIDDEN]
       hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
@@ -2035,8 +2185,7 @@ int main(int argc, char **argv) {
       }
 
       uint32_t seq_len = pos + 1;
-      hipLaunchKernelGGL(kern_attn_decode, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
-                         lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+      dispatch_attention(s, &model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                          seq_len, 1.0f, state.scratch_q,
                          model.kv_k[l], model.kv_v[l], state.scratch_attn);
 
