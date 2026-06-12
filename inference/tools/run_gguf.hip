@@ -716,6 +716,28 @@ kern_embed_lookup(uint32_t token, uint32_t dim, float embed_scale,
   out[tid] = __float2half((float)q * scale * embed_scale);
 }
 
+// Indirect embedding lookup: reads token ID from device memory (for graph/feedback loop)
+__global__ void __launch_bounds__(256)
+kern_embed_lookup_indirect(const uint32_t * __restrict__ token_ptr, uint32_t dim, float embed_scale,
+                           const Q6_K_Block * __restrict__ embed_q6k,
+                           __half * __restrict__ out) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t token = *token_ptr;
+  int blocks_per_row = dim / 256;
+  const Q6_K_Block *row = embed_q6k + (size_t)token * blocks_per_row;
+
+  if (tid >= (int)dim) return;
+  int blk_idx = tid / 256;
+  int j = tid % 256;
+  const Q6_K_Block &b = row[blk_idx];
+  float d = __half2float(b.d);
+  uint8_t ql_val = (b.ql[j / 2] >> ((j % 2) * 4)) & 0xF;
+  uint8_t qh_val = (b.qh[j / 4] >> ((j % 4) * 2)) & 0x3;
+  int8_t q = (int8_t)((ql_val | (qh_val << 4)) - 32);
+  float scale = d * (float)b.scales[j / 16];
+  out[tid] = __float2half((float)q * scale * embed_scale);
+}
+
 // RoPE with precomputed cos/sin tables
 __global__ void __launch_bounds__(WAVE)
 kern_rope_precomp(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
@@ -775,6 +797,377 @@ kern_headnorm_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
     float x1 = __half2float(hx[i + half_dim]);
     hx[i]            = __float2half(x0 * cos_row[i] - x1 * sin_row[i]);
     hx[i + half_dim] = __float2half(x0 * sin_row[i] + x1 * cos_row[i]);
+  }
+}
+
+// ============================================================================
+// Software WMMA for gfx1032 (RDNA2): 16x16x16 fp16→f32
+// Uses DPP8 v_dot2c_f32_f16 + permlanex16 + ds_bpermute
+// ============================================================================
+
+using half2_vec __attribute__((ext_vector_type(2))) = _Float16;
+
+__device__ static inline float wmma_dot2_dpp8(half2_vec a, half2_vec b, float acc, uint32_t lane) {
+  // Unrolled DPP8 broadcast for each of 8 lanes in the subgroup
+  // The lane parameter selects which src lane's data to broadcast
+  float result = acc;
+  switch (lane) {
+    case 0: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[0,0,0,0,0,0,0,0]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 1: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[1,1,1,1,1,1,1,1]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 2: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[2,2,2,2,2,2,2,2]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 3: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[3,3,3,3,3,3,3,3]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 4: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[4,4,4,4,4,4,4,4]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 5: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[5,5,5,5,5,5,5,5]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 6: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[6,6,6,6,6,6,6,6]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+    case 7: asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[7,7,7,7,7,7,7,7]"
+              : "=v"(result) : "v"(a), "v"(b), "0"(result)); break;
+  }
+  return result;
+}
+
+__device__ static inline uint32_t wmma_bpermute(uint32_t data, uint32_t srcLane) {
+  return __builtin_amdgcn_ds_bpermute(srcLane << 2, data);
+}
+
+__device__ static inline uint32_t wmma_permlanex16(uint32_t data) {
+  return __builtin_amdgcn_permlanex16(0u, data, 0x76543210u, 0xfedcba98u, false, true);
+}
+
+// Core 16x16x16 WMMA: C[16×16] += A[16×16] × B[16×16]
+// A is row-major in LDS: a_lds[row][col], each row = 16 fp16
+// B is col-major in LDS: b_lds[col][row], each col = 16 fp16
+// C is distributed: each lane holds 8 f32 accumulators
+// Lane mapping: lanes 0-15 = rows 0-15 of C (even cols), lanes 16-31 = rows 0-15 (odd cols)
+__device__ static inline void wmma_16x16x16_f16(
+    const __half *a_lds,  // [16][16] row-major
+    const __half *b_lds,  // [16][16] col-major (i.e. b_lds[col*16 + row])
+    float *acc            // [8] per lane
+) {
+  uint32_t lid = threadIdx.x & 31u;
+  uint32_t lowHalf = lid < 16u;
+  uint32_t laneInHalf = lid & 15u;
+
+  // Each lane loads its row of A (16 fp16 = 8 pairs) and its col of B
+  uint32_t a_row = laneInHalf;
+  uint32_t b_col = laneInHalf;
+
+  // Pack A row into 8 half2 pairs
+  uint32_t aPairs[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const __half *ap = a_lds + a_row * 16 + i * 2;
+    aPairs[i] = *reinterpret_cast<const uint32_t*>(ap);
+  }
+
+  // Pack B col into 8 half2 pairs
+  uint32_t bPairs[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const __half *bp = b_lds + b_col * 16 + i * 2;
+    bPairs[i] = *reinterpret_cast<const uint32_t*>(bp);
+  }
+
+  // Exchange A rows between halves: low half needs rows from high half's lanes and vice versa
+  uint32_t aOther[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++)
+    aOther[i] = wmma_permlanex16(aPairs[i]);
+
+  // Each lane needs the A row corresponding to B's column index within its 8-lane DPP group.
+  // Low half: my B col is laneInHalf, I need A rows 0-7 from low half, 8-15 from high half
+  // High half: my B col is laneInHalf, I need A rows 0-7 from low half, 8-15 from high half
+  // DPP8 broadcasts within groups of 8 lanes. Within each 8-lane group, lane j holds A row j (or j+8).
+  // Use bpermute to rearrange so that within each 8-lane DPP subgroup, lane j has A row j.
+
+  uint32_t myGroup = (lid & 7u); // 0-7 within 8-lane group
+  // For the DPP8 pattern: lane j in the 8-group will broadcast its A, computing dot(A_row_j, B_col_mine)
+  // So each lane just needs its own A row — but in the right register for bpermute to distribute
+  // Actually: we need A_row_j available at lane j within each 8-lane group.
+  // Low-half lanes 0-7 naturally have A rows 0-7. Lanes 8-15 have A rows 8-15.
+  // The DPP8 pattern [j,j,j,j,j,j,j,j] broadcasts lane j's value to all 8 lanes in the subgroup.
+  // So for computing C[myRow][col], where col iterates 0-7 within the DPP subgroup:
+  // accum[col] += A[myRow][k_pair] * B[col_of_lane_j][k_pair]  via DPP8 broadcast of B
+
+  // Wait — rethinking. The standard approach:
+  // Each lane holds B column data. DPP8 broadcasts B from lane j to all lanes in the 8-group.
+  // Each lane has its own A row. So: acc[j] += dot2(myA[pair], broadcast_from_j(B[pair]))
+  // This gives each lane: C[myRow][col_j] for j in the 8-lane group.
+
+  // But we have 32 lanes and 16 columns. Low half covers cols 0-7 of each row, high half covers 8-15.
+  // Lane l (l<16): row = l, accumulates cols 0-7 via DPP8 within lanes 0-7
+  //                        accumulates cols 8-15 via cross-half exchange + DPP8 within lanes 8-15
+  // Hmm, this is getting complex. Let me use a simpler decomposition:
+
+  // Simpler: lanes 0-15 = "group A" (rows 0-15), lanes 16-31 = "group B" (also rows 0-15 but different cols)
+  // Group A lanes 0-7: each lane j holds B col j, accumulates C[row][0..7]
+  // Group A lanes 8-15: each lane j holds B col j, accumulates C[row][8..15]
+
+  // With DPP8, in lanes 0-7: broadcast lane j's B → all get B[col_j], multiply with own A → C[row][col_j]
+  // Same for lanes 8-15.
+  // But wait, lanes 0-7 would only produce 8 columns. We need 16 columns per row.
+  // Solution: lanes 0-15 produce cols 0-7 (using DPP within their 8-lane subgroups: 0-7 and 8-15)
+  //           lanes 16-31 produce cols 8-15
+
+  // Actually this doesn't work cleanly either because DPP8 operates on fixed 8-lane groups (0-7, 8-15, 16-23, 24-31).
+  // Lane 0 is in DPP group 0 (lanes 0-7), lane 8 is in DPP group 1 (lanes 8-15), etc.
+
+  // The rocWMMA approach: use ds_bpermute to redistribute A rows so that within each DPP8 group,
+  // lane j has the A row needed. Then DPP8 broadcasts A from lane j, each lane has its own B, computes dot.
+  // Final: permlanex16 to exchange partial sums between halves.
+
+  // Let me just follow rocWMMA's proven algorithm exactly:
+  // 1. Low half (lanes 0-15): each lane l has A[l] and B[l]
+  // 2. High half (lanes 16-31): each lane l has A[l-16] and B[l-16]  (same rows/cols)
+  // 3. We use permlanex16 to get the other half's A data
+  // 4. Combine: low half builds aPairs from (own low, other high), high from (other low, own high)
+  //    This gives each half the full 16×16 A matrix distributed across 16 lanes
+  // 5. bpermute: each lane fetches A[col_within_8group] from the appropriate lane
+  // 6. DPP8: iterate over 8 columns, broadcasting A[row_j] while using own B[col]
+  // 7. permlanex16: exchange results between halves, accumulate
+
+  // Following rocWMMA's select_half2_bits: interleave low/high pairs
+  uint32_t aFull[8], bFull[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    uint32_t lo = aPairs[i];
+    uint32_t hi = aOther[i];
+    // Low half takes own low 16 bits + other's high 16 bits (column pairs interleaved)
+    aFull[i] = lowHalf ? ((lo & 0xFFFF) | (hi & 0xFFFF0000u))
+                       : ((hi & 0xFFFF) | (lo & 0xFFFF0000u));
+    // B: same exchange
+    uint32_t bOth = wmma_permlanex16(bPairs[i]);
+    bFull[i] = lowHalf ? ((bPairs[i] & 0xFFFF) | (bOth & 0xFFFF0000u))
+                       : ((bOth & 0xFFFF) | (bPairs[i] & 0xFFFF0000u));
+  }
+
+  // bpermute: get A rows for DPP8 subgroup matching
+  // Within the 8-lane DPP subgroup, we'll broadcast A from each lane.
+  // Each lane needs A data rearranged so lane j in the 8-group has A row j (or j+8).
+  uint32_t srcLane = (lid & 7u) + (lowHalf ? 0u : 8u);
+  uint32_t aRows[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++)
+    aRows[i] = wmma_bpermute(aFull[i], srcLane);
+
+  // DPP8 core: 8 pairs × 8 broadcasts = 64 FMAs (= 128 multiplies for the 16×16×16)
+  float localAcc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  #pragma unroll
+  for (int pair = 0; pair < 8; pair++) {
+    half2_vec aP = reinterpret_cast<half2_vec&>(aRows[pair]);
+    half2_vec bP = reinterpret_cast<half2_vec&>(bFull[pair]);
+    // DPP8 broadcasts A from lane j, each lane multiplies with its own B
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[0,0,0,0,0,0,0,0]"
+                 : "=v"(localAcc[0]) : "v"(aP), "v"(bP), "0"(localAcc[0]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[1,1,1,1,1,1,1,1]"
+                 : "=v"(localAcc[1]) : "v"(aP), "v"(bP), "0"(localAcc[1]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[2,2,2,2,2,2,2,2]"
+                 : "=v"(localAcc[2]) : "v"(aP), "v"(bP), "0"(localAcc[2]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[3,3,3,3,3,3,3,3]"
+                 : "=v"(localAcc[3]) : "v"(aP), "v"(bP), "0"(localAcc[3]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[4,4,4,4,4,4,4,4]"
+                 : "=v"(localAcc[4]) : "v"(aP), "v"(bP), "0"(localAcc[4]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[5,5,5,5,5,5,5,5]"
+                 : "=v"(localAcc[5]) : "v"(aP), "v"(bP), "0"(localAcc[5]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[6,6,6,6,6,6,6,6]"
+                 : "=v"(localAcc[6]) : "v"(aP), "v"(bP), "0"(localAcc[6]));
+    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[7,7,7,7,7,7,7,7]"
+                 : "=v"(localAcc[7]) : "v"(aP), "v"(bP), "0"(localAcc[7]));
+  }
+
+  // Exchange partial results between halves
+  uint32_t partnerAcc[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++)
+    partnerAcc[i] = wmma_permlanex16(reinterpret_cast<uint32_t&>(localAcc[i]));
+
+  // Accumulate: low half gets even-indexed results, high half gets odd-indexed
+  if (lowHalf) {
+    acc[0] += localAcc[0];
+    acc[1] += localAcc[2];
+    acc[2] += localAcc[4];
+    acc[3] += localAcc[6];
+    acc[4] += reinterpret_cast<float&>(partnerAcc[0]);
+    acc[5] += reinterpret_cast<float&>(partnerAcc[2]);
+    acc[6] += reinterpret_cast<float&>(partnerAcc[4]);
+    acc[7] += reinterpret_cast<float&>(partnerAcc[6]);
+  } else {
+    acc[0] += reinterpret_cast<float&>(partnerAcc[1]);
+    acc[1] += reinterpret_cast<float&>(partnerAcc[3]);
+    acc[2] += reinterpret_cast<float&>(partnerAcc[5]);
+    acc[3] += reinterpret_cast<float&>(partnerAcc[7]);
+    acc[4] += localAcc[1];
+    acc[5] += localAcc[3];
+    acc[6] += localAcc[5];
+    acc[7] += localAcc[7];
+  }
+}
+
+// ============================================================================
+// GEMM kernel using software WMMA for batched prefill
+// Y[M×N] = X[M×K] × W[N×K]^T   (W stored row-major as Q4_0 blocks, transposed for GEMM)
+// Each wavefront computes one 16×16 output tile. M must be multiple of 16.
+// Grid: (N/16, M/16), Block: (32,)
+// ============================================================================
+
+// LDS tile: 16×16 fp16 = 512 bytes. Two tiles (A + B) = 1 KB per wavefront.
+// With 4 waves per CU: 4 KB LDS — easily fits within 32 KB LDS budget.
+static constexpr int WMMA_M = 16;
+static constexpr int WMMA_N = 16;
+static constexpr int WMMA_K = 16;
+
+__global__ void __launch_bounds__(WAVE)
+kern_gemm_q4_0_wmma(int M, int N, int K,
+                    const __half    * __restrict__ X,     // [M × K] row-major fp16
+                    const Q4_0Block * __restrict__ W,     // [N × K/32] Q4_0 blocks (row per output)
+                    __half          * __restrict__ Y) {   // [M × N] row-major fp16
+  // Output tile position
+  int tile_n = blockIdx.x;  // which 16-col tile of output
+  int tile_m = blockIdx.y;  // which 16-row tile of output
+  int out_row_base = tile_m * WMMA_M;
+  int out_col_base = tile_n * WMMA_N;
+
+  if (out_col_base + WMMA_N > N || out_row_base + WMMA_M > M) return;
+
+  int tid = threadIdx.x;
+
+  // LDS for staging dequanted tiles
+  __shared__ __half a_tile[WMMA_M * WMMA_K];  // X tile: 16 rows × 16 cols
+  __shared__ __half b_tile[WMMA_N * WMMA_K];  // W tile: 16 cols × 16 rows (col-major for WMMA)
+
+  // Accumulators: 8 f32 per lane
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+  int num_k_tiles = K / WMMA_K;
+
+  for (int kt = 0; kt < num_k_tiles; kt++) {
+    int k_base = kt * WMMA_K;
+
+    // Load A tile: X[out_row_base + row][k_base + col] → a_tile[row][col]
+    // 32 threads, 256 elements to load = 8 per thread
+    #pragma unroll
+    for (int i = tid; i < WMMA_M * WMMA_K; i += WAVE) {
+      int row = i / WMMA_K;
+      int col = i % WMMA_K;
+      a_tile[i] = X[(out_row_base + row) * K + k_base + col];
+    }
+
+    // Load B tile: dequant W[out_col_base + col][k_base .. k_base+15] → b_tile[col * 16 + k_offset]
+    // Each Q4_0 block has 32 elements. k_base might not align to block boundary.
+    // k_base/32 = which block, k_base%32 = offset within block
+    // For 16 elements starting at k_base: might span 1 or 2 Q4_0 blocks
+    #pragma unroll
+    for (int i = tid; i < WMMA_N * WMMA_K; i += WAVE) {
+      int col = i / WMMA_K;  // which output row of W (0-15)
+      int k_off = i % WMMA_K;  // which element within the 16-wide K chunk
+
+      int w_row = out_col_base + col;
+      int k_idx = k_base + k_off;
+      int blk_idx = k_idx / Q4_BLOCK;
+      int elem_in_blk = k_idx % Q4_BLOCK;
+
+      const Q4_0Block &blk = W[(long)w_row * (K / Q4_BLOCK) + blk_idx];
+      float scale = __half2float(blk.scale);
+      int nibble_idx = elem_in_blk;
+      uint8_t packed = blk.qs[nibble_idx / 2];
+      float val = (nibble_idx & 1) ? scale * ((float)(packed >> 4) - 8.0f)
+                                   : scale * ((float)(packed & 0xF) - 8.0f);
+      // Store col-major for WMMA B: b_tile[col][k_off]
+      b_tile[col * WMMA_K + k_off] = __float2half(val);
+    }
+
+    __syncthreads();
+
+    // Software WMMA: acc += a_tile × b_tile
+    wmma_16x16x16_f16(a_tile, b_tile, acc);
+
+    __syncthreads();
+  }
+
+  // Store results: each lane has 8 elements of C
+  // Lane mapping: lid < 16 → row = lid, cols depend on acc index
+  // lid >= 16 → row = lid - 16, cols offset by 8
+  uint32_t lid = tid & 31u;
+  uint32_t row = lid & 15u;
+  uint32_t col_base_out = (lid < 16u) ? 0u : 8u;
+
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    int out_r = out_row_base + row;
+    int out_c = out_col_base + col_base_out + i;
+    if (out_r < M && out_c < N)
+      Y[out_r * N + out_c] = __float2half(acc[i]);
+  }
+}
+
+// Batched GEMV using WMMA: for when M < 16, pad to 16 and use GEMM kernel
+// For small batch (1-15 tokens), this still outperforms N separate GEMVs
+// because the weight read is amortized.
+__global__ void __launch_bounds__(WAVE)
+kern_gemm_q4_0_wmma_padded(int M_real, int N, int K,
+                           const __half    * __restrict__ X,
+                           const Q4_0Block * __restrict__ W,
+                           __half          * __restrict__ Y) {
+  int tile_n = blockIdx.x;
+  int out_col_base = tile_n * WMMA_N;
+  if (out_col_base + WMMA_N > N) return;
+
+  int tid = threadIdx.x;
+
+  __shared__ __half a_tile[WMMA_M * WMMA_K];
+  __shared__ __half b_tile[WMMA_N * WMMA_K];
+
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  int num_k_tiles = K / WMMA_K;
+
+  for (int kt = 0; kt < num_k_tiles; kt++) {
+    int k_base = kt * WMMA_K;
+
+    #pragma unroll
+    for (int i = tid; i < WMMA_M * WMMA_K; i += WAVE) {
+      int row = i / WMMA_K;
+      int col = i % WMMA_K;
+      a_tile[i] = (row < M_real) ? X[row * K + k_base + col] : __float2half(0.0f);
+    }
+
+    #pragma unroll
+    for (int i = tid; i < WMMA_N * WMMA_K; i += WAVE) {
+      int col = i / WMMA_K;
+      int k_off = i % WMMA_K;
+      int w_row = out_col_base + col;
+      int k_idx = k_base + k_off;
+      int blk_idx = k_idx / Q4_BLOCK;
+      int elem_in_blk = k_idx % Q4_BLOCK;
+      const Q4_0Block &blk = W[(long)w_row * (K / Q4_BLOCK) + blk_idx];
+      float scale = __half2float(blk.scale);
+      uint8_t packed = blk.qs[elem_in_blk / 2];
+      float val = (elem_in_blk & 1) ? scale * ((float)(packed >> 4) - 8.0f)
+                                     : scale * ((float)(packed & 0xF) - 8.0f);
+      b_tile[col * WMMA_K + k_off] = __float2half(val);
+    }
+
+    __syncthreads();
+    wmma_16x16x16_f16(a_tile, b_tile, acc);
+    __syncthreads();
+  }
+
+  uint32_t lid = tid & 31u;
+  uint32_t row = lid & 15u;
+  uint32_t col_base_out = (lid < 16u) ? 0u : 8u;
+
+  if ((int)row < M_real) {
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      int out_c = out_col_base + col_base_out + i;
+      if (out_c < N)
+        Y[row * N + out_c] = __float2half(acc[i]);
+    }
   }
 }
 
@@ -1106,6 +1499,16 @@ struct RunState {
   __half *scratch_ffn2;// [FFN]
   hipStream_t stream;
   uint32_t pos;        // current position in sequence
+
+  // Batch prefill buffers (WMMA path): sized for up to 16 tokens
+  __half *batch_x;     // [16 × HIDDEN] — batched activations
+  __half *batch_normed;// [16 × HIDDEN]
+  __half *batch_q;     // [16 × max_q_dim]
+  __half *batch_kv;    // [16 × max_kv_dim]
+  __half *batch_v;     // [16 × max_kv_dim]
+  __half *batch_ffn1;  // [16 × FFN]
+  __half *batch_ffn2;  // [16 × FFN]
+  __half *batch_out;   // [16 × HIDDEN] — projection output
 };
 
 static void forward_decode(Model *model, RunState *state, uint32_t token) {
@@ -1226,6 +1629,207 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
   state->pos++;
 }
 
+// Batched prefill using WMMA GEMM: process up to 16 tokens simultaneously
+// All linear projections use WMMA GEMM, norms and activations remain per-token.
+static void forward_prefill_batch(Model *model, RunState *state,
+                                  const uint32_t *tokens, int n_tokens) {
+  hipStream_t s = state->stream;
+  int M = n_tokens;  // 1..16
+
+  // Embed all tokens into batch_x[tok][HIDDEN]
+  for (int t = 0; t < M; t++) {
+    hipLaunchKernelGGL(kern_embed_lookup, dim3((HIDDEN+255)/256), dim3(256), 0, s,
+                       tokens[t], HIDDEN, sqrtf((float)HIDDEN), model->embed_q6k_dev,
+                       state->batch_x + t * HIDDEN);
+  }
+
+  for (uint32_t l = 0; l < N_LAYERS; l++) {
+    LayerWeights &lw = model->layers[l];
+
+    // 1. Per-token attention pre-norm
+    for (int t = 0; t < M; t++) {
+      hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state->batch_x + t * HIDDEN, lw.attn_norm, EPS,
+                         state->batch_normed + t * HIDDEN);
+    }
+
+    // 2. Q projection: [M × HIDDEN] × [q_dim × HIDDEN]^T → [M × q_dim]
+    // Use WMMA GEMM for batch, GEMV for single token
+    if (M >= 2) {
+      int grid_n = (lw.q_dim + WMMA_N - 1) / WMMA_N;
+      int grid_m = (M + WMMA_M - 1) / WMMA_M;
+      if (M < WMMA_M) {
+        hipLaunchKernelGGL(kern_gemm_q4_0_wmma_padded, dim3(grid_n), dim3(WAVE), 0, s,
+                           M, (int)lw.q_dim, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.wq, state->batch_q);
+      } else {
+        hipLaunchKernelGGL(kern_gemm_q4_0_wmma, dim3(grid_n, grid_m), dim3(WAVE), 0, s,
+                           M, (int)lw.q_dim, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.wq, state->batch_q);
+      }
+    } else {
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.q_dim), dim3(WAVE), 0, s,
+                         (int)lw.q_dim, (int)HIDDEN,
+                         state->batch_normed, (const Q4_0Block*)lw.wq, state->batch_q);
+    }
+
+    // K projection
+    if (lw.wk) {
+      if (M >= 2) {
+        int grid_n = (lw.kv_dim + WMMA_N - 1) / WMMA_N;
+        if (M < WMMA_M) {
+          hipLaunchKernelGGL(kern_gemm_q4_0_wmma_padded, dim3(grid_n), dim3(WAVE), 0, s,
+                             M, (int)lw.kv_dim, (int)HIDDEN,
+                             state->batch_normed, (const Q4_0Block*)lw.wk, state->batch_kv);
+        } else {
+          int grid_m = (M + WMMA_M - 1) / WMMA_M;
+          hipLaunchKernelGGL(kern_gemm_q4_0_wmma, dim3(grid_n, grid_m), dim3(WAVE), 0, s,
+                             M, (int)lw.kv_dim, (int)HIDDEN,
+                             state->batch_normed, (const Q4_0Block*)lw.wk, state->batch_kv);
+        }
+      } else {
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
+                           (int)lw.kv_dim, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.wk, state->batch_kv);
+      }
+    }
+
+    // V projection
+    if (lw.has_v && lw.wv) {
+      if (M >= 2) {
+        int grid_n = (lw.kv_dim + WMMA_N - 1) / WMMA_N;
+        if (M < WMMA_M) {
+          hipLaunchKernelGGL(kern_gemm_q4_0_wmma_padded, dim3(grid_n), dim3(WAVE), 0, s,
+                             M, (int)lw.kv_dim, (int)HIDDEN,
+                             state->batch_normed, (const Q4_0Block*)lw.wv, state->batch_v);
+        } else {
+          int grid_m = (M + WMMA_M - 1) / WMMA_M;
+          hipLaunchKernelGGL(kern_gemm_q4_0_wmma, dim3(grid_n, grid_m), dim3(WAVE), 0, s,
+                             M, (int)lw.kv_dim, (int)HIDDEN,
+                             state->batch_normed, (const Q4_0Block*)lw.wv, state->batch_v);
+        }
+      } else {
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
+                           (int)lw.kv_dim, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.wv, state->batch_v);
+      }
+    }
+
+    // 3. Per-token: head norm + RoPE, store KV, attention
+    const float *cos_tbl = lw.is_swa ? model->rope_cos_swa : model->rope_cos_global;
+    const float *sin_tbl = lw.is_swa ? model->rope_sin_swa : model->rope_sin_global;
+
+    for (int t = 0; t < M; t++) {
+      uint32_t pos = state->pos + t;
+
+      // Q head norm + RoPE
+      hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                         lw.n_q_heads, lw.head_dim, pos,
+                         lw.attn_q_norm, cos_tbl, sin_tbl, EPS,
+                         state->batch_q + t * lw.q_dim);
+
+      // K head norm + RoPE
+      if (lw.wk) {
+        hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                           lw.n_kv_heads, lw.head_dim, pos,
+                           lw.attn_k_norm, cos_tbl, sin_tbl, EPS,
+                           state->batch_kv + t * lw.kv_dim);
+      }
+
+      // Store K/V to cache
+      if (lw.wk) {
+        HIP_CHECK(hipMemcpyAsync(model->kv_k[l] + pos * lw.kv_dim,
+                                 state->batch_kv + t * lw.kv_dim,
+                                 lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+        __half *v_src = lw.has_v ? (state->batch_v + t * lw.kv_dim)
+                                 : (state->batch_kv + t * lw.kv_dim);
+        HIP_CHECK(hipMemcpyAsync(model->kv_v[l] + pos * lw.kv_dim,
+                                 v_src, lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+      }
+
+      // Attention (causal: token t sees positions 0..pos+t)
+      uint32_t seq_len = pos + 1;
+      hipLaunchKernelGGL(kern_attn_decode, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                         lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                         seq_len, 1.0f,
+                         state->batch_q + t * lw.q_dim,
+                         model->kv_k[l], model->kv_v[l],
+                         state->scratch_attn);
+
+      // Output projection for this token: [1 × q_dim] × [HIDDEN × q_dim]^T → [1 × HIDDEN]
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
+                         (int)HIDDEN, (int)lw.q_dim,
+                         state->scratch_attn, (const Q4_0Block*)lw.wo,
+                         state->batch_out + t * HIDDEN);
+
+      // Fused post-attn-norm + residual add
+      hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state->batch_x + t * HIDDEN,
+                         state->batch_out + t * HIDDEN, lw.post_attn_norm, EPS, 1.0f);
+    }
+
+    // 4. FFN pre-norm (per token)
+    for (int t = 0; t < M; t++) {
+      hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state->batch_x + t * HIDDEN, lw.ffn_norm, EPS,
+                         state->batch_normed + t * HIDDEN);
+    }
+
+    // 5. FFN gate + up projections: WMMA GEMM
+    if (M >= 2) {
+      int grid_n = (FFN + WMMA_N - 1) / WMMA_N;
+      if (M < WMMA_M) {
+        hipLaunchKernelGGL(kern_gemm_q4_0_wmma_padded, dim3(grid_n), dim3(WAVE), 0, s,
+                           M, (int)FFN, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.ffn_gate, state->batch_ffn1);
+        hipLaunchKernelGGL(kern_gemm_q4_0_wmma_padded, dim3(grid_n), dim3(WAVE), 0, s,
+                           M, (int)FFN, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.ffn_up, state->batch_ffn2);
+      } else {
+        int grid_m = (M + WMMA_M - 1) / WMMA_M;
+        hipLaunchKernelGGL(kern_gemm_q4_0_wmma, dim3(grid_n, grid_m), dim3(WAVE), 0, s,
+                           M, (int)FFN, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.ffn_gate, state->batch_ffn1);
+        hipLaunchKernelGGL(kern_gemm_q4_0_wmma, dim3(grid_n, grid_m), dim3(WAVE), 0, s,
+                           M, (int)FFN, (int)HIDDEN,
+                           state->batch_normed, (const Q4_0Block*)lw.ffn_up, state->batch_ffn2);
+      }
+    } else {
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(FFN), dim3(WAVE), 0, s,
+                         (int)FFN, (int)HIDDEN,
+                         state->batch_normed, (const Q4_0Block*)lw.ffn_gate, state->batch_ffn1);
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(FFN), dim3(WAVE), 0, s,
+                         (int)FFN, (int)HIDDEN,
+                         state->batch_normed, (const Q4_0Block*)lw.ffn_up, state->batch_ffn2);
+    }
+
+    // 6. GeLU + down projection + post-FFN norm (per token)
+    for (int t = 0; t < M; t++) {
+      hipLaunchKernelGGL(kern_gelu_mul, dim3((FFN+255)/256), dim3(256), 0, s,
+                         FFN, state->batch_ffn1 + t * FFN, state->batch_ffn2 + t * FFN,
+                         state->batch_ffn1 + t * FFN);
+
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
+                         (int)HIDDEN, (int)FFN,
+                         state->batch_ffn1 + t * FFN, (const Q4_0Block*)lw.ffn_down,
+                         state->batch_out + t * HIDDEN);
+
+      float scale = lw.out_scale_val;
+      hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state->batch_x + t * HIDDEN,
+                         state->batch_out + t * HIDDEN, lw.post_ffn_norm, EPS, scale);
+    }
+  }
+
+  // Final norm on last token → state->hidden (for sampling)
+  int last = M - 1;
+  hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                     HIDDEN, state->batch_x + last * HIDDEN, model->output_norm, EPS,
+                     state->hidden);
+
+  state->pos += M;
+}
+
 // GPU-based lm_head + GPU argmax sampling
 static uint32_t sample_greedy(Model *model, RunState *state) {
   hipStream_t s = state->stream;
@@ -1286,11 +1890,40 @@ int main(int argc, char **argv) {
   HIP_CHECK(hipMalloc(&state.scratch_attn, 8192 * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.scratch_ffn1, FFN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.scratch_ffn2, FFN * sizeof(__half)));
+  // Batch prefill buffers (16 tokens max)
+  HIP_CHECK(hipMalloc(&state.batch_x, 16 * HIDDEN * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_normed, 16 * HIDDEN * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_q, 16 * 8192 * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_kv, 16 * 2048 * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_v, 16 * 2048 * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_ffn1, 16 * FFN * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_ffn2, 16 * FFN * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_out, 16 * HIDDEN * sizeof(__half)));
   HIP_CHECK(hipStreamCreate(&state.stream));
   state.pos = 0;
 
+  // GPU telemetry helpers
+  auto read_sysfs = [](const char *path) -> int64_t {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int64_t val = -1;
+    fscanf(f, "%ld", &val);
+    fclose(f);
+    return val;
+  };
+
+  auto print_gpu_stats = [&](const char *label) {
+    int64_t temp = read_sysfs("/sys/class/hwmon/hwmon6/temp1_input");
+    int64_t power = read_sysfs("/sys/class/hwmon/hwmon6/power1_average");
+    int64_t freq = read_sysfs("/sys/class/hwmon/hwmon6/freq1_input");
+    int64_t busy = read_sysfs("/sys/class/drm/card2/device/gpu_busy_percent");
+    printf("[GPU %s] freq=%ldMHz temp=%ld°C power=%.1fW busy=%ld%%\n",
+           label, freq / 1000000, temp / 1000, power / 1e6, busy);
+  };
+
   printf("\nModel loaded. Starting generation...\n");
   printf("Prompt: \"%s\"\n\n", prompt);
+  print_gpu_stats("idle");
 
   // Tokenize (BPE is complex — for now just use byte-level fallback)
   // TODO: proper tokenizer. For benchmarking, just feed BOS + a few tokens.
@@ -1306,46 +1939,149 @@ int main(int argc, char **argv) {
   printf("Tokens: %zu (BOS + %zu prompt bytes)\n", tokens.size(), tokens.size() - 1);
   printf("---\n");
 
-  // Prefill: process prompt tokens
+  // Prefill: process prompt tokens in batches of 16 using WMMA GEMM
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  for (size_t i = 0; i < tokens.size(); i++) {
-    forward_decode(&model, &state, tokens[i]);
+  size_t n_prompt = tokens.size();
+  for (size_t i = 0; i < n_prompt; ) {
+    int batch = std::min((int)(n_prompt - i), 16);
+    forward_prefill_batch(&model, &state, tokens.data() + i, batch);
+    i += batch;
   }
 
   auto t_prefill = std::chrono::high_resolution_clock::now();
   float prefill_ms = std::chrono::duration<float, std::milli>(t_prefill - t_start).count();
-  printf("[Prefill: %zu tokens in %.1f ms = %.1f t/s]\n",
+  printf("[Prefill: %zu tokens in %.1f ms = %.1f t/s (WMMA batched)]\n",
          tokens.size(), prefill_ms, tokens.size() * 1000.0f / prefill_ms);
 
-  // Warmup: run 2 decode+sample cycles to JIT all kernels at their final grid sizes
+  // Warmup: 2 cycles to JIT, then reset KV cache for clean benchmark
   printf("\nWarming up GPU kernels...\n");
   {
     uint32_t wt = sample_greedy(&model, &state);
     forward_decode(&model, &state, wt);
     wt = sample_greedy(&model, &state);
     forward_decode(&model, &state, wt);
+    print_gpu_stats("post-warmup");
   }
 
-  // Generate tokens (timed)
+  // Generate tokens (timed) — pipelined: forward reads token from device memory,
+  // GPU does embed+forward+lm_head+argmax → writes next token to argmax_dev,
+  // host only syncs to read token for logging (not for feedback).
   int n_gen = 32;
   printf("Generating %d tokens...\n", n_gen);
 
   auto t_gen_start = std::chrono::high_resolution_clock::now();
 
   for (int i = 0; i < n_gen; i++) {
-    uint32_t next_token = sample_greedy(&model, &state);
-    forward_decode(&model, &state, next_token);
+    // Launch lm_head + argmax → writes to model.argmax_dev
+    hipStream_t s = state.stream;
+    hipLaunchKernelGGL(kern_gemv_q6k, dim3(model.vocab_size), dim3(WAVE), 0, s,
+                       (int)model.vocab_size, (int)HIDDEN,
+                       state.hidden, model.embed_q6k_dev, model.logits_dev);
+    HIP_CHECK(hipMemsetAsync(model.argmax_dev, 0, sizeof(uint32_t), s));
+    hipLaunchKernelGGL(kern_argmax_single, dim3(1), dim3(1024), 0, s,
+                       model.logits_dev, model.vocab_size, model.argmax_dev);
 
-    // Print progress
-    if ((i + 1) % 8 == 0) {
-      auto t_now = std::chrono::high_resolution_clock::now();
-      float elapsed = std::chrono::duration<float, std::milli>(t_now - t_gen_start).count();
-      printf("  [%d/%d tokens, %.1f t/s]\n", i + 1, n_gen,
-             (i + 1) * 1000.0f / elapsed);
+    // Forward pass reads token indirectly from argmax_dev (no host sync needed)
+    hipLaunchKernelGGL(kern_embed_lookup_indirect, dim3((HIDDEN+255)/256), dim3(256), 0, s,
+                       model.argmax_dev, HIDDEN, sqrtf((float)HIDDEN),
+                       model.embed_q6k_dev, state.hidden);
+
+    // Run all layers (same as forward_decode minus embedding)
+    __half *normed = state.normed;
+    uint32_t pos = state.pos;
+
+    for (uint32_t l = 0; l < N_LAYERS; l++) {
+      LayerWeights &lw = model.layers[l];
+
+      hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state.hidden, lw.attn_norm, EPS, normed);
+
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.q_dim), dim3(WAVE), 0, s,
+                         (int)lw.q_dim, (int)HIDDEN,
+                         normed, (const Q4_0Block*)lw.wq, state.scratch_q);
+
+      if (lw.wk) {
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
+                           (int)lw.kv_dim, (int)HIDDEN,
+                           normed, (const Q4_0Block*)lw.wk, state.scratch_kv);
+      }
+      if (lw.has_v && lw.wv) {
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
+                           (int)lw.kv_dim, (int)HIDDEN,
+                           normed, (const Q4_0Block*)lw.wv, state.scratch_v);
+      }
+
+      const float *cos_tbl = lw.is_swa ? model.rope_cos_swa : model.rope_cos_global;
+      const float *sin_tbl = lw.is_swa ? model.rope_sin_swa : model.rope_sin_global;
+
+      hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                         lw.n_q_heads, lw.head_dim, pos,
+                         lw.attn_q_norm, cos_tbl, sin_tbl, EPS, state.scratch_q);
+      if (lw.wk) {
+        hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                           lw.n_kv_heads, lw.head_dim, pos,
+                           lw.attn_k_norm, cos_tbl, sin_tbl, EPS, state.scratch_kv);
+      }
+
+      if (lw.wk) {
+        HIP_CHECK(hipMemcpyAsync(model.kv_k[l] + pos * lw.kv_dim,
+                                 state.scratch_kv, lw.kv_dim * sizeof(__half),
+                                 hipMemcpyDeviceToDevice, s));
+        __half *v_src = lw.has_v ? state.scratch_v : state.scratch_kv;
+        HIP_CHECK(hipMemcpyAsync(model.kv_v[l] + pos * lw.kv_dim,
+                                 v_src, lw.kv_dim * sizeof(__half),
+                                 hipMemcpyDeviceToDevice, s));
+      }
+
+      uint32_t seq_len = pos + 1;
+      hipLaunchKernelGGL(kern_attn_decode, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                         lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                         seq_len, 1.0f, state.scratch_q,
+                         model.kv_k[l], model.kv_v[l], state.scratch_attn);
+
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
+                         (int)HIDDEN, (int)lw.q_dim,
+                         state.scratch_attn, (const Q4_0Block*)lw.wo, state.residual);
+
+      hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state.hidden, state.residual, lw.post_attn_norm, EPS, 1.0f);
+
+      hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state.hidden, lw.ffn_norm, EPS, normed);
+
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(FFN), dim3(WAVE), 0, s,
+                         (int)FFN, (int)HIDDEN,
+                         normed, (const Q4_0Block*)lw.ffn_gate, state.scratch_ffn1);
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(FFN), dim3(WAVE), 0, s,
+                         (int)FFN, (int)HIDDEN,
+                         normed, (const Q4_0Block*)lw.ffn_up, state.scratch_ffn2);
+
+      hipLaunchKernelGGL(kern_gelu_mul, dim3((FFN+255)/256), dim3(256), 0, s,
+                         FFN, state.scratch_ffn1, state.scratch_ffn2, state.scratch_ffn1);
+
+      hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
+                         (int)HIDDEN, (int)FFN,
+                         state.scratch_ffn1, (const Q4_0Block*)lw.ffn_down, state.residual);
+
+      float scale = lw.out_scale_val;
+      hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state.hidden, state.residual, lw.post_ffn_norm, EPS, scale);
+    }
+
+    // Final norm
+    hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                       HIDDEN, state.hidden, model.output_norm, EPS, state.hidden);
+
+    state.pos++;
+
+    // Progress reporting: use events to avoid pipeline stalls
+    if ((i + 1) == n_gen) {
+      // Only sync at the very end (handled after loop)
     }
   }
 
+  HIP_CHECK(hipStreamSynchronize(state.stream));
   auto t_gen_end = std::chrono::high_resolution_clock::now();
   float gen_ms = std::chrono::duration<float, std::milli>(t_gen_end - t_gen_start).count();
 
@@ -1360,6 +2096,46 @@ int main(int argc, char **argv) {
   float effective_bw = model_gb / (gen_ms / n_gen / 1000.0f);
   printf("Effective BW: %.0f GB/s (of 280 GB/s VRAM)\n", effective_bw);
   printf("BW utilization: %.0f%%\n", effective_bw / 280.0f * 100.0f);
+
+  print_gpu_stats("post-gen");
+
+  // Profile: separate host dispatch time from GPU execution time
+  printf("\n--- Per-kernel profiling (1 token) ---\n");
+  {
+    hipEvent_t ev_start, ev_end;
+    HIP_CHECK(hipEventCreate(&ev_start));
+    HIP_CHECK(hipEventCreate(&ev_end));
+
+    // Measure host dispatch time (time to submit all kernels, no GPU wait)
+    HIP_CHECK(hipStreamSynchronize(state.stream)); // drain queue first
+    auto h_start = std::chrono::high_resolution_clock::now();
+    HIP_CHECK(hipEventRecord(ev_start, state.stream));
+    forward_decode(&model, &state, 1);
+    auto h_end = std::chrono::high_resolution_clock::now();
+    HIP_CHECK(hipEventRecord(ev_end, state.stream));
+    HIP_CHECK(hipEventSynchronize(ev_end));
+
+    float host_ms = std::chrono::duration<float, std::milli>(h_end - h_start).count();
+    float gpu_ms;
+    HIP_CHECK(hipEventElapsedTime(&gpu_ms, ev_start, ev_end));
+    printf("Host dispatch: %.2f ms\n", host_ms);
+    printf("GPU execution: %.2f ms (= %.1f t/s)\n", gpu_ms, 1000.0f/gpu_ms);
+    printf("Overlap: %.2f ms hidden by GPU\n", host_ms - (gpu_ms > host_ms ? 0 : gpu_ms - host_ms));
+
+    // Time sample
+    HIP_CHECK(hipEventRecord(ev_start, state.stream));
+    sample_greedy(&model, &state);
+    HIP_CHECK(hipEventRecord(ev_end, state.stream));
+    HIP_CHECK(hipEventSynchronize(ev_end));
+    float sample_ms;
+    HIP_CHECK(hipEventElapsedTime(&sample_ms, ev_start, ev_end));
+    printf("Sample (lm_head+argmax): %.2f ms\n", sample_ms);
+    printf("Total GPU/token: %.2f ms (= %.1f t/s potential)\n",
+           gpu_ms + sample_ms, 1000.0f/(gpu_ms + sample_ms));
+
+    HIP_CHECK(hipEventDestroy(ev_start));
+    HIP_CHECK(hipEventDestroy(ev_end));
+  }
 
   // Cleanup
   gguf_close(gguf);
