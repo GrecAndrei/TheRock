@@ -116,6 +116,7 @@ struct GGUFFile {
   std::unordered_map<std::string, uint64_t>   kv_uint;
   std::unordered_map<std::string, float>      kv_float;
   std::unordered_map<std::string, std::string> kv_str;
+  std::unordered_map<std::string, std::vector<std::string>> kv_str_arr;
 
   const void* tensor_data(const GGUFTensor &t) const {
     return data + tensor_data_offset + t.offset;
@@ -142,6 +143,21 @@ static void skip_gguf_value(const uint8_t *&p, uint32_t type_id) {
     for (uint64_t i = 0; i < arr_len; i++)
       skip_gguf_value(p, arr_type);
   }
+}
+
+static std::vector<std::string> read_gguf_string_array(const uint8_t *&p) {
+  uint32_t arr_type = *(const uint32_t*)p; p += 4;
+  uint64_t arr_len = *(const uint64_t*)p; p += 8;
+  std::vector<std::string> values;
+  if (arr_type != 8) {
+    for (uint64_t i = 0; i < arr_len; i++)
+      skip_gguf_value(p, arr_type);
+    return values;
+  }
+  values.reserve(arr_len);
+  for (uint64_t i = 0; i < arr_len; i++)
+    values.push_back(read_gguf_string(p));
+  return values;
 }
 
 static uint64_t read_gguf_uint(const uint8_t *&p, uint32_t type_id) {
@@ -195,6 +211,12 @@ static GGUFFile* gguf_open(const char *path) {
       g->kv_str[key] = read_gguf_string(p);
     } else if (type_id == 7) { // bool
       g->kv_uint[key] = *p; p += 1;
+    } else if (type_id == 9) { // array
+      if (key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.merges") {
+        g->kv_str_arr[key] = read_gguf_string_array(p);
+      } else {
+        skip_gguf_value(p, type_id);
+      }
     } else {
       skip_gguf_value(p, type_id);
     }
@@ -230,6 +252,226 @@ static void gguf_close(GGUFFile *g) {
 }
 
 // ============================================================================
+// Tokenizer (Gemma4 BPE from GGUF metadata)
+// ============================================================================
+
+static constexpr const char *TOKEN_SPACE = "\xE2\x96\x81";
+
+struct Model;
+struct RunState;
+static void forward_prefill_batch(Model *model, RunState *state,
+                                  const uint32_t *tokens, int n_tokens);
+
+struct Tokenizer {
+  std::vector<std::string> id_to_piece;
+  std::unordered_map<std::string, uint32_t> piece_to_id;
+  std::unordered_map<std::string, uint32_t> merge_rank;
+  uint32_t bos_id = 2;
+  uint32_t eos_id = 1;
+  uint32_t unk_id = 3;
+  uint32_t turn_open_id = UINT32_MAX;
+  uint32_t turn_close_id = UINT32_MAX;
+  uint32_t channel_open_id = UINT32_MAX;
+  uint32_t channel_close_id = UINT32_MAX;
+  bool add_bos_token = true;
+  bool add_space_prefix = false;
+};
+
+static std::vector<std::string> utf8_split(const std::string &text) {
+  std::vector<std::string> out;
+  for (size_t i = 0; i < text.size(); ) {
+    unsigned char c = (unsigned char)text[i];
+    size_t len = 1;
+    if ((c & 0x80) == 0x00) len = 1;
+    else if ((c & 0xE0) == 0xC0) len = 2;
+    else if ((c & 0xF0) == 0xE0) len = 3;
+    else if ((c & 0xF8) == 0xF0) len = 4;
+    if (i + len > text.size()) len = 1;
+    out.emplace_back(text.substr(i, len));
+    i += len;
+  }
+  return out;
+}
+
+static std::string normalize_tokenizer_text(const std::string &text) {
+  std::string out;
+  out.reserve(text.size() + 16);
+  for (char c : text) {
+    if (c == ' ') out += TOKEN_SPACE;
+    else out.push_back(c);
+  }
+  return out;
+}
+
+static bool load_tokenizer(GGUFFile *gguf, Tokenizer *tok) {
+  auto tok_it = gguf->kv_str_arr.find("tokenizer.ggml.tokens");
+  auto merge_it = gguf->kv_str_arr.find("tokenizer.ggml.merges");
+  if (tok_it == gguf->kv_str_arr.end() || merge_it == gguf->kv_str_arr.end()) {
+    fprintf(stderr, "Missing tokenizer metadata in GGUF\n");
+    return false;
+  }
+
+  tok->id_to_piece = tok_it->second;
+  tok->piece_to_id.reserve(tok->id_to_piece.size() * 2);
+  for (uint32_t i = 0; i < tok->id_to_piece.size(); i++)
+    tok->piece_to_id.emplace(tok->id_to_piece[i], i);
+
+  tok->merge_rank.reserve(merge_it->second.size() * 2);
+  for (uint32_t i = 0; i < merge_it->second.size(); i++)
+    tok->merge_rank.emplace(merge_it->second[i], i);
+
+  if (gguf->kv_uint.count("tokenizer.ggml.bos_token_id"))
+    tok->bos_id = (uint32_t)gguf->kv_uint["tokenizer.ggml.bos_token_id"];
+  if (gguf->kv_uint.count("tokenizer.ggml.eos_token_id"))
+    tok->eos_id = (uint32_t)gguf->kv_uint["tokenizer.ggml.eos_token_id"];
+  if (gguf->kv_uint.count("tokenizer.ggml.unknown_token_id"))
+    tok->unk_id = (uint32_t)gguf->kv_uint["tokenizer.ggml.unknown_token_id"];
+  if (gguf->kv_uint.count("tokenizer.ggml.add_bos_token"))
+    tok->add_bos_token = (bool)gguf->kv_uint["tokenizer.ggml.add_bos_token"];
+  if (gguf->kv_uint.count("tokenizer.ggml.add_space_prefix"))
+    tok->add_space_prefix = (bool)gguf->kv_uint["tokenizer.ggml.add_space_prefix"];
+
+  auto it_open = tok->piece_to_id.find("<|turn>");
+  if (it_open != tok->piece_to_id.end()) tok->turn_open_id = it_open->second;
+  auto it_close = tok->piece_to_id.find("<turn|>");
+  if (it_close != tok->piece_to_id.end()) tok->turn_close_id = it_close->second;
+  auto it_ch_open = tok->piece_to_id.find("<|channel>");
+  if (it_ch_open != tok->piece_to_id.end()) tok->channel_open_id = it_ch_open->second;
+  auto it_ch_close = tok->piece_to_id.find("<channel|>");
+  if (it_ch_close != tok->piece_to_id.end()) tok->channel_close_id = it_ch_close->second;
+  return true;
+}
+
+static void tokenizer_append_bytes(const Tokenizer &tok, const std::string &bytes,
+                                   std::vector<uint32_t> *out_ids) {
+  char buf[8];
+  for (unsigned char c : bytes) {
+    snprintf(buf, sizeof(buf), "<0x%02X>", (unsigned)c);
+    auto it = tok.piece_to_id.find(buf);
+    out_ids->push_back(it != tok.piece_to_id.end() ? it->second : tok.unk_id);
+  }
+}
+
+static void tokenizer_append_chunk(const Tokenizer &tok, const std::string &chunk,
+                                   std::vector<uint32_t> *out_ids) {
+  std::vector<std::string> pieces = utf8_split(chunk);
+  if (pieces.empty()) return;
+
+  while (pieces.size() > 1) {
+    uint32_t best_rank = UINT32_MAX;
+    size_t best_i = pieces.size();
+    for (size_t i = 0; i + 1 < pieces.size(); i++) {
+      std::string key = pieces[i] + " " + pieces[i + 1];
+      auto it = tok.merge_rank.find(key);
+      if (it != tok.merge_rank.end() && it->second < best_rank) {
+        best_rank = it->second;
+        best_i = i;
+      }
+    }
+    if (best_i == pieces.size()) break;
+    pieces[best_i] += pieces[best_i + 1];
+    pieces.erase(pieces.begin() + best_i + 1);
+  }
+
+  for (const std::string &piece : pieces) {
+    auto it = tok.piece_to_id.find(piece);
+    if (it != tok.piece_to_id.end()) out_ids->push_back(it->second);
+    else tokenizer_append_bytes(tok, piece, out_ids);
+  }
+}
+
+static void tokenizer_append_text(const Tokenizer &tok, const std::string &text,
+                                  std::vector<uint32_t> *out_ids) {
+  std::string normalized = normalize_tokenizer_text(text);
+  if (tok.add_space_prefix && !normalized.empty() && normalized.rfind(TOKEN_SPACE, 0) != 0)
+    normalized = std::string(TOKEN_SPACE) + normalized;
+
+  size_t i = 0;
+  while (i < normalized.size()) {
+    size_t j = i;
+    if (normalized[i] == '\n') {
+      while (j < normalized.size() && normalized[j] == '\n') j++;
+    } else {
+      while (j < normalized.size() && normalized[j] != '\n') j++;
+    }
+    std::string chunk = normalized.substr(i, j - i);
+    auto it = tok.piece_to_id.find(chunk);
+    if (it != tok.piece_to_id.end()) out_ids->push_back(it->second);
+    else tokenizer_append_chunk(tok, chunk, out_ids);
+    i = j;
+  }
+}
+
+static std::vector<uint32_t> tokenizer_encode_prompt(const Tokenizer &tok, const std::string &text) {
+  std::vector<uint32_t> ids;
+  if (tok.add_bos_token) ids.push_back(tok.bos_id);
+  tokenizer_append_text(tok, text, &ids);
+  return ids;
+}
+
+static std::string decode_piece_for_display(const std::string &piece) {
+  if (piece == "<bos>" || piece == "<eos>" || piece == "<pad>") return std::string();
+  if ((piece.size() >= 4 && piece[0] == '<' && piece[1] == '|') || piece == "<turn|>" || piece == "<channel|>")
+    return std::string();
+  if (piece.size() == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[5] == '>') {
+    auto hex = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+      if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+      return -1;
+    };
+    int hi = hex(piece[3]);
+    int lo = hex(piece[4]);
+    if (hi >= 0 && lo >= 0) return std::string(1, (char)((hi << 4) | lo));
+  }
+  std::string out;
+  out.reserve(piece.size());
+  for (size_t i = 0; i < piece.size(); ) {
+    if (i + 3 <= piece.size() && memcmp(piece.data() + i, TOKEN_SPACE, 3) == 0) {
+      out.push_back(' ');
+      i += 3;
+    } else {
+      out.push_back(piece[i]);
+      i++;
+    }
+  }
+  return out;
+}
+
+static void append_model_generation_prompt(const Tokenizer &tok, std::vector<uint32_t> *ids) {
+  if (tok.turn_open_id != UINT32_MAX) ids->push_back(tok.turn_open_id);
+  tokenizer_append_text(tok, "model\n", ids);
+  if (tok.channel_open_id != UINT32_MAX && tok.channel_close_id != UINT32_MAX) {
+    ids->push_back(tok.channel_open_id);
+    tokenizer_append_text(tok, "thought\n", ids);
+    ids->push_back(tok.channel_close_id);
+  }
+}
+
+static void append_chat_turn_tokens(const Tokenizer &tok, const char *role,
+                                    const std::string &content,
+                                    bool prepend_newline,
+                                    bool open_next_model_turn,
+                                    std::vector<uint32_t> *ids) {
+  if (prepend_newline)
+    tokenizer_append_text(tok, "\n", ids);
+  if (tok.turn_open_id != UINT32_MAX) ids->push_back(tok.turn_open_id);
+  tokenizer_append_text(tok, std::string(role) + "\n", ids);
+  tokenizer_append_text(tok, content, ids);
+  if (tok.turn_close_id != UINT32_MAX) ids->push_back(tok.turn_close_id);
+  tokenizer_append_text(tok, "\n", ids);
+  if (open_next_model_turn) append_model_generation_prompt(tok, ids);
+}
+
+static void prefill_tokens(Model *model, RunState *state, const std::vector<uint32_t> &tokens) {
+  for (size_t i = 0; i < tokens.size(); ) {
+    int batch = std::min((int)(tokens.size() - i), 16);
+    forward_prefill_batch(model, state, tokens.data() + i, batch);
+    i += batch;
+  }
+}
+
+// ============================================================================
 // GPU Kernels
 // ============================================================================
 
@@ -257,40 +499,12 @@ kern_gemv_q4_0(int N, int K,
     float scale = __half2float(b.scale);
     const __half *xblk = x + blk * Q4_BLOCK;
 
-    // Load activation via float4 (8 halves per load, 4 loads for 32 elements)
-    float4 xv0 = *reinterpret_cast<const float4*>(xblk);
-    float4 xv1 = *reinterpret_cast<const float4*>(xblk + 8);
-    float4 xv2 = *reinterpret_cast<const float4*>(xblk + 16);
-    float4 xv3 = *reinterpret_cast<const float4*>(xblk + 24);
-    const __half *xp0 = reinterpret_cast<const __half*>(&xv0);
-    const __half *xp1 = reinterpret_cast<const __half*>(&xv1);
-    const __half *xp2 = reinterpret_cast<const __half*>(&xv2);
-    const __half *xp3 = reinterpret_cast<const __half*>(&xv3);
-
     float block_acc = 0.0f;
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 16; i++) {
       uint8_t packed = b.qs[i];
-      block_acc += scale * ((float)(packed & 0xF) - 8.0f) * __half2float(xp0[i*2]);
-      block_acc += scale * ((float)(packed >> 4)  - 8.0f) * __half2float(xp0[i*2+1]);
-    }
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      uint8_t packed = b.qs[4+i];
-      block_acc += scale * ((float)(packed & 0xF) - 8.0f) * __half2float(xp1[i*2]);
-      block_acc += scale * ((float)(packed >> 4)  - 8.0f) * __half2float(xp1[i*2+1]);
-    }
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      uint8_t packed = b.qs[8+i];
-      block_acc += scale * ((float)(packed & 0xF) - 8.0f) * __half2float(xp2[i*2]);
-      block_acc += scale * ((float)(packed >> 4)  - 8.0f) * __half2float(xp2[i*2+1]);
-    }
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      uint8_t packed = b.qs[12+i];
-      block_acc += scale * ((float)(packed & 0xF) - 8.0f) * __half2float(xp3[i*2]);
-      block_acc += scale * ((float)(packed >> 4)  - 8.0f) * __half2float(xp3[i*2+1]);
+      block_acc += scale * ((float)(packed & 0xF) - 8.0f) * __half2float(xblk[i]);
+      block_acc += scale * ((float)(packed >> 4)  - 8.0f) * __half2float(xblk[i + 16]);
     }
     acc += block_acc;
   }
@@ -401,6 +615,29 @@ kern_rmsnorm_head(uint32_t n_heads, uint32_t head_dim,
     ho[i] = __float2half(__half2float(hx[i]) * rms_inv * scale[i % head_dim]);
 }
 
+__global__ void __launch_bounds__(WAVE)
+kern_rmsnorm_head_noscale(uint32_t n_heads, uint32_t head_dim,
+                          __half * __restrict__ x,
+                          float eps) {
+  int head = blockIdx.x;
+  if (head >= (int)n_heads) return;
+  int tid = threadIdx.x;
+
+  __half *hx = x + head * head_dim;
+
+  float ss = 0.0f;
+  for (uint32_t i = tid; i < head_dim; i += WAVE) {
+    float v = __half2float(hx[i]);
+    ss += v * v;
+  }
+  ss += __shfl_xor(ss, 16); ss += __shfl_xor(ss, 8);
+  ss += __shfl_xor(ss, 4);  ss += __shfl_xor(ss, 2); ss += __shfl_xor(ss, 1);
+
+  float rms_inv = rsqrtf(ss / (float)head_dim + eps);
+  for (uint32_t i = tid; i < head_dim; i += WAVE)
+    hx[i] = __float2half(__half2float(hx[i]) * rms_inv);
+}
+
 // GeLU activation: out = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
 __global__ void
 kern_gelu_mul(uint32_t n,
@@ -424,6 +661,138 @@ kern_softcap(uint32_t n, float cap, __half * __restrict__ data) {
   data[i] = __float2half(cap * tanhf(x / cap));
 }
 
+__global__ void
+kern_quantize_kv_fp16_to_i8(uint32_t n,
+                            const __half * __restrict__ k_src,
+                            const __half * __restrict__ v_src,
+                            int8_t       * __restrict__ k_dst,
+                            int8_t       * __restrict__ v_dst,
+                            float        * __restrict__ k_scale_out,
+                            float        * __restrict__ v_scale_out) {
+  __shared__ float red_k[256];
+  __shared__ float red_v[256];
+  __shared__ float k_scale;
+  __shared__ float v_scale;
+  __shared__ float k_inv_scale;
+  __shared__ float v_inv_scale;
+
+  uint32_t tid = threadIdx.x;
+  float max_k = 0.0f;
+  float max_v = 0.0f;
+  for (uint32_t i = tid; i < n; i += blockDim.x) {
+    max_k = fmaxf(max_k, fabsf(__half2float(k_src[i])));
+    max_v = fmaxf(max_v, fabsf(__half2float(v_src[i])));
+  }
+  red_k[tid] = max_k;
+  red_v[tid] = max_v;
+  __syncthreads();
+
+  for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red_k[tid] = fmaxf(red_k[tid], red_k[tid + stride]);
+      red_v[tid] = fmaxf(red_v[tid], red_v[tid + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    k_scale = (red_k[0] > 0.0f) ? (red_k[0] / 127.0f) : (1.0f / 127.0f);
+    v_scale = (red_v[0] > 0.0f) ? (red_v[0] / 127.0f) : (1.0f / 127.0f);
+    k_inv_scale = 1.0f / k_scale;
+    v_inv_scale = 1.0f / v_scale;
+    *k_scale_out = k_scale;
+    *v_scale_out = v_scale;
+  }
+  __syncthreads();
+
+  for (uint32_t i = tid; i < n; i += blockDim.x) {
+    float kq = __half2float(k_src[i]) * k_inv_scale;
+    float vq = __half2float(v_src[i]) * v_inv_scale;
+    int k_rounded = (int)lrintf(kq);
+    int v_rounded = (int)lrintf(vq);
+    k_rounded = (k_rounded < -127) ? -127 : ((k_rounded > 127) ? 127 : k_rounded);
+    v_rounded = (v_rounded < -127) ? -127 : ((v_rounded > 127) ? 127 : v_rounded);
+    k_dst[i] = (int8_t)k_rounded;
+    v_dst[i] = (int8_t)v_rounded;
+  }
+}
+
+__global__ void
+kern_quantize_kv_fp16_to_q4(uint32_t n,
+                            const __half * __restrict__ k_src,
+                            const __half * __restrict__ v_src,
+                            uint8_t      * __restrict__ k_dst,
+                            uint8_t      * __restrict__ v_dst,
+                            float        * __restrict__ k_scale_out,
+                            float        * __restrict__ v_scale_out) {
+  __shared__ float red_k[256];
+  __shared__ float red_v[256];
+  __shared__ float k_scale;
+  __shared__ float v_scale;
+  __shared__ float k_inv_scale;
+  __shared__ float v_inv_scale;
+
+  uint32_t tid = threadIdx.x;
+  float max_k = 0.0f;
+  float max_v = 0.0f;
+  for (uint32_t i = tid; i < n; i += blockDim.x) {
+    max_k = fmaxf(max_k, fabsf(__half2float(k_src[i])));
+    max_v = fmaxf(max_v, fabsf(__half2float(v_src[i])));
+  }
+  red_k[tid] = max_k;
+  red_v[tid] = max_v;
+  __syncthreads();
+
+  for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red_k[tid] = fmaxf(red_k[tid], red_k[tid + stride]);
+      red_v[tid] = fmaxf(red_v[tid], red_v[tid + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    k_scale = (red_k[0] > 0.0f) ? (red_k[0] / 7.0f) : (1.0f / 7.0f);
+    v_scale = (red_v[0] > 0.0f) ? (red_v[0] / 7.0f) : (1.0f / 7.0f);
+    k_inv_scale = 1.0f / k_scale;
+    v_inv_scale = 1.0f / v_scale;
+    *k_scale_out = k_scale;
+    *v_scale_out = v_scale;
+  }
+  __syncthreads();
+
+  for (uint32_t pair = tid; pair < n / 2; pair += blockDim.x) {
+    uint32_t idx0 = pair * 2;
+    uint32_t idx1 = idx0 + 1;
+    int k0 = (int)lrintf(__half2float(k_src[idx0]) * k_inv_scale);
+    int k1 = (int)lrintf(__half2float(k_src[idx1]) * k_inv_scale);
+    int v0 = (int)lrintf(__half2float(v_src[idx0]) * v_inv_scale);
+    int v1 = (int)lrintf(__half2float(v_src[idx1]) * v_inv_scale);
+    k0 = (k0 < -8) ? -8 : ((k0 > 7) ? 7 : k0);
+    k1 = (k1 < -8) ? -8 : ((k1 > 7) ? 7 : k1);
+    v0 = (v0 < -8) ? -8 : ((v0 > 7) ? 7 : v0);
+    v1 = (v1 < -8) ? -8 : ((v1 > 7) ? 7 : v1);
+    k_dst[pair] = (uint8_t)((k0 & 0xF) | ((k1 & 0xF) << 4));
+    v_dst[pair] = (uint8_t)((v0 & 0xF) | ((v1 & 0xF) << 4));
+  }
+}
+
+__global__ void
+kern_fill_rope_row(uint32_t half_dim, uint32_t pos,
+                   float freq_base,
+                   const float * __restrict__ freq_factors,
+                   float * __restrict__ cos_row,
+                   float * __restrict__ sin_row) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= half_dim) return;
+  uint32_t head_dim = half_dim * 2;
+  float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+  if (freq_factors) freq /= freq_factors[i];
+  float angle = (float)pos * freq;
+  cos_row[i] = cosf(angle);
+  sin_row[i] = sinf(angle);
+}
+
 // RoPE (Rotary Position Embedding) applied in-place
 // For head_dim elements: pairs (x[2i], x[2i+1]) rotated by angle at position pos
 __global__ void __launch_bounds__(WAVE)
@@ -439,7 +808,7 @@ kern_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
 
   for (uint32_t i = tid; i < half_dim; i += WAVE) {
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
-    if (freq_factors) freq *= freq_factors[i];
+    if (freq_factors) freq /= freq_factors[i];
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);
@@ -458,12 +827,27 @@ kern_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
 
 static constexpr int ATTN_SPLIT_SIZE = 64; // tokens per split
 
+__device__ __forceinline__ uint32_t cache_phys_index(uint32_t cache_start,
+                                                     uint32_t cache_capacity,
+                                                     uint32_t t) {
+  uint32_t phys = cache_start + t;
+  if (phys >= cache_capacity) phys -= cache_capacity;
+  return phys;
+}
+
+__device__ __forceinline__ int unpack_q4_signed(const uint8_t *src, uint32_t idx) {
+  uint8_t byte = src[idx >> 1];
+  uint8_t nibble = (idx & 1) ? (byte >> 4) : (byte & 0xF);
+  return (nibble < 8) ? (int)nibble : ((int)nibble - 16);
+}
+
 // Phase 1: each wavefront handles one head × one chunk of tokens
 // Grid: (n_q_heads, n_splits), Block: (32)
 // Output: split_buf[split][head][head_dim] (partial output), split_ml[split][head][2] (m, l)
 __global__ void __launch_bounds__(WAVE)
 kern_attn_split(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                uint32_t seq_len, float scale,
+                uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                float scale,
                 const __half * __restrict__ q,
                 const __half * __restrict__ k_cache,
                 const __half * __restrict__ v_cache,
@@ -497,8 +881,9 @@ kern_attn_split(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
   float o[16] = {};
 
   for (uint32_t t = t_start; t < t_end; t++) {
-    const __half *kt = k_cache + t * n_kv_heads * head_dim + kvh * head_dim;
-    const __half *vt = v_cache + t * n_kv_heads * head_dim + kvh * head_dim;
+    uint32_t phys_t = cache_phys_index(cache_start, cache_capacity, t);
+    const __half *kt = k_cache + phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    const __half *vt = v_cache + phys_t * n_kv_heads * head_dim + kvh * head_dim;
 
     float dot = 0.0f;
     for (uint32_t i = 0; i < ept; i++)
@@ -575,7 +960,8 @@ kern_attn_reduce(uint32_t n_q_heads, uint32_t head_dim, uint32_t n_splits,
 // Original single-wave attention (used when seq_len is short enough)
 __global__ void __launch_bounds__(WAVE)
 kern_attn_decode(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                 uint32_t seq_len, float scale,
+                 uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                 float scale,
                  const __half * __restrict__ q,
                  const __half * __restrict__ k_cache,
                  const __half * __restrict__ v_cache,
@@ -593,8 +979,9 @@ kern_attn_decode(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
   float o[16] = {};
 
   for (uint32_t t = 0; t < seq_len; t++) {
-    const __half *kt = k_cache + t * n_kv_heads * head_dim + kvh * head_dim;
-    const __half *vt = v_cache + t * n_kv_heads * head_dim + kvh * head_dim;
+    uint32_t phys_t = cache_phys_index(cache_start, cache_capacity, t);
+    const __half *kt = k_cache + phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    const __half *vt = v_cache + phys_t * n_kv_heads * head_dim + kvh * head_dim;
 
     float dot = 0.0f;
     for (int i = 0; i < (int)head_dim / WAVE; i++)
@@ -621,6 +1008,210 @@ kern_attn_decode(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
     out[qh * head_dim + tid * (head_dim / WAVE) + i] = __float2half(o[i] * l_inv);
 }
 
+__global__ void __launch_bounds__(WAVE)
+kern_attn_split_i8(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                   uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                   float scale,
+                   const __half * __restrict__ q,
+                   const int8_t * __restrict__ k_cache,
+                   const int8_t * __restrict__ v_cache,
+                   const float  * __restrict__ k_scale,
+                   const float  * __restrict__ v_scale,
+                   float        * __restrict__ split_o,
+                   float        * __restrict__ split_ml) {
+  int qh = blockIdx.x;
+  int split_id = blockIdx.y;
+  if (qh >= (int)n_q_heads) return;
+  int kvh = qh / (n_q_heads / n_kv_heads);
+  int tid = threadIdx.x;
+  uint32_t ept = head_dim / WAVE;
+
+  uint32_t t_start = split_id * ATTN_SPLIT_SIZE;
+  uint32_t t_end = min(t_start + ATTN_SPLIT_SIZE, seq_len);
+  if (t_start >= seq_len) {
+    if (tid == 0) {
+      uint32_t ml_idx = split_id * n_q_heads * 2 + qh * 2;
+      split_ml[ml_idx] = -1e9f;
+      split_ml[ml_idx + 1] = 0.0f;
+    }
+    return;
+  }
+
+  float q_reg[16];
+  for (uint32_t i = 0; i < ept; i++)
+    q_reg[i] = __half2float(q[qh * head_dim + tid * ept + i]);
+
+  float m = -1e9f, l = 0.0f;
+  float o[16] = {};
+
+  for (uint32_t t = t_start; t < t_end; t++) {
+    uint32_t phys_t = cache_phys_index(cache_start, cache_capacity, t);
+    const int8_t *kt = k_cache + (size_t)phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    const int8_t *vt = v_cache + (size_t)phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    float ks = k_scale[phys_t];
+    float vs = v_scale[phys_t];
+
+    float dot = 0.0f;
+    for (uint32_t i = 0; i < ept; i++)
+      dot += q_reg[i] * ((float)kt[tid * ept + i] * ks);
+    dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+    dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+
+    float s_val = dot * scale;
+    float m_new = fmaxf(m, s_val);
+    float exp_shift = expf(m - m_new);
+    float exp_s = expf(s_val - m_new);
+    l = exp_shift * l + exp_s;
+    for (uint32_t i = 0; i < ept; i++)
+      o[i] = exp_shift * o[i] + exp_s * ((float)vt[tid * ept + i] * vs);
+    m = m_new;
+  }
+
+  uint32_t o_base = (split_id * n_q_heads + qh) * head_dim + tid * ept;
+  for (uint32_t i = 0; i < ept; i++)
+    split_o[o_base + i] = o[i];
+
+  if (tid == 0) {
+    uint32_t ml_idx = split_id * n_q_heads * 2 + qh * 2;
+    split_ml[ml_idx] = m;
+    split_ml[ml_idx + 1] = l;
+  }
+}
+
+__global__ void __launch_bounds__(WAVE)
+kern_attn_decode_i8(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                    uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                    float scale,
+                    const __half * __restrict__ q,
+                    const int8_t * __restrict__ k_cache,
+                    const int8_t * __restrict__ v_cache,
+                    const float  * __restrict__ k_scale,
+                    const float  * __restrict__ v_scale,
+                    __half       * __restrict__ out) {
+  int qh = blockIdx.x;
+  if (qh >= (int)n_q_heads) return;
+  int kvh = qh / (n_q_heads / n_kv_heads);
+  int tid = threadIdx.x;
+
+  float q_reg[16];
+  for (int i = 0; i < (int)head_dim / WAVE; i++)
+    q_reg[i] = __half2float(q[qh * head_dim + tid * (head_dim / WAVE) + i]);
+
+  float m = -1e9f, l = 0.0f;
+  float o[16] = {};
+
+  for (uint32_t t = 0; t < seq_len; t++) {
+    uint32_t phys_t = cache_phys_index(cache_start, cache_capacity, t);
+    const int8_t *kt = k_cache + (size_t)phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    const int8_t *vt = v_cache + (size_t)phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    float ks = k_scale[phys_t];
+    float vs = v_scale[phys_t];
+
+    float dot = 0.0f;
+    for (int i = 0; i < (int)head_dim / WAVE; i++)
+      dot += q_reg[i] * ((float)kt[tid * (head_dim / WAVE) + i] * ks);
+
+    dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+    dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+
+    float s_val = dot * scale;
+    float m_new = fmaxf(m, s_val);
+    float exp_shift = expf(m - m_new);
+    float exp_s = expf(s_val - m_new);
+    l = exp_shift * l + exp_s;
+
+    for (int i = 0; i < (int)head_dim / WAVE; i++)
+      o[i] = exp_shift * o[i] + exp_s * ((float)vt[tid * (head_dim / WAVE) + i] * vs);
+    m = m_new;
+  }
+
+  float l_inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+  for (int i = 0; i < (int)head_dim / WAVE; i++)
+    out[qh * head_dim + tid * (head_dim / WAVE) + i] = __float2half(o[i] * l_inv);
+}
+
+// Global Gemma layers use 16:1 GQA. Process all 16 query heads in a single
+// block so the shared K/V head is streamed once instead of 16 times.
+static constexpr int GLOBAL_GQA_HEADS = 16;
+static constexpr int GLOBAL_GQA_BLOCK = GLOBAL_GQA_HEADS * WAVE;
+
+__global__ void __launch_bounds__(GLOBAL_GQA_BLOCK)
+kern_attn_split_gqa_q4(uint32_t head_dim,
+                       uint32_t seq_len,
+                       uint32_t cache_capacity,
+                       uint32_t cache_start,
+                       float scale,
+                       const __half * __restrict__ q,
+                       const uint8_t * __restrict__ k_cache,
+                       const uint8_t * __restrict__ v_cache,
+                       const float   * __restrict__ k_scale,
+                       const float   * __restrict__ v_scale,
+                       float         * __restrict__ split_o,
+                       float         * __restrict__ split_ml) {
+  int split_id = blockIdx.x;
+  int tid = threadIdx.x;
+  int qh = tid / WAVE;
+  int lane = tid & (WAVE - 1);
+  if (qh >= GLOBAL_GQA_HEADS) return;
+
+  uint32_t ept = head_dim / WAVE;
+  uint32_t t_start = split_id * ATTN_SPLIT_SIZE;
+  uint32_t t_end = min(t_start + ATTN_SPLIT_SIZE, seq_len);
+  if (t_start >= seq_len) {
+    if (lane == 0) {
+      uint32_t ml_idx = split_id * GLOBAL_GQA_HEADS * 2 + qh * 2;
+      split_ml[ml_idx] = -1e9f;
+      split_ml[ml_idx + 1] = 0.0f;
+    }
+    return;
+  }
+
+  float q_reg[16];
+  for (uint32_t i = 0; i < ept; i++)
+    q_reg[i] = __half2float(q[qh * head_dim + lane * ept + i]);
+
+  float m = -1e9f;
+  float l = 0.0f;
+  float o[16] = {};
+
+  for (uint32_t t = t_start; t < t_end; t++) {
+    uint32_t phys_t = cache_phys_index(cache_start, cache_capacity, t);
+    const uint8_t *kt = k_cache + (size_t)phys_t * (head_dim / 2);
+    const uint8_t *vt = v_cache + (size_t)phys_t * (head_dim / 2);
+    float ks = k_scale[phys_t];
+    float vs = v_scale[phys_t];
+
+    float dot = 0.0f;
+    for (uint32_t i = 0; i < ept; i++) {
+      uint32_t idx = lane * ept + i;
+      dot += q_reg[i] * ((float)unpack_q4_signed(kt, idx) * ks);
+    }
+    dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+    dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+
+    float s_val = dot * scale;
+    float m_new = fmaxf(m, s_val);
+    float exp_shift = expf(m - m_new);
+    float exp_s = expf(s_val - m_new);
+    l = exp_shift * l + exp_s;
+    for (uint32_t i = 0; i < ept; i++) {
+      uint32_t idx = lane * ept + i;
+      o[i] = exp_shift * o[i] + exp_s * ((float)unpack_q4_signed(vt, idx) * vs);
+    }
+    m = m_new;
+  }
+
+  uint32_t o_base = (split_id * GLOBAL_GQA_HEADS + qh) * head_dim + lane * ept;
+  for (uint32_t i = 0; i < ept; i++)
+    split_o[o_base + i] = o[i];
+
+  if (lane == 0) {
+    uint32_t ml_idx = split_id * GLOBAL_GQA_HEADS * 2 + qh * 2;
+    split_ml[ml_idx] = m;
+    split_ml[ml_idx + 1] = l;
+  }
+}
+
 // Q6_K GEMV for lm_head: y[n] = sum_k dequant(W[n,k]) * x[k]
 // All 32 threads collaborate on EACH Q6_K block (256 elem / 32 = 8 elem/thread).
 // Sequential over blocks, parallel within block. 264 GB/s on gfx1032.
@@ -642,16 +1233,21 @@ kern_gemv_q6k(int N, int K,
     const __half *xblk = x + blk * 256;
 
     int base = tid * 8;
-    float sub_scale = d * (float)b.scales[base / 16];
 
     #pragma unroll
     for (int i = 0; i < 8; i++) {
       int j = base + i;
-      uint8_t ql_val = (b.ql[j / 2] >> ((j % 2) * 4)) & 0xF;
-      uint8_t qh_val = (b.qh[j / 4] >> ((j % 4) * 2)) & 0x3;
+      int group = j / 128;
+      int jg = j % 128;
+      int l = jg % 32;
+      int quart = jg / 32;
+      int ql_idx = group * 64 + l + ((quart & 1) ? 32 : 0);
+      uint8_t ql_byte = b.ql[ql_idx];
+      uint8_t ql_val = (quart >= 2) ? ((ql_byte >> 4) & 0xF) : (ql_byte & 0xF);
+      uint8_t qh_val = (b.qh[group * 32 + l] >> (quart * 2)) & 0x3;
       int8_t q = (int8_t)((ql_val | (qh_val << 4)) - 32);
-      float s = (i == 0 || (base + i) / 16 == base / 16) ? sub_scale
-                : d * (float)b.scales[(base + i) / 16];
+      int scale_idx = group * 8 + (l / 16) + ((quart & 2) ? 4 : 0) + ((quart & 1) ? 2 : 0);
+      float s = d * (float)b.scales[scale_idx];
       acc += s * (float)q * __half2float(xblk[j]);
     }
   }
@@ -828,10 +1424,17 @@ kern_embed_lookup(uint32_t token, uint32_t dim, float embed_scale,
   int j = tid % 256;
   const Q6_K_Block &b = row[blk_idx];
   float d = __half2float(b.d);
-  uint8_t ql_val = (b.ql[j / 2] >> ((j % 2) * 4)) & 0xF;
-  uint8_t qh_val = (b.qh[j / 4] >> ((j % 4) * 2)) & 0x3;
+  int group = j / 128;
+  int jg = j % 128;
+  int l = jg % 32;
+  int quart = jg / 32;
+  int ql_idx = group * 64 + l + ((quart & 1) ? 32 : 0);
+  uint8_t ql_byte = b.ql[ql_idx];
+  uint8_t ql_val = (quart >= 2) ? ((ql_byte >> 4) & 0xF) : (ql_byte & 0xF);
+  uint8_t qh_val = (b.qh[group * 32 + l] >> (quart * 2)) & 0x3;
   int8_t q = (int8_t)((ql_val | (qh_val << 4)) - 32);
-  float scale = d * (float)b.scales[j / 16];
+  int scale_idx = group * 8 + (l / 16) + ((quart & 2) ? 4 : 0) + ((quart & 1) ? 2 : 0);
+  float scale = d * (float)b.scales[scale_idx];
   out[tid] = __float2half((float)q * scale * embed_scale);
 }
 
@@ -850,10 +1453,17 @@ kern_embed_lookup_indirect(const uint32_t * __restrict__ token_ptr, uint32_t dim
   int j = tid % 256;
   const Q6_K_Block &b = row[blk_idx];
   float d = __half2float(b.d);
-  uint8_t ql_val = (b.ql[j / 2] >> ((j % 2) * 4)) & 0xF;
-  uint8_t qh_val = (b.qh[j / 4] >> ((j % 4) * 2)) & 0x3;
+  int group = j / 128;
+  int jg = j % 128;
+  int l = jg % 32;
+  int quart = jg / 32;
+  int ql_idx = group * 64 + l + ((quart & 1) ? 32 : 0);
+  uint8_t ql_byte = b.ql[ql_idx];
+  uint8_t ql_val = (quart >= 2) ? ((ql_byte >> 4) & 0xF) : (ql_byte & 0xF);
+  uint8_t qh_val = (b.qh[group * 32 + l] >> (quart * 2)) & 0x3;
   int8_t q = (int8_t)((ql_val | (qh_val << 4)) - 32);
-  float scale = d * (float)b.scales[j / 16];
+  int scale_idx = group * 8 + (l / 16) + ((quart & 2) ? 4 : 0) + ((quart & 1) ? 2 : 0);
+  float scale = d * (float)b.scales[scale_idx];
   out[tid] = __float2half((float)q * scale * embed_scale);
 }
 
@@ -879,14 +1489,14 @@ kern_rope_precomp(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
   }
 }
 
-// Fused: RMSNorm per head + RoPE (saves 2 kernel launches per Q/K)
+// Fused: RMSNorm per head + RoPE with a single precomputed row.
 __global__ void __launch_bounds__(WAVE)
-kern_headnorm_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
-                   const float * __restrict__ norm_weights,
-                   const float * __restrict__ cos_table,
-                   const float * __restrict__ sin_table,
-                   float eps,
-                   __half * __restrict__ x) {
+kern_headnorm_rope_row(uint32_t n_heads, uint32_t head_dim,
+                       const float * __restrict__ norm_weights,
+                       const float * __restrict__ cos_row,
+                       const float * __restrict__ sin_row,
+                       float eps,
+                       __half * __restrict__ x) {
   int head = blockIdx.x;
   if (head >= (int)n_heads) return;
   int tid = threadIdx.x;
@@ -904,8 +1514,6 @@ kern_headnorm_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
 
   // Apply norm and write to temp registers, then RoPE
   uint32_t half_dim = head_dim / 2;
-  const float *cos_row = cos_table + pos * half_dim;
-  const float *sin_row = sin_table + pos * half_dim;
 
   // Two-pass: first normalize, then rotate
   for (uint32_t i = tid; i < head_dim; i += WAVE)
@@ -916,6 +1524,46 @@ kern_headnorm_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
     float x1 = __half2float(hx[i + half_dim]);
     hx[i]            = __float2half(x0 * cos_row[i] - x1 * sin_row[i]);
     hx[i + half_dim] = __float2half(x0 * sin_row[i] + x1 * cos_row[i]);
+  }
+}
+
+// Prefill path: compute RoPE on the fly so long context does not require
+// max_seq-sized tables in VRAM.
+__global__ void __launch_bounds__(WAVE)
+kern_headnorm_rope_dynamic(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
+                           float freq_base,
+                           const float * __restrict__ freq_factors,
+                           const float * __restrict__ norm_weights,
+                           float eps,
+                           __half * __restrict__ x) {
+  int head = blockIdx.x;
+  if (head >= (int)n_heads) return;
+  int tid = threadIdx.x;
+  __half *hx = x + head * head_dim;
+
+  float ss = 0.0f;
+  for (uint32_t i = tid; i < head_dim; i += WAVE) {
+    float v = __half2float(hx[i]);
+    ss += v * v;
+  }
+  ss += __shfl_xor(ss, 16); ss += __shfl_xor(ss, 8);
+  ss += __shfl_xor(ss, 4);  ss += __shfl_xor(ss, 2); ss += __shfl_xor(ss, 1);
+  float rms_inv = rsqrtf(ss / (float)head_dim + eps);
+
+  uint32_t half_dim = head_dim / 2;
+  for (uint32_t i = tid; i < head_dim; i += WAVE)
+    hx[i] = __float2half(__half2float(hx[i]) * rms_inv * norm_weights[i % head_dim]);
+
+  for (uint32_t i = tid; i < half_dim; i += WAVE) {
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    if (freq_factors) freq /= freq_factors[i];
+    float angle = (float)pos * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+    float x0 = __half2float(hx[i]);
+    float x1 = __half2float(hx[i + half_dim]);
+    hx[i]            = __float2half(x0 * cos_a - x1 * sin_a);
+    hx[i + half_dim] = __float2half(x0 * sin_a + x1 * cos_a);
   }
 }
 
@@ -1193,10 +1841,9 @@ kern_gemm_q4_0_wmma(int M, int N, int K,
 
       const Q4_0Block &blk = W[(long)w_row * (K / Q4_BLOCK) + blk_idx];
       float scale = __half2float(blk.scale);
-      int nibble_idx = elem_in_blk;
-      uint8_t packed = blk.qs[nibble_idx / 2];
-      float val = (nibble_idx & 1) ? scale * ((float)(packed >> 4) - 8.0f)
-                                   : scale * ((float)(packed & 0xF) - 8.0f);
+      uint8_t packed = blk.qs[elem_in_blk & 15];
+      float val = (elem_in_blk < 16) ? scale * ((float)(packed & 0xF) - 8.0f)
+                                     : scale * ((float)(packed >> 4) - 8.0f);
       // Store col-major for WMMA B: b_tile[col][k_off]
       b_tile[col * WMMA_K + k_off] = __float2half(val);
     }
@@ -1265,9 +1912,9 @@ kern_gemm_q4_0_wmma_padded(int M_real, int N, int K,
       int elem_in_blk = k_idx % Q4_BLOCK;
       const Q4_0Block &blk = W[(long)w_row * (K / Q4_BLOCK) + blk_idx];
       float scale = __half2float(blk.scale);
-      uint8_t packed = blk.qs[elem_in_blk / 2];
-      float val = (elem_in_blk & 1) ? scale * ((float)(packed >> 4) - 8.0f)
-                                     : scale * ((float)(packed & 0xF) - 8.0f);
+      uint8_t packed = blk.qs[elem_in_blk & 15];
+      float val = (elem_in_blk < 16) ? scale * ((float)(packed & 0xF) - 8.0f)
+                                     : scale * ((float)(packed >> 4) - 8.0f);
       b_tile[col * WMMA_K + k_off] = __float2half(val);
     }
 
@@ -1326,8 +1973,22 @@ struct LayerWeights {
   uint32_t q_dim;     // n_q_heads * head_dim
   uint32_t kv_dim;    // n_kv_heads * head_dim
   bool     is_swa;    // sliding window layer
+  uint32_t attn_window;
+  uint32_t kv_capacity;
   bool     has_kv;    // has own K/V projection (non-shared layers)
   bool     has_v;     // has separate V weight (vs using K as V)
+  bool     kv_quant_i8;
+  bool     kv_quant_q4;
+
+  // Layer-local KV storage
+  __half *kv_k;
+  __half *kv_v;
+  int8_t *kv_k_i8;
+  int8_t *kv_v_i8;
+  uint8_t *kv_k_q4;
+  uint8_t *kv_v_q4;
+  float  *kv_k_scale;
+  float  *kv_v_scale;
 };
 
 struct Model {
@@ -1344,21 +2005,28 @@ struct Model {
   __half *logits_dev;                   // [vocab_size] on GPU for argmax
   uint32_t *argmax_dev;                 // GPU argmax result
 
-  // Precomputed RoPE tables (GPU)
-  float *rope_cos_swa;    // [max_seq × 128] for SWA (head_dim=256, half=128)
-  float *rope_sin_swa;
-  float *rope_cos_global; // [max_seq × 256] for global (head_dim=512, half=256)
-  float *rope_sin_global;
-
-  // KV cache: [N_LAYERS][max_seq][n_kv_heads * head_dim] fp16 on device
-  __half **kv_k; // per-layer K cache
-  __half **kv_v; // per-layer V cache
+  // Per-token RoPE rows (GPU) reused across all layers of the same type
+  float *rope_cos_swa_row;    // [128]
+  float *rope_sin_swa_row;    // [128]
+  float *rope_cos_global_row; // [256]
+  float *rope_sin_global_row; // [256]
   uint32_t max_seq;
+  uint32_t sliding_window;
 
   // Split attention scratch buffers
   float *attn_split_o;   // [max_splits × max_q_heads × max_head_dim]
   float *attn_split_ml;  // [max_splits × max_q_heads × 2]
 };
+
+static uint32_t getenv_u32(const char *name, uint32_t default_value) {
+  const char *v = getenv(name);
+  if (!v || !*v) return default_value;
+  char *end = nullptr;
+  unsigned long parsed = strtoul(v, &end, 10);
+  if (!end || *end != '\0' || parsed == 0 || parsed > 0xffffffffUL)
+    return default_value;
+  return (uint32_t)parsed;
+}
 
 // ============================================================================
 // Q6_K dequantization (for embedding table, done on CPU)
@@ -1373,17 +2041,16 @@ static void dequant_q6k_row(__half *out, const uint8_t *data, uint64_t n_element
     float d = __half2float(blk.d);
 
     for (int j = 0; j < 256; j++) {
-      // Get the 6-bit quantized value
-      int ql_idx = j / 2;
-      int ql_shift = (j % 2) * 4;
-      uint8_t ql_val = (blk.ql[ql_idx] >> ql_shift) & 0xF;
-
-      int qh_idx = j / 4;
-      int qh_shift = (j % 4) * 2;
-      uint8_t qh_val = (blk.qh[qh_idx] >> qh_shift) & 0x3;
-
+      int group = j / 128;
+      int jg = j % 128;
+      int l = jg % 32;
+      int quart = jg / 32;
+      int ql_idx = group * 64 + l + ((quart & 1) ? 32 : 0);
+      uint8_t ql_byte = blk.ql[ql_idx];
+      uint8_t ql_val = (quart >= 2) ? ((ql_byte >> 4) & 0xF) : (ql_byte & 0xF);
+      uint8_t qh_val = (blk.qh[group * 32 + l] >> (quart * 2)) & 0x3;
       int8_t q = (int8_t)((ql_val | (qh_val << 4)) - 32);
-      int scale_idx = j / 16;
+      int scale_idx = group * 8 + (l / 16) + ((quart & 2) ? 4 : 0) + ((quart & 1) ? 2 : 0);
       float scale = d * (float)blk.scales[scale_idx];
       out[b * 256 + j] = __float2half((float)q * scale);
     }
@@ -1416,7 +2083,8 @@ static bool load_model(GGUFFile *gguf, Model *model) {
   model->final_logit_softcap = 30.0f;
   model->rope_freq_base = 1000000.0f;
   model->rope_freq_base_swa = 10000.0f;
-  model->max_seq = 512;  // keep small — just enough for benchmarking t/s
+  model->max_seq = 65536;
+  model->sliding_window = 1024;
 
   if (gguf->kv_float.count("gemma4.final_logit_softcapping"))
     model->final_logit_softcap = gguf->kv_float["gemma4.final_logit_softcapping"];
@@ -1424,6 +2092,11 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     model->rope_freq_base = gguf->kv_float["gemma4.rope.freq_base"];
   if (gguf->kv_float.count("gemma4.rope.freq_base_swa"))
     model->rope_freq_base_swa = gguf->kv_float["gemma4.rope.freq_base_swa"];
+  if (gguf->kv_uint.count("gemma4.attention.sliding_window"))
+    model->sliding_window = (uint32_t)gguf->kv_uint["gemma4.attention.sliding_window"];
+  if (gguf->kv_uint.count("gemma4.context_length"))
+    model->max_seq = (uint32_t)std::min<uint64_t>(gguf->kv_uint["gemma4.context_length"], model->max_seq);
+  model->max_seq = getenv_u32("THEROCK_MAX_SEQ", model->max_seq);
 
   // SWA pattern: layers 5,11,17,23,29,35,41,47 are global (non-SWA)
   // From metadata: sliding_window_pattern = [T,T,T,T,T,F,T,T,T,T] repeating
@@ -1469,22 +2142,31 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     }
   }
 
-  // Allocate KV cache
-  model->kv_k = new __half*[N_LAYERS];
-  model->kv_v = new __half*[N_LAYERS];
-
   printf("Loading %u layers...\n", N_LAYERS);
+  bool force_fp16_kv = getenv("THEROCK_FORCE_FP16_KV") != nullptr;
   for (uint32_t l = 0; l < N_LAYERS; l++) {
     LayerWeights &lw = model->layers[l];
     char name[128];
 
     lw.is_swa = !is_global(l);
+    lw.attn_window = lw.is_swa ? model->sliding_window : model->max_seq;
     lw.has_kv = true;  // all layers in 12B have their own KV
     lw.head_dim = lw.is_swa ? 256 : 512;
     lw.n_q_heads = 16;
     lw.n_kv_heads = lw.is_swa ? 8 : 1;
     lw.q_dim = lw.n_q_heads * lw.head_dim;
     lw.kv_dim = lw.n_kv_heads * lw.head_dim;
+    lw.kv_capacity = lw.is_swa ? std::min(model->max_seq, lw.attn_window) : model->max_seq;
+    lw.kv_quant_i8 = lw.is_swa && !force_fp16_kv;
+    lw.kv_quant_q4 = !lw.is_swa && !force_fp16_kv;
+    lw.kv_k = nullptr;
+    lw.kv_v = nullptr;
+    lw.kv_k_i8 = nullptr;
+    lw.kv_v_i8 = nullptr;
+    lw.kv_k_q4 = nullptr;
+    lw.kv_v_q4 = nullptr;
+    lw.kv_k_scale = nullptr;
+    lw.kv_v_scale = nullptr;
 
     // Check if V weight exists
     snprintf(name, sizeof(name), "blk.%u.attn_v.weight", l);
@@ -1535,71 +2217,59 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     }
 
     // KV cache allocation
-    size_t kv_bytes = (size_t)model->max_seq * lw.kv_dim * sizeof(__half);
-    HIP_CHECK(hipMalloc(&model->kv_k[l], kv_bytes));
-    HIP_CHECK(hipMalloc(&model->kv_v[l], kv_bytes));
-    HIP_CHECK(hipMemset(model->kv_k[l], 0, kv_bytes));
-    HIP_CHECK(hipMemset(model->kv_v[l], 0, kv_bytes));
-    total_gpu_bytes += kv_bytes * 2;
+    size_t kv_elems = (size_t)lw.kv_capacity * lw.kv_dim;
+    if (lw.kv_quant_q4) {
+      size_t kv_bytes = (kv_elems / 2) * sizeof(uint8_t);
+      size_t scale_bytes = (size_t)lw.kv_capacity * sizeof(float);
+      HIP_CHECK(hipMalloc(&lw.kv_k_q4, kv_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_v_q4, kv_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_k_scale, scale_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_v_scale, scale_bytes));
+      HIP_CHECK(hipMemset(lw.kv_k_q4, 0, kv_bytes));
+      HIP_CHECK(hipMemset(lw.kv_v_q4, 0, kv_bytes));
+      HIP_CHECK(hipMemset(lw.kv_k_scale, 0, scale_bytes));
+      HIP_CHECK(hipMemset(lw.kv_v_scale, 0, scale_bytes));
+      total_gpu_bytes += kv_bytes * 2 + scale_bytes * 2;
+    } else if (lw.kv_quant_i8) {
+      size_t kv_bytes = kv_elems * sizeof(int8_t);
+      size_t scale_bytes = (size_t)lw.kv_capacity * sizeof(float);
+      HIP_CHECK(hipMalloc(&lw.kv_k_i8, kv_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_v_i8, kv_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_k_scale, scale_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_v_scale, scale_bytes));
+      HIP_CHECK(hipMemset(lw.kv_k_i8, 0, kv_bytes));
+      HIP_CHECK(hipMemset(lw.kv_v_i8, 0, kv_bytes));
+      HIP_CHECK(hipMemset(lw.kv_k_scale, 0, scale_bytes));
+      HIP_CHECK(hipMemset(lw.kv_v_scale, 0, scale_bytes));
+      total_gpu_bytes += kv_bytes * 2 + scale_bytes * 2;
+    } else {
+      size_t kv_bytes = kv_elems * sizeof(__half);
+      HIP_CHECK(hipMalloc(&lw.kv_k, kv_bytes));
+      HIP_CHECK(hipMalloc(&lw.kv_v, kv_bytes));
+      HIP_CHECK(hipMemset(lw.kv_k, 0, kv_bytes));
+      HIP_CHECK(hipMemset(lw.kv_v, 0, kv_bytes));
+      total_gpu_bytes += kv_bytes * 2;
+    }
 
     if (l % 12 == 0 || l == N_LAYERS - 1)
-      printf("  Layer %u: q_dim=%u kv_dim=%u head_dim=%u %s%s [%.0f MB GPU so far]\n",
+      printf("  Layer %u: q_dim=%u kv_dim=%u head_dim=%u %s%s cap=%u %s [%.0f MB GPU so far]\n",
              l, lw.q_dim, lw.kv_dim, lw.head_dim,
              lw.is_swa ? "SWA" : "GLOBAL",
              lw.has_v ? "" : " (K=V)",
+             lw.kv_capacity,
+             lw.kv_quant_q4 ? "q4-kv" : (lw.kv_quant_i8 ? "int8-kv" : "fp16-kv"),
              total_gpu_bytes / 1e6);
   }
 
-  // Precompute RoPE cos/sin tables on host, upload to GPU
-  printf("Precomputing RoPE tables...\n");
+  // Allocate per-token RoPE rows. Decode fills these once per token and reuses
+  // them across all layers of the same type.
+  printf("Allocating RoPE row buffers...\n");
   {
-    uint32_t max_seq = model->max_seq;
-
-    // SWA: head_dim=256, half_dim=128
-    size_t swa_size = (size_t)max_seq * 128;
-    float *cos_swa_h = (float*)malloc(swa_size * sizeof(float));
-    float *sin_swa_h = (float*)malloc(swa_size * sizeof(float));
-    for (uint32_t pos = 0; pos < max_seq; pos++) {
-      for (uint32_t i = 0; i < 128; i++) {
-        float freq = 1.0f / powf(model->rope_freq_base_swa, (float)(2*i) / 256.0f);
-        float angle = (float)pos * freq;
-        cos_swa_h[pos*128+i] = cosf(angle);
-        sin_swa_h[pos*128+i] = sinf(angle);
-      }
-    }
-    HIP_CHECK(hipMalloc(&model->rope_cos_swa, swa_size*sizeof(float)));
-    HIP_CHECK(hipMalloc(&model->rope_sin_swa, swa_size*sizeof(float)));
-    HIP_CHECK(hipMemcpy(model->rope_cos_swa, cos_swa_h, swa_size*sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(model->rope_sin_swa, sin_swa_h, swa_size*sizeof(float), hipMemcpyHostToDevice));
-    free(cos_swa_h); free(sin_swa_h);
-
-    // Global: head_dim=512, half_dim=256 — also needs freq_factors
-    size_t global_size = (size_t)max_seq * 256;
-    float *cos_g_h = (float*)malloc(global_size * sizeof(float));
-    float *sin_g_h = (float*)malloc(global_size * sizeof(float));
-    // Read freq_factors from host if available
-    float freq_factors_host[256] = {};
-    auto ff_it = gguf->tensors.find("rope_freqs.weight");
-    if (ff_it != gguf->tensors.end()) {
-      const float *ff_data = (const float*)gguf->tensor_data(ff_it->second);
-      memcpy(freq_factors_host, ff_data, std::min((size_t)256, (size_t)ff_it->second.n_elements) * sizeof(float));
-    }
-    for (uint32_t pos = 0; pos < max_seq; pos++) {
-      for (uint32_t i = 0; i < 256; i++) {
-        float freq = 1.0f / powf(model->rope_freq_base, (float)(2*i) / 512.0f);
-        if (freq_factors_host[i] != 0.0f) freq *= freq_factors_host[i];
-        float angle = (float)pos * freq;
-        cos_g_h[pos*256+i] = cosf(angle);
-        sin_g_h[pos*256+i] = sinf(angle);
-      }
-    }
-    HIP_CHECK(hipMalloc(&model->rope_cos_global, global_size*sizeof(float)));
-    HIP_CHECK(hipMalloc(&model->rope_sin_global, global_size*sizeof(float)));
-    HIP_CHECK(hipMemcpy(model->rope_cos_global, cos_g_h, global_size*sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(model->rope_sin_global, sin_g_h, global_size*sizeof(float), hipMemcpyHostToDevice));
-    free(cos_g_h); free(sin_g_h);
-
-    total_gpu_bytes += (swa_size + global_size) * 2 * sizeof(float);
+    HIP_CHECK(hipMalloc(&model->rope_cos_swa_row, 128 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&model->rope_sin_swa_row, 128 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&model->rope_cos_global_row, 256 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&model->rope_sin_global_row, 256 * sizeof(float)));
+    total_gpu_bytes += (128 + 128 + 256 + 256) * sizeof(float);
   }
 
   // Split attention scratch: max_splits = max_seq / ATTN_SPLIT_SIZE + 1
@@ -1621,24 +2291,84 @@ static bool load_model(GGUFFile *gguf, Model *model) {
 // Dispatch attention: uses split-K for long sequences, single wave for short
 static constexpr uint32_t ATTN_SPLIT_THRESHOLD = 64;
 
-static void dispatch_attention(hipStream_t s, Model *model,
-                               uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                               uint32_t seq_len, float scale,
-                               const __half *q, const __half *k_cache, const __half *v_cache,
-                               __half *out) {
+static inline uint32_t layer_seq_len(const LayerWeights &lw, uint32_t pos) {
+  return lw.is_swa ? std::min(pos + 1, lw.attn_window) : (pos + 1);
+}
+
+static inline uint32_t layer_cache_start(const LayerWeights &lw, uint32_t pos, uint32_t seq_len) {
+  if (!lw.is_swa || lw.kv_capacity == 0)
+    return 0;
+  return (pos + 1 - seq_len) % lw.kv_capacity;
+}
+
+static inline uint32_t layer_store_index(const LayerWeights &lw, uint32_t pos) {
+  return lw.is_swa ? (pos % lw.kv_capacity) : pos;
+}
+
+static void dispatch_attention_fp16(hipStream_t s, Model *model,
+                                    uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                    uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                                    float scale,
+                                    const __half *q, const __half *k_cache, const __half *v_cache,
+                                    __half *out) {
   if (seq_len <= ATTN_SPLIT_THRESHOLD) {
     hipLaunchKernelGGL(kern_attn_decode, dim3(n_q_heads), dim3(WAVE), 0, s,
-                       n_q_heads, n_kv_heads, head_dim, seq_len, scale,
+                       n_q_heads, n_kv_heads, head_dim, seq_len, cache_capacity, cache_start, scale,
                        q, k_cache, v_cache, out);
   } else {
     uint32_t n_splits = (seq_len + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
     hipLaunchKernelGGL(kern_attn_split, dim3(n_q_heads, n_splits), dim3(WAVE), 0, s,
-                       n_q_heads, n_kv_heads, head_dim, seq_len, scale,
+                       n_q_heads, n_kv_heads, head_dim, seq_len, cache_capacity, cache_start, scale,
                        q, k_cache, v_cache, model->attn_split_o, model->attn_split_ml);
     hipLaunchKernelGGL(kern_attn_reduce, dim3(n_q_heads), dim3(WAVE), 0, s,
                        n_q_heads, head_dim, n_splits,
                        model->attn_split_o, model->attn_split_ml, out);
   }
+}
+
+static void dispatch_attention_i8(hipStream_t s, Model *model,
+                                  uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                                  float scale,
+                                  const __half *q,
+                                  const int8_t *k_cache,
+                                  const int8_t *v_cache,
+                                  const float *k_scale,
+                                  const float *v_scale,
+                                  __half *out) {
+  if (seq_len <= ATTN_SPLIT_THRESHOLD) {
+    hipLaunchKernelGGL(kern_attn_decode_i8, dim3(n_q_heads), dim3(WAVE), 0, s,
+                       n_q_heads, n_kv_heads, head_dim, seq_len, cache_capacity, cache_start, scale,
+                       q, k_cache, v_cache, k_scale, v_scale, out);
+  } else {
+    uint32_t n_splits = (seq_len + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
+    hipLaunchKernelGGL(kern_attn_split_i8, dim3(n_q_heads, n_splits), dim3(WAVE), 0, s,
+                       n_q_heads, n_kv_heads, head_dim, seq_len, cache_capacity, cache_start, scale,
+                       q, k_cache, v_cache, k_scale, v_scale,
+                       model->attn_split_o, model->attn_split_ml);
+    hipLaunchKernelGGL(kern_attn_reduce, dim3(n_q_heads), dim3(WAVE), 0, s,
+                       n_q_heads, head_dim, n_splits,
+                       model->attn_split_o, model->attn_split_ml, out);
+  }
+}
+
+static void dispatch_attention_gqa_q4(hipStream_t s, Model *model,
+                                      uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
+                                      float scale,
+                                      const __half *q,
+                                      const uint8_t *k_cache,
+                                      const uint8_t *v_cache,
+                                      const float *k_scale,
+                                      const float *v_scale,
+                                      __half *out) {
+  uint32_t n_splits = (seq_len + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
+  hipLaunchKernelGGL(kern_attn_split_gqa_q4, dim3(n_splits), dim3(GLOBAL_GQA_BLOCK), 0, s,
+                     512, seq_len, cache_capacity, cache_start, scale,
+                     q, k_cache, v_cache, k_scale, v_scale,
+                     model->attn_split_o, model->attn_split_ml);
+  hipLaunchKernelGGL(kern_attn_reduce, dim3(GLOBAL_GQA_HEADS), dim3(WAVE), 0, s,
+                     GLOBAL_GQA_HEADS, 512, n_splits,
+                     model->attn_split_o, model->attn_split_ml, out);
 }
 
 // ============================================================================
@@ -1677,6 +2407,13 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
   hipLaunchKernelGGL(kern_embed_lookup, dim3((HIDDEN+255)/256), dim3(256), 0, s,
                      token, HIDDEN, sqrtf((float)HIDDEN), model->embed_q6k_dev, state->hidden);
 
+  hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(128), 0, s,
+                     128, pos, model->rope_freq_base_swa, nullptr,
+                     model->rope_cos_swa_row, model->rope_sin_swa_row);
+  hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(256), 0, s,
+                     256, pos, model->rope_freq_base, model->rope_freqs,
+                     model->rope_cos_global_row, model->rope_sin_global_row);
+
   __half *normed = state->normed;
 
   for (uint32_t l = 0; l < N_LAYERS; l++) {
@@ -1695,6 +2432,11 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
       hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
                          (int)lw.kv_dim, (int)HIDDEN,
                          normed, (const Q4_0Block*)lw.wk, state->scratch_kv);
+      if (!lw.has_v) {
+        HIP_CHECK(hipMemcpyAsync(state->scratch_v, state->scratch_kv,
+                                 lw.kv_dim * sizeof(__half),
+                                 hipMemcpyDeviceToDevice, s));
+      }
     }
 
     if (lw.has_v && lw.wv) {
@@ -1703,40 +2445,80 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
                          normed, (const Q4_0Block*)lw.wv, state->scratch_v);
     }
 
-    // 3. Fused Q/K head norms + RoPE (saves 4 launches per layer)
-    const float *cos_tbl = lw.is_swa ? model->rope_cos_swa : model->rope_cos_global;
-    const float *sin_tbl = lw.is_swa ? model->rope_sin_swa : model->rope_sin_global;
+    if (lw.wk) {
+      hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                         lw.n_kv_heads, lw.head_dim,
+                         state->scratch_v, EPS);
+    }
 
-    hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
-                       lw.n_q_heads, lw.head_dim, pos,
-                       lw.attn_q_norm, cos_tbl, sin_tbl, EPS,
+    // 3. Fused Q/K head norms + RoPE using per-token rows.
+    const float *cos_row = lw.is_swa ? model->rope_cos_swa_row : model->rope_cos_global_row;
+    const float *sin_row = lw.is_swa ? model->rope_sin_swa_row : model->rope_sin_global_row;
+
+    hipLaunchKernelGGL(kern_headnorm_rope_row, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                       lw.n_q_heads, lw.head_dim,
+                       lw.attn_q_norm, cos_row, sin_row, EPS,
                        state->scratch_q);
 
     if (lw.wk) {
-      hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
-                         lw.n_kv_heads, lw.head_dim, pos,
-                         lw.attn_k_norm, cos_tbl, sin_tbl, EPS,
+      hipLaunchKernelGGL(kern_headnorm_rope_row, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                         lw.n_kv_heads, lw.head_dim,
+                         lw.attn_k_norm, cos_row, sin_row, EPS,
                          state->scratch_kv);
     }
 
     // 5. Store K/V into cache
     if (lw.wk) {
-      HIP_CHECK(hipMemcpyAsync(model->kv_k[l] + pos * lw.kv_dim,
-                               state->scratch_kv,
-                               lw.kv_dim * sizeof(__half),
-                               hipMemcpyDeviceToDevice, s));
+      uint32_t store_idx = layer_store_index(lw, pos);
       __half *v_src = lw.has_v ? state->scratch_v : state->scratch_kv;
-      HIP_CHECK(hipMemcpyAsync(model->kv_v[l] + pos * lw.kv_dim,
-                               v_src,
-                               lw.kv_dim * sizeof(__half),
-                               hipMemcpyDeviceToDevice, s));
+      if (lw.kv_quant_q4) {
+        hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
+                           lw.kv_dim, state->scratch_kv, v_src,
+                           lw.kv_k_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                           lw.kv_v_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                           lw.kv_k_scale + store_idx,
+                           lw.kv_v_scale + store_idx);
+      } else if (lw.kv_quant_i8) {
+        hipLaunchKernelGGL(kern_quantize_kv_fp16_to_i8, dim3(1), dim3(256), 0, s,
+                           lw.kv_dim, state->scratch_kv, v_src,
+                           lw.kv_k_i8 + (size_t)store_idx * lw.kv_dim,
+                           lw.kv_v_i8 + (size_t)store_idx * lw.kv_dim,
+                           lw.kv_k_scale + store_idx,
+                           lw.kv_v_scale + store_idx);
+      } else {
+        HIP_CHECK(hipMemcpyAsync(lw.kv_k + (size_t)store_idx * lw.kv_dim,
+                                 state->scratch_kv,
+                                 lw.kv_dim * sizeof(__half),
+                                 hipMemcpyDeviceToDevice, s));
+        HIP_CHECK(hipMemcpyAsync(lw.kv_v + (size_t)store_idx * lw.kv_dim,
+                                 v_src,
+                                 lw.kv_dim * sizeof(__half),
+                                 hipMemcpyDeviceToDevice, s));
+      }
     }
 
     // 6. Attention (split-K for long context)
-    uint32_t seq_len = pos + 1;
-    dispatch_attention(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                       seq_len, 1.0f, state->scratch_q,
-                       model->kv_k[l], model->kv_v[l], state->scratch_attn);
+    uint32_t seq_len = layer_seq_len(lw, pos);
+    uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+    if (lw.kv_quant_q4) {
+      dispatch_attention_gqa_q4(s, model, seq_len, lw.kv_capacity, cache_start,
+                                1.0f, state->scratch_q,
+                                lw.kv_k_q4, lw.kv_v_q4,
+                                lw.kv_k_scale, lw.kv_v_scale,
+                                state->scratch_attn);
+    } else if (lw.kv_quant_i8) {
+      dispatch_attention_i8(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                            seq_len, lw.kv_capacity, cache_start,
+                            1.0f, state->scratch_q,
+                            lw.kv_k_i8, lw.kv_v_i8,
+                            lw.kv_k_scale, lw.kv_v_scale,
+                            state->scratch_attn);
+    } else {
+      dispatch_attention_fp16(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                              seq_len, lw.kv_capacity, cache_start,
+                              1.0f, state->scratch_q,
+                              lw.kv_k, lw.kv_v, state->scratch_attn);
+    }
 
     // 7. Output projection
     hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
@@ -1845,6 +2627,11 @@ static void forward_prefill_batch(Model *model, RunState *state,
                            (int)lw.kv_dim, (int)HIDDEN,
                            state->batch_normed, (const Q4_0Block*)lw.wk, state->batch_kv);
       }
+      if (!lw.has_v) {
+        HIP_CHECK(hipMemcpyAsync(state->batch_v, state->batch_kv,
+                                 (size_t)M * lw.kv_dim * sizeof(__half),
+                                 hipMemcpyDeviceToDevice, s));
+      }
     }
 
     // V projection
@@ -1868,43 +2655,88 @@ static void forward_prefill_batch(Model *model, RunState *state,
       }
     }
 
-    // 3. Per-token: head norm + RoPE, store KV, attention
-    const float *cos_tbl = lw.is_swa ? model->rope_cos_swa : model->rope_cos_global;
-    const float *sin_tbl = lw.is_swa ? model->rope_sin_swa : model->rope_sin_global;
+    if (lw.wk) {
+      for (int t = 0; t < M; t++) {
+        hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                           lw.n_kv_heads, lw.head_dim,
+                           state->batch_v + t * lw.kv_dim, EPS);
+      }
+    }
 
+    // 3. Per-token: head norm + RoPE, store KV, attention
     for (int t = 0; t < M; t++) {
       uint32_t pos = state->pos + t;
+      const float *freq_factors = lw.is_swa ? nullptr : model->rope_freqs;
+      float freq_base = lw.is_swa ? model->rope_freq_base_swa : model->rope_freq_base;
 
       // Q head norm + RoPE
-      hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+      hipLaunchKernelGGL(kern_headnorm_rope_dynamic, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
                          lw.n_q_heads, lw.head_dim, pos,
-                         lw.attn_q_norm, cos_tbl, sin_tbl, EPS,
+                         freq_base, freq_factors, lw.attn_q_norm, EPS,
                          state->batch_q + t * lw.q_dim);
 
       // K head norm + RoPE
       if (lw.wk) {
-        hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+        hipLaunchKernelGGL(kern_headnorm_rope_dynamic, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
                            lw.n_kv_heads, lw.head_dim, pos,
-                           lw.attn_k_norm, cos_tbl, sin_tbl, EPS,
+                           freq_base, freq_factors, lw.attn_k_norm, EPS,
                            state->batch_kv + t * lw.kv_dim);
       }
 
       // Store K/V to cache
       if (lw.wk) {
-        HIP_CHECK(hipMemcpyAsync(model->kv_k[l] + pos * lw.kv_dim,
-                                 state->batch_kv + t * lw.kv_dim,
-                                 lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+        uint32_t store_idx = layer_store_index(lw, pos);
         __half *v_src = lw.has_v ? (state->batch_v + t * lw.kv_dim)
                                  : (state->batch_kv + t * lw.kv_dim);
-        HIP_CHECK(hipMemcpyAsync(model->kv_v[l] + pos * lw.kv_dim,
-                                 v_src, lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+        if (lw.kv_quant_q4) {
+          hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
+                             lw.kv_dim,
+                             state->batch_kv + t * lw.kv_dim,
+                             v_src,
+                             lw.kv_k_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                             lw.kv_v_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                             lw.kv_k_scale + store_idx,
+                             lw.kv_v_scale + store_idx);
+        } else if (lw.kv_quant_i8) {
+          hipLaunchKernelGGL(kern_quantize_kv_fp16_to_i8, dim3(1), dim3(256), 0, s,
+                             lw.kv_dim,
+                             state->batch_kv + t * lw.kv_dim,
+                             v_src,
+                             lw.kv_k_i8 + (size_t)store_idx * lw.kv_dim,
+                             lw.kv_v_i8 + (size_t)store_idx * lw.kv_dim,
+                             lw.kv_k_scale + store_idx,
+                             lw.kv_v_scale + store_idx);
+        } else {
+          HIP_CHECK(hipMemcpyAsync(lw.kv_k + (size_t)store_idx * lw.kv_dim,
+                                   state->batch_kv + t * lw.kv_dim,
+                                   lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+          HIP_CHECK(hipMemcpyAsync(lw.kv_v + (size_t)store_idx * lw.kv_dim,
+                                   v_src, lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+        }
       }
 
       // Attention (causal: token t sees positions 0..pos+t)
-      uint32_t seq_len = pos + 1;
-      dispatch_attention(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                         seq_len, 1.0f, state->batch_q + t * lw.q_dim,
-                         model->kv_k[l], model->kv_v[l], state->scratch_attn);
+      uint32_t seq_len = layer_seq_len(lw, pos);
+      uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+      if (lw.kv_quant_q4) {
+        dispatch_attention_gqa_q4(s, model, seq_len, lw.kv_capacity, cache_start,
+                                  1.0f, state->batch_q + t * lw.q_dim,
+                                  lw.kv_k_q4, lw.kv_v_q4,
+                                  lw.kv_k_scale, lw.kv_v_scale,
+                                  state->scratch_attn);
+      } else if (lw.kv_quant_i8) {
+        dispatch_attention_i8(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                              seq_len, lw.kv_capacity, cache_start,
+                              1.0f, state->batch_q + t * lw.q_dim,
+                              lw.kv_k_i8, lw.kv_v_i8,
+                              lw.kv_k_scale, lw.kv_v_scale,
+                              state->scratch_attn);
+      } else {
+        dispatch_attention_fp16(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                                seq_len, lw.kv_capacity, cache_start,
+                                1.0f, state->batch_q + t * lw.q_dim,
+                                lw.kv_k, lw.kv_v, state->scratch_attn);
+      }
 
       // Output projection for this token: [1 × q_dim] × [HIDDEN × q_dim]^T → [1 × HIDDEN]
       hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
@@ -1989,6 +2821,11 @@ static uint32_t sample_greedy(Model *model, RunState *state) {
                      (int)model->vocab_size, (int)HIDDEN,
                      state->hidden, model->embed_q6k_dev, model->logits_dev);
 
+  if (model->final_logit_softcap > 0.0f) {
+    hipLaunchKernelGGL(kern_softcap, dim3((model->vocab_size + 255) / 256), dim3(256), 0, s,
+                       model->vocab_size, model->final_logit_softcap, model->logits_dev);
+  }
+
   // GPU argmax (single kernel, no DtoH of full logits)
   HIP_CHECK(hipMemsetAsync(model->argmax_dev, 0, sizeof(uint32_t), s));
   hipLaunchKernelGGL(kern_argmax_single, dim3(1), dim3(1024), 0, s,
@@ -2001,18 +2838,96 @@ static uint32_t sample_greedy(Model *model, RunState *state) {
   return result;
 }
 
+static int run_chat(Model *model, RunState *state, const Tokenizer &tok, const char *system_prompt) {
+  std::vector<uint32_t> init_tokens;
+  if (tok.add_bos_token) init_tokens.push_back(tok.bos_id);
+  if (system_prompt && *system_prompt)
+    append_chat_turn_tokens(tok, "system", system_prompt, false, false, &init_tokens);
+  if (!init_tokens.empty())
+    prefill_tokens(model, state, init_tokens);
+
+  bool prepend_newline = false;
+  const uint32_t max_new_tokens = getenv_u32("THEROCK_CHAT_MAX_NEW", 256);
+  char line[8192];
+
+  while (true) {
+    fprintf(stdout, "user> ");
+    fflush(stdout);
+    if (!fgets(line, sizeof(line), stdin)) break;
+    std::string user_text(line);
+    while (!user_text.empty() && (user_text.back() == '\n' || user_text.back() == '\r'))
+      user_text.pop_back();
+    if (user_text.empty()) continue;
+    if (user_text == "/quit" || user_text == "/exit") break;
+
+    std::vector<uint32_t> turn_tokens;
+    append_chat_turn_tokens(tok, "user", user_text, prepend_newline, true, &turn_tokens);
+    if (state->pos + turn_tokens.size() + max_new_tokens >= model->max_seq) {
+      fprintf(stderr, "Context full at %u tokens; restart chat or raise THEROCK_MAX_SEQ\n", state->pos);
+      return 1;
+    }
+    prefill_tokens(model, state, turn_tokens);
+
+    fprintf(stdout, "assistant> ");
+    fflush(stdout);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    uint32_t generated = 0;
+    bool in_hidden_channel = false;
+    for (; generated < max_new_tokens; generated++) {
+      uint32_t tok_id = sample_greedy(model, state);
+      forward_decode(model, state, tok_id);
+      if (tok_id == tok.eos_id || tok_id == tok.turn_close_id) break;
+      if (tok_id == tok.channel_open_id) {
+        in_hidden_channel = true;
+        continue;
+      }
+      if (tok_id == tok.channel_close_id) {
+        in_hidden_channel = false;
+        continue;
+      }
+      if (in_hidden_channel) continue;
+      if (tok_id < tok.id_to_piece.size()) {
+        std::string piece = decode_piece_for_display(tok.id_to_piece[tok_id]);
+        if (!piece.empty()) {
+          fwrite(piece.data(), 1, piece.size(), stdout);
+          fflush(stdout);
+        }
+      }
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+    fprintf(stdout, "\n[turn: %u tokens in %.1f ms = %.2f t/s]\n", generated, ms,
+            generated > 0 ? generated * 1000.0f / ms : 0.0f);
+    prepend_newline = (generated < max_new_tokens);
+  }
+  return 0;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <model.gguf> [prompt]\n", argv[0]);
+    fprintf(stderr, "Usage: %s <model.gguf> [--chat] [--system TEXT] [prompt]\n", argv[0]);
     return 1;
   }
 
   const char *model_path = argv[1];
-  const char *prompt = (argc > 2) ? argv[2] : "Hello, I am";
+  bool chat_mode = false;
+  const char *prompt = nullptr;
+  const char *system_prompt = getenv("THEROCK_SYSTEM_PROMPT");
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--chat") == 0) {
+      chat_mode = true;
+    } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
+      system_prompt = argv[++i];
+    } else if (!prompt) {
+      prompt = argv[i];
+    }
+  }
+  if (!prompt && !chat_mode)
+    prompt = "Hello, I am";
 
   printf("=== TheRock Inference Engine ===\n");
   printf("Model: %s\n", model_path);
@@ -2024,6 +2939,9 @@ int main(int argc, char **argv) {
   if (!gguf) return 1;
   printf("  Version: %u, Tensors: %lu, KV pairs: %lu\n",
          gguf->version, gguf->n_tensors, gguf->n_kv);
+
+  Tokenizer tokenizer;
+  if (!load_tokenizer(gguf, &tokenizer)) return 1;
 
   // Load model to GPU
   Model model = {};
@@ -2072,32 +2990,31 @@ int main(int argc, char **argv) {
   };
 
   printf("\nModel loaded. Starting generation...\n");
-  printf("Prompt: \"%s\"\n\n", prompt);
+  if (!chat_mode)
+    printf("Prompt: \"%s\"\n\n", prompt);
   print_gpu_stats("idle");
 
-  // Tokenize (BPE is complex — for now just use byte-level fallback)
-  // TODO: proper tokenizer. For benchmarking, just feed BOS + a few tokens.
-  std::vector<uint32_t> tokens;
-  tokens.push_back(2);  // BOS token
-
-  // Simple byte-level encoding as fallback (each byte → token offset)
-  // This won't produce coherent text but will exercise the full pipeline
-  for (const char *c = prompt; *c; c++) {
-    tokens.push_back((uint32_t)(unsigned char)*c + 256);  // rough byte fallback
+  if (chat_mode) {
+    int rc = run_chat(&model, &state, tokenizer, system_prompt ? system_prompt : "");
+    gguf_close(gguf);
+    return rc;
   }
 
-  printf("Tokens: %zu (BOS + %zu prompt bytes)\n", tokens.size(), tokens.size() - 1);
+  std::vector<uint32_t> tokens = tokenizer_encode_prompt(tokenizer, prompt ? prompt : "");
+
+  int n_gen = (int)getenv_u32("THEROCK_N_GEN", 32);
+  if (tokens.size() + 2 + (size_t)n_gen > model.max_seq) {
+    fprintf(stderr, "Prompt + warmup + generation exceed max_seq=%u\n", model.max_seq);
+    return 1;
+  }
+
+  printf("Tokens: %zu\n", tokens.size());
   printf("---\n");
 
   // Prefill: process prompt tokens in batches of 16 using WMMA GEMM
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  size_t n_prompt = tokens.size();
-  for (size_t i = 0; i < n_prompt; ) {
-    int batch = std::min((int)(n_prompt - i), 16);
-    forward_prefill_batch(&model, &state, tokens.data() + i, batch);
-    i += batch;
-  }
+  prefill_tokens(&model, &state, tokens);
 
   auto t_prefill = std::chrono::high_resolution_clock::now();
   float prefill_ms = std::chrono::duration<float, std::milli>(t_prefill - t_start).count();
@@ -2117,7 +3034,6 @@ int main(int argc, char **argv) {
   // Generate tokens (timed) — pipelined: forward reads token from device memory,
   // GPU does embed+forward+lm_head+argmax → writes next token to argmax_dev,
   // host only syncs to read token for logging (not for feedback).
-  int n_gen = 32;
   printf("Generating %d tokens...\n", n_gen);
 
   auto t_gen_start = std::chrono::high_resolution_clock::now();
@@ -2128,6 +3044,10 @@ int main(int argc, char **argv) {
     hipLaunchKernelGGL(kern_gemv_q6k, dim3(model.vocab_size), dim3(WAVE), 0, s,
                        (int)model.vocab_size, (int)HIDDEN,
                        state.hidden, model.embed_q6k_dev, model.logits_dev);
+    if (model.final_logit_softcap > 0.0f) {
+      hipLaunchKernelGGL(kern_softcap, dim3((model.vocab_size + 255) / 256), dim3(256), 0, s,
+                         model.vocab_size, model.final_logit_softcap, model.logits_dev);
+    }
     HIP_CHECK(hipMemsetAsync(model.argmax_dev, 0, sizeof(uint32_t), s));
     hipLaunchKernelGGL(kern_argmax_single, dim3(1), dim3(1024), 0, s,
                        model.logits_dev, model.vocab_size, model.argmax_dev);
@@ -2140,6 +3060,13 @@ int main(int argc, char **argv) {
     // Run all layers (same as forward_decode minus embedding)
     __half *normed = state.normed;
     uint32_t pos = state.pos;
+
+    hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(128), 0, s,
+                       128, pos, model.rope_freq_base_swa, nullptr,
+                       model.rope_cos_swa_row, model.rope_sin_swa_row);
+    hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(256), 0, s,
+                       256, pos, model.rope_freq_base, model.rope_freqs,
+                       model.rope_cos_global_row, model.rope_sin_global_row);
 
     for (uint32_t l = 0; l < N_LAYERS; l++) {
       LayerWeights &lw = model.layers[l];
@@ -2155,39 +3082,83 @@ int main(int argc, char **argv) {
         hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
                            (int)lw.kv_dim, (int)HIDDEN,
                            normed, (const Q4_0Block*)lw.wk, state.scratch_kv);
+        if (!lw.has_v) {
+          HIP_CHECK(hipMemcpyAsync(state.scratch_v, state.scratch_kv,
+                                   lw.kv_dim * sizeof(__half),
+                                   hipMemcpyDeviceToDevice, s));
+        }
       }
       if (lw.has_v && lw.wv) {
         hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
                            (int)lw.kv_dim, (int)HIDDEN,
                            normed, (const Q4_0Block*)lw.wv, state.scratch_v);
       }
-
-      const float *cos_tbl = lw.is_swa ? model.rope_cos_swa : model.rope_cos_global;
-      const float *sin_tbl = lw.is_swa ? model.rope_sin_swa : model.rope_sin_global;
-
-      hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
-                         lw.n_q_heads, lw.head_dim, pos,
-                         lw.attn_q_norm, cos_tbl, sin_tbl, EPS, state.scratch_q);
       if (lw.wk) {
-        hipLaunchKernelGGL(kern_headnorm_rope, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
-                           lw.n_kv_heads, lw.head_dim, pos,
-                           lw.attn_k_norm, cos_tbl, sin_tbl, EPS, state.scratch_kv);
+        hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                           lw.n_kv_heads, lw.head_dim,
+                           state.scratch_v, EPS);
+      }
+
+      const float *cos_row = lw.is_swa ? model.rope_cos_swa_row : model.rope_cos_global_row;
+      const float *sin_row = lw.is_swa ? model.rope_sin_swa_row : model.rope_sin_global_row;
+
+      hipLaunchKernelGGL(kern_headnorm_rope_row, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                         lw.n_q_heads, lw.head_dim,
+                         lw.attn_q_norm, cos_row, sin_row, EPS, state.scratch_q);
+      if (lw.wk) {
+        hipLaunchKernelGGL(kern_headnorm_rope_row, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                           lw.n_kv_heads, lw.head_dim,
+                           lw.attn_k_norm, cos_row, sin_row, EPS, state.scratch_kv);
       }
 
       if (lw.wk) {
-        HIP_CHECK(hipMemcpyAsync(model.kv_k[l] + pos * lw.kv_dim,
-                                 state.scratch_kv, lw.kv_dim * sizeof(__half),
-                                 hipMemcpyDeviceToDevice, s));
+        uint32_t store_idx = layer_store_index(lw, pos);
         __half *v_src = lw.has_v ? state.scratch_v : state.scratch_kv;
-        HIP_CHECK(hipMemcpyAsync(model.kv_v[l] + pos * lw.kv_dim,
-                                 v_src, lw.kv_dim * sizeof(__half),
-                                 hipMemcpyDeviceToDevice, s));
+        if (lw.kv_quant_q4) {
+          hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
+                             lw.kv_dim, state.scratch_kv, v_src,
+                             lw.kv_k_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                             lw.kv_v_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                             lw.kv_k_scale + store_idx,
+                             lw.kv_v_scale + store_idx);
+        } else if (lw.kv_quant_i8) {
+          hipLaunchKernelGGL(kern_quantize_kv_fp16_to_i8, dim3(1), dim3(256), 0, s,
+                             lw.kv_dim, state.scratch_kv, v_src,
+                             lw.kv_k_i8 + (size_t)store_idx * lw.kv_dim,
+                             lw.kv_v_i8 + (size_t)store_idx * lw.kv_dim,
+                             lw.kv_k_scale + store_idx,
+                             lw.kv_v_scale + store_idx);
+        } else {
+          HIP_CHECK(hipMemcpyAsync(lw.kv_k + (size_t)store_idx * lw.kv_dim,
+                                   state.scratch_kv, lw.kv_dim * sizeof(__half),
+                                   hipMemcpyDeviceToDevice, s));
+          HIP_CHECK(hipMemcpyAsync(lw.kv_v + (size_t)store_idx * lw.kv_dim,
+                                   v_src, lw.kv_dim * sizeof(__half),
+                                   hipMemcpyDeviceToDevice, s));
+        }
       }
 
-      uint32_t seq_len = pos + 1;
-      dispatch_attention(s, &model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                         seq_len, 1.0f, state.scratch_q,
-                         model.kv_k[l], model.kv_v[l], state.scratch_attn);
+      uint32_t seq_len = layer_seq_len(lw, pos);
+      uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+      if (lw.kv_quant_q4) {
+        dispatch_attention_gqa_q4(s, &model, seq_len, lw.kv_capacity, cache_start,
+                                  1.0f, state.scratch_q,
+                                  lw.kv_k_q4, lw.kv_v_q4,
+                                  lw.kv_k_scale, lw.kv_v_scale,
+                                  state.scratch_attn);
+      } else if (lw.kv_quant_i8) {
+        dispatch_attention_i8(s, &model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                              seq_len, lw.kv_capacity, cache_start,
+                              1.0f, state.scratch_q,
+                              lw.kv_k_i8, lw.kv_v_i8,
+                              lw.kv_k_scale, lw.kv_v_scale,
+                              state.scratch_attn);
+      } else {
+        dispatch_attention_fp16(s, &model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                                seq_len, lw.kv_capacity, cache_start,
+                                1.0f, state.scratch_q,
+                                lw.kv_k, lw.kv_v, state.scratch_attn);
+      }
 
       hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
                          (int)HIDDEN, (int)lw.q_dim,
