@@ -495,11 +495,274 @@ static constexpr uint32_t GQA_KV_TILE  = 64;
 static constexpr uint32_t GQA_BLK_SZ   = WAVE * 8;  // 8 warps = 256 threads
 
 // ---------------------------------------------------------------------------
-// Decode flash attention (GQA, no LDS) — same algorithm as
-// kernel_flash_attn_decode (1 warp per query head) but with multiple warps
-// per block, each handling a different query head that shares the same kv_head.
-// K/V come from global, L1/L2/IC cache the redundant reads.  No LDS staging,
-// no __syncthreads — just rely on cache reuse across warps in the block.
+// ---------------------------------------------------------------------------
+// Decode flash attention (split-K) — multi-warp per query head.
+//
+// Grid:  (num_q_heads,)  — one block per query head
+// Block: (WAVE * SPLITS,)  — one warp per split
+//
+// Each warp processes 1/SPLITS of the K range, with its own partial
+// (m, l, o).  Then the warps combine via LDS and warp 0 writes the
+// normalized output.  This uses SPLITS × more warps in flight (better
+// GPU utilization) than the 1-warp-per-query-head baseline, while still
+// sharing K/V reads via L1 across the warps in the same block.
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t SK_SPLITS = 4;
+static constexpr uint32_t SK_BLK_SZ = WAVE * SK_SPLITS;  // 128 threads
+
+__global__ void __launch_bounds__(SK_BLK_SZ, 4)
+kernel_flash_attn_decode_splitk(
+    uint32_t      num_q_heads,
+    uint32_t      num_kv_heads,
+    uint32_t      head_dim,
+    uint32_t      total_kv_tokens,
+    uint32_t      page_tokens,
+    float         scale,
+    const __half * __restrict__ q,
+    const __half * __restrict__ k_pages,
+    const __half * __restrict__ v_pages,
+    const uint32_t * __restrict__ page_table,
+    __half       * __restrict__ out
+) {
+  const uint32_t qh  = blockIdx.x;
+  const uint32_t kvh = qh / (num_q_heads / num_kv_heads);
+  const uint32_t wid = threadIdx.x / WAVE;
+  const uint32_t lane = threadIdx.x % WAVE;
+
+  const int EPT = HEAD_DIM / WAVE;
+
+  // Load Q for this query head into registers
+  float q_reg[EPT];
+  #pragma unroll
+  for (int i = 0; i < EPT; i++)
+    q_reg[i] = __half2float(q[qh * head_dim + lane * EPT + i]);
+
+  // Online softmax state (per-warp)
+  float m = NEG_INF;
+  float l = 0.0f;
+  float o[EPT] = {0.0f};
+
+  // Each warp processes a contiguous slice of the total K range
+  const uint32_t tokens_per_split = (total_kv_tokens + SK_SPLITS - 1) / SK_SPLITS;
+  const uint32_t split_start = wid * tokens_per_split;
+  const uint32_t split_end   = min(split_start + tokens_per_split, total_kv_tokens);
+
+  uint32_t abs_t = split_start;
+  while (abs_t < split_end) {
+    const uint32_t pg = abs_t / page_tokens;
+    const uint32_t tokens_this_page = min(page_tokens,
+                                    total_kv_tokens - pg * page_tokens);
+    const uint32_t physical_page = page_table[pg];
+    const __half *k_page = k_pages
+      + (size_t)physical_page * page_tokens * num_kv_heads * head_dim
+      + kvh * head_dim;
+    const __half *v_page = v_pages
+      + (size_t)physical_page * page_tokens * num_kv_heads * head_dim
+      + kvh * head_dim;
+
+    const uint32_t local_start = abs_t - pg * page_tokens;
+    const uint32_t local_end   = min(tokens_this_page,
+                                     split_end - pg * page_tokens);
+
+    uint32_t t = local_start;
+    for (; t + 8 <= local_end; t += 8) {
+      const __half *kt0 = k_page + (t + 0) * num_kv_heads * head_dim;
+      const __half *kt1 = k_page + (t + 1) * num_kv_heads * head_dim;
+      const __half *kt2 = k_page + (t + 2) * num_kv_heads * head_dim;
+      const __half *kt3 = k_page + (t + 3) * num_kv_heads * head_dim;
+      const __half *kt4 = k_page + (t + 4) * num_kv_heads * head_dim;
+      const __half *kt5 = k_page + (t + 5) * num_kv_heads * head_dim;
+      const __half *kt6 = k_page + (t + 6) * num_kv_heads * head_dim;
+      const __half *kt7 = k_page + (t + 7) * num_kv_heads * head_dim;
+
+      const int load_off = lane * EPT;
+      __half k0_0 = kt0[load_off + 0]; __half k0_1 = kt0[load_off + 1];
+      __half k0_2 = kt0[load_off + 2]; __half k0_3 = kt0[load_off + 3];
+      __half k1_0 = kt1[load_off + 0]; __half k1_1 = kt1[load_off + 1];
+      __half k1_2 = kt1[load_off + 2]; __half k1_3 = kt1[load_off + 3];
+      __half k2_0 = kt2[load_off + 0]; __half k2_1 = kt2[load_off + 1];
+      __half k2_2 = kt2[load_off + 2]; __half k2_3 = kt2[load_off + 3];
+      __half k3_0 = kt3[load_off + 0]; __half k3_1 = kt3[load_off + 1];
+      __half k3_2 = kt3[load_off + 2]; __half k3_3 = kt3[load_off + 3];
+      __half k4_0 = kt4[load_off + 0]; __half k4_1 = kt4[load_off + 1];
+      __half k4_2 = kt4[load_off + 2]; __half k4_3 = kt4[load_off + 3];
+      __half k5_0 = kt5[load_off + 0]; __half k5_1 = kt5[load_off + 1];
+      __half k5_2 = kt5[load_off + 2]; __half k5_3 = kt5[load_off + 3];
+      __half k6_0 = kt6[load_off + 0]; __half k6_1 = kt6[load_off + 1];
+      __half k6_2 = kt6[load_off + 2]; __half k6_3 = kt6[load_off + 3];
+      __half k7_0 = kt7[load_off + 0]; __half k7_1 = kt7[load_off + 1];
+      __half k7_2 = kt7[load_off + 2]; __half k7_3 = kt7[load_off + 3];
+
+      const __half *vt0 = v_page + (t + 0) * num_kv_heads * head_dim;
+      const __half *vt1 = v_page + (t + 1) * num_kv_heads * head_dim;
+      const __half *vt2 = v_page + (t + 2) * num_kv_heads * head_dim;
+      const __half *vt3 = v_page + (t + 3) * num_kv_heads * head_dim;
+      const __half *vt4 = v_page + (t + 4) * num_kv_heads * head_dim;
+      const __half *vt5 = v_page + (t + 5) * num_kv_heads * head_dim;
+      const __half *vt6 = v_page + (t + 6) * num_kv_heads * head_dim;
+      const __half *vt7 = v_page + (t + 7) * num_kv_heads * head_dim;
+
+      __half v0_0 = vt0[load_off + 0]; __half v0_1 = vt0[load_off + 1];
+      __half v0_2 = vt0[load_off + 2]; __half v0_3 = vt0[load_off + 3];
+      __half v1_0 = vt1[load_off + 0]; __half v1_1 = vt1[load_off + 1];
+      __half v1_2 = vt1[load_off + 2]; __half v1_3 = vt1[load_off + 3];
+      __half v2_0 = vt2[load_off + 0]; __half v2_1 = vt2[load_off + 1];
+      __half v2_2 = vt2[load_off + 2]; __half v2_3 = vt2[load_off + 3];
+      __half v3_0 = vt3[load_off + 0]; __half v3_1 = vt3[load_off + 1];
+      __half v3_2 = vt3[load_off + 2]; __half v3_3 = vt3[load_off + 3];
+      __half v4_0 = vt4[load_off + 0]; __half v4_1 = vt4[load_off + 1];
+      __half v4_2 = vt4[load_off + 2]; __half v4_3 = vt4[load_off + 3];
+      __half v5_0 = vt5[load_off + 0]; __half v5_1 = vt5[load_off + 1];
+      __half v5_2 = vt5[load_off + 2]; __half v5_3 = vt5[load_off + 3];
+      __half v6_0 = vt6[load_off + 0]; __half v6_1 = vt6[load_off + 1];
+      __half v6_2 = vt6[load_off + 2]; __half v6_3 = vt6[load_off + 3];
+      __half v7_0 = vt7[load_off + 0]; __half v7_1 = vt7[load_off + 1];
+      __half v7_2 = vt7[load_off + 2]; __half v7_3 = vt7[load_off + 3];
+
+      float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+      float d4 = 0.0f, d5 = 0.0f, d6 = 0.0f, d7 = 0.0f;
+      d0 += q_reg[0] * __half2float(k0_0); d0 += q_reg[1] * __half2float(k0_1);
+      d0 += q_reg[2] * __half2float(k0_2); d0 += q_reg[3] * __half2float(k0_3);
+      d1 += q_reg[0] * __half2float(k1_0); d1 += q_reg[1] * __half2float(k1_1);
+      d1 += q_reg[2] * __half2float(k1_2); d1 += q_reg[3] * __half2float(k1_3);
+      d2 += q_reg[0] * __half2float(k2_0); d2 += q_reg[1] * __half2float(k2_1);
+      d2 += q_reg[2] * __half2float(k2_2); d2 += q_reg[3] * __half2float(k2_3);
+      d3 += q_reg[0] * __half2float(k3_0); d3 += q_reg[1] * __half2float(k3_1);
+      d3 += q_reg[2] * __half2float(k3_2); d3 += q_reg[3] * __half2float(k3_3);
+      d4 += q_reg[0] * __half2float(k4_0); d4 += q_reg[1] * __half2float(k4_1);
+      d4 += q_reg[2] * __half2float(k4_2); d4 += q_reg[3] * __half2float(k4_3);
+      d5 += q_reg[0] * __half2float(k5_0); d5 += q_reg[1] * __half2float(k5_1);
+      d5 += q_reg[2] * __half2float(k5_2); d5 += q_reg[3] * __half2float(k5_3);
+      d6 += q_reg[0] * __half2float(k6_0); d6 += q_reg[1] * __half2float(k6_1);
+      d6 += q_reg[2] * __half2float(k6_2); d6 += q_reg[3] * __half2float(k6_3);
+      d7 += q_reg[0] * __half2float(k7_0); d7 += q_reg[1] * __half2float(k7_1);
+      d7 += q_reg[2] * __half2float(k7_2); d7 += q_reg[3] * __half2float(k7_3);
+
+      d0 += __shfl_xor(d0, 16); d1 += __shfl_xor(d1, 16);
+      d2 += __shfl_xor(d2, 16); d3 += __shfl_xor(d3, 16);
+      d4 += __shfl_xor(d4, 16); d5 += __shfl_xor(d5, 16);
+      d6 += __shfl_xor(d6, 16); d7 += __shfl_xor(d7, 16);
+      d0 += __shfl_xor(d0, 8);  d1 += __shfl_xor(d1, 8);
+      d2 += __shfl_xor(d2, 8);  d3 += __shfl_xor(d3, 8);
+      d4 += __shfl_xor(d4, 8);  d5 += __shfl_xor(d5, 8);
+      d6 += __shfl_xor(d6, 8);  d7 += __shfl_xor(d7, 8);
+      d0 += __shfl_xor(d0, 4);  d1 += __shfl_xor(d1, 4);
+      d2 += __shfl_xor(d2, 4);  d3 += __shfl_xor(d3, 4);
+      d4 += __shfl_xor(d4, 4);  d5 += __shfl_xor(d5, 4);
+      d6 += __shfl_xor(d6, 4);  d7 += __shfl_xor(d7, 4);
+      d0 += __shfl_xor(d0, 2);  d1 += __shfl_xor(d1, 2);
+      d2 += __shfl_xor(d2, 2);  d3 += __shfl_xor(d3, 2);
+      d4 += __shfl_xor(d4, 2);  d5 += __shfl_xor(d5, 2);
+      d6 += __shfl_xor(d6, 2);  d7 += __shfl_xor(d7, 2);
+      d0 += __shfl_xor(d0, 1);  d1 += __shfl_xor(d1, 1);
+      d2 += __shfl_xor(d2, 1);  d3 += __shfl_xor(d3, 1);
+      d4 += __shfl_xor(d4, 1);  d5 += __shfl_xor(d5, 1);
+      d6 += __shfl_xor(d6, 1);  d7 += __shfl_xor(d7, 1);
+
+      float s0 = d0 * scale, s1 = d1 * scale, s2 = d2 * scale, s3 = d3 * scale;
+      float s4 = d4 * scale, s5 = d5 * scale, s6 = d6 * scale, s7 = d7 * scale;
+      float s[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+
+      float m_new = m;
+      #pragma unroll
+      for (int k = 0; k < 8; k++) m_new = (s[k] > m_new) ? s[k] : m_new;
+
+      float exp_shift = __expf(m - m_new);
+      float e[8];
+      #pragma unroll
+      for (int k = 0; k < 8; k++) e[k] = __expf(s[k] - m_new);
+
+      float e_sum = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < 8; k++) e_sum += e[k];
+      l = exp_shift * l + e_sum;
+
+      o[0] = exp_shift * o[0] + (e[0] * __half2float(v0_0) + e[1] * __half2float(v1_0) +
+                                  e[2] * __half2float(v2_0) + e[3] * __half2float(v3_0) +
+                                  e[4] * __half2float(v4_0) + e[5] * __half2float(v5_0) +
+                                  e[6] * __half2float(v6_0) + e[7] * __half2float(v7_0));
+      o[1] = exp_shift * o[1] + (e[0] * __half2float(v0_1) + e[1] * __half2float(v1_1) +
+                                  e[2] * __half2float(v2_1) + e[3] * __half2float(v3_1) +
+                                  e[4] * __half2float(v4_1) + e[5] * __half2float(v5_1) +
+                                  e[6] * __half2float(v6_1) + e[7] * __half2float(v7_1));
+      o[2] = exp_shift * o[2] + (e[0] * __half2float(v0_2) + e[1] * __half2float(v1_2) +
+                                  e[2] * __half2float(v2_2) + e[3] * __half2float(v3_2) +
+                                  e[4] * __half2float(v4_2) + e[5] * __half2float(v5_2) +
+                                  e[6] * __half2float(v6_2) + e[7] * __half2float(v7_2));
+      o[3] = exp_shift * o[3] + (e[0] * __half2float(v0_3) + e[1] * __half2float(v1_3) +
+                                  e[2] * __half2float(v2_3) + e[3] * __half2float(v3_3) +
+                                  e[4] * __half2float(v4_3) + e[5] * __half2float(v5_3) +
+                                  e[6] * __half2float(v6_3) + e[7] * __half2float(v7_3));
+
+      m = m_new;
+    }
+
+    for (; t < local_end; t++) {
+      const __half *kt = k_page + t * num_kv_heads * head_dim;
+      const __half *vt = v_page + t * num_kv_heads * head_dim;
+
+      float dot = 0.0f;
+      #pragma unroll
+      for (int i = 0; i < EPT; i++)
+        dot += q_reg[i] * __half2float(kt[lane * EPT + i]);
+
+      dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+      dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+      float s = dot * scale;
+
+      float m_new = (s > m) ? s : m;
+      float exp_shift = __expf(m - m_new);
+      float exp_s     = __expf(s - m_new);
+      l = exp_shift * l + exp_s;
+
+      #pragma unroll
+      for (int i = 0; i < EPT; i++) {
+        o[i] = exp_shift * o[i] + exp_s * __half2float(vt[lane * EPT + i]);
+      }
+
+      m = m_new;
+    }
+
+    abs_t = (pg + 1) * page_tokens;
+  }
+
+  // Cross-warp combine via LDS
+  __shared__ float lds_m[SK_SPLITS];
+  __shared__ float lds_l[SK_SPLITS];
+  __shared__ float lds_o[SK_SPLITS * HEAD_DIM];
+
+  if (lane == 0) lds_m[wid] = m;
+  if (lane == 0) lds_l[wid] = l;
+  #pragma unroll
+  for (int i = 0; i < EPT; i++)
+    lds_o[wid * HEAD_DIM + lane * EPT + i] = o[i];
+  __syncthreads();
+
+  // Warp 0 combines and writes the final output
+  if (wid == 0) {
+    float m_combined = NEG_INF;
+    #pragma unroll
+    for (int s = 0; s < (int)SK_SPLITS; s++)
+      m_combined = (lds_m[s] > m_combined) ? lds_m[s] : m_combined;
+
+    float o_combined[EPT] = {0.0f};
+    float l_combined = 0.0f;
+    #pragma unroll
+    for (int s = 0; s < (int)SK_SPLITS; s++) {
+      float e = __expf(lds_m[s] - m_combined);
+      l_combined += e * lds_l[s];
+      #pragma unroll
+      for (int i = 0; i < EPT; i++)
+        o_combined[i] += e * lds_o[s * HEAD_DIM + lane * EPT + i];
+    }
+
+    float l_inv = (l_combined > 0.0f) ? (1.0f / l_combined) : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < EPT; i++)
+      out[qh * head_dim + lane * EPT + i] = __float2half(o_combined[i] * l_inv);
+  }
+}
 // ---------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(GQA_BLK_SZ)
@@ -729,6 +992,20 @@ extern "C" void therock_flash_attn_decode(
     const void *q, const void *k_pages, const void *v_pages,
     const uint32_t *page_table, void *out)
 {
+  // Split-K path: multi-warp per query head, only when KV is large enough
+  // that the per-query-head work warrants parallel splits.  Each split is a
+  // warp that processes 1/SK_SPLITS of the K range; cross-warp combine in LDS.
+  if (head_dim == HEAD_DIM && total_kv_tokens >= 256) {
+    dim3 grid(num_q_heads);
+    dim3 block(SK_BLK_SZ);
+    hipLaunchKernelGGL(kernel_flash_attn_decode_splitk, grid, block, 0, stream,
+      num_q_heads, num_kv_heads, head_dim,
+      total_kv_tokens, page_tokens, scale,
+      (const __half *)q, (const __half *)k_pages, (const __half *)v_pages,
+      page_table, (__half *)out);
+    return;
+  }
+
   // GQA-aware path: 1 block per kv_head, multiple warps share K/V via L1/L2/IC.
   // Only meaningful when q_per_kv == 8 (matches GQA_BLK_SZ = 8 warps).  For
   // other GQA ratios fall through to the non-GQA path which has 1 warp per
