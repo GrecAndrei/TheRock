@@ -18,7 +18,7 @@ extern "C" void therock_flash_attn_decode(
 
 int main() {
   const int D = 128, PAGE = 16;
-  int kv_sizes[] = {64, 256, 1024, 4096, 16384};
+  int kv_sizes[] = {64, 256, 1024, 4096, 16384, 32768, 65536, 131072};
   const int n = sizeof(kv_sizes)/sizeof(kv_sizes[0]);
 
   // Run for 2 configs: H_q=8 H_kv=8 (no GQA, baseline) and H_q=8 H_kv=1 (GQA, 8x share)
