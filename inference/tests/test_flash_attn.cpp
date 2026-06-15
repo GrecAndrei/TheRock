@@ -348,9 +348,87 @@ static void bench_prefill(int S, int H, int D) {
   hipStreamDestroy(s);
 }
 
-int main() {
+// ---- Test: decode GQA (H_q=8, H_kv=1) ----
+static int test_decode_gqa() {
+  const int S = 1, H_Q = 8, H_KV = 1, D = 128, KV_PAST = 64;
+  const int TOTAL_KV = KV_PAST;
+
+  // Build K, V as if num_kv_heads=8, then we just use the first kv_head's data
+  // since all 8 query heads in GQA share the same kv_head.  The reference
+  // compares against using the first kv_head.
+  int total_elems_qkv = H_Q * D;              // Q: 1 token × H_Q heads
+  int total_elems_kv = TOTAL_KV * H_KV * D;   // K, V: TOTAL_KV × H_KV heads
+  std::vector<uint16_t> q_h(total_elems_qkv);
+  std::vector<uint16_t> k_h(total_elems_kv);
+  std::vector<uint16_t> v_h(total_elems_kv);
+
+  srand(42);
+  auto randf16 = [&]() { return f32_to_f16((rand() / (float)RAND_MAX - 0.5f) * 0.5f); };
+  for (auto &x : q_h) x = randf16();
+  for (auto &x : k_h) x = randf16();
+  for (auto &x : v_h) x = randf16();
+
+  // CPU reference: 8 query heads, 1 kv head (shared).  Each query head
+  // attends to the same K/V data.
+  std::vector<float> ref(total_elems_qkv);
+  for (int h = 0; h < H_Q; h++) {
+    float m = -1e9f, l = 0.0f;
+    std::vector<float> o(D, 0.0f);
+    for (int t = 0; t < TOTAL_KV; t++) {
+      float dot = 0.0f;
+      for (int d = 0; d < D; d++) {
+        dot += f16_to_f32(q_h[h * D + d]) * f16_to_f32(k_h[t * D + d]);
+      }
+      float s = dot * (1.0f / sqrtf((float)D));
+      float m_new = (s > m) ? s : m;
+      float exp_shift = expf(m - m_new);
+      float exp_s = expf(s - m_new);
+      l = exp_shift * l + exp_s;
+      for (int d = 0; d < D; d++) {
+        o[d] = exp_shift * o[d] + exp_s * f16_to_f32(v_h[t * D + d]);
+      }
+      m = m_new;
+    }
+    float l_inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < D; d++) ref[h * D + d] = o[d] * l_inv;
+  }
+
+  // GPU
+  void *d_q, *d_k, *d_v, *d_out;
+  HIP_CHECK(hipMalloc(&d_q, total_elems_qkv * 2));
+  HIP_CHECK(hipMalloc(&d_k, total_elems_kv * 2));
+  HIP_CHECK(hipMalloc(&d_v, total_elems_kv * 2));
+  HIP_CHECK(hipMalloc(&d_out, total_elems_qkv * 2));
+  HIP_CHECK(hipMemcpy(d_q, q_h.data(), total_elems_qkv * 2, hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k, k_h.data(), total_elems_kv * 2, hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v, v_h.data(), total_elems_kv * 2, hipMemcpyHostToDevice));
+
+  uint32_t page_table_h = 0;
+  uint32_t *d_page_table;
+  HIP_CHECK(hipMalloc(&d_page_table, sizeof(uint32_t)));
+  HIP_CHECK(hipMemcpy(d_page_table, &page_table_h, sizeof(uint32_t), hipMemcpyHostToDevice));
+
+  hipStream_t s; HIP_CHECK(hipStreamCreate(&s));
+  float scale = 1.0f / sqrtf((float)D);
+  therock_flash_attn_decode(s, H_Q, H_KV, D, TOTAL_KV, TOTAL_KV, scale,
+                             d_q, d_k, d_v, d_page_table, d_out);
+  HIP_CHECK(hipStreamSynchronize(s));
+
+  std::vector<uint16_t> got(total_elems_qkv);
+  HIP_CHECK(hipMemcpy(got.data(), d_out, total_elems_qkv * 2, hipMemcpyDeviceToHost));
+
+  float err = max_rel_err(got, ref);
+  printf("decode_gqa  S=1  H_q=%d H_kv=%d D=%d KV=%d: max_rel_err=%.4f  %s\n",
+         H_Q, H_KV, D, TOTAL_KV, err, err < 0.05f ? "PASS" : "FAIL");
+
+  hipFree(d_q); hipFree(d_k); hipFree(d_v); hipFree(d_out); hipFree(d_page_table);
+  return err < 0.05f ? 0 : 1;
+}
+
+ int main() {
   int failures = 0;
   failures += test_decode();
+  failures += test_decode_gqa();
   failures += test_prefill();
   failures += test_prefill_hipblaslt();
 
