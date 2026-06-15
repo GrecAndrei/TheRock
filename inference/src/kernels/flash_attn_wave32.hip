@@ -100,29 +100,175 @@ kernel_flash_attn_decode(
       + (size_t)physical_page * page_tokens * num_kv_heads * head_dim
       + kvh * head_dim;
 
-    for (uint32_t t = 0; t < tokens_this_page; t++) {
+    // 8-token unroll: process 8 tokens per iteration to maximize the dot
+    // chain's ILP, hiding both the 5-cycle shuffle-reduce chain and the
+    // V-load latency behind independent dot products. 5 shfl_xor's cover
+    // all 8 reductions in 5 cycles (vs 5*8=40 serially).
+    uint32_t t = 0;
+    for (; t + 8 <= tokens_this_page; t += 8) {
+      const __half *kt[8] = {
+        k_page + (t + 0) * num_kv_heads * head_dim,
+        k_page + (t + 1) * num_kv_heads * head_dim,
+        k_page + (t + 2) * num_kv_heads * head_dim,
+        k_page + (t + 3) * num_kv_heads * head_dim,
+        k_page + (t + 4) * num_kv_heads * head_dim,
+        k_page + (t + 5) * num_kv_heads * head_dim,
+        k_page + (t + 6) * num_kv_heads * head_dim,
+        k_page + (t + 7) * num_kv_heads * head_dim,
+      };
+      const __half *vt[8] = {
+        v_page + (t + 0) * num_kv_heads * head_dim,
+        v_page + (t + 1) * num_kv_heads * head_dim,
+        v_page + (t + 2) * num_kv_heads * head_dim,
+        v_page + (t + 3) * num_kv_heads * head_dim,
+        v_page + (t + 4) * num_kv_heads * head_dim,
+        v_page + (t + 5) * num_kv_heads * head_dim,
+        v_page + (t + 6) * num_kv_heads * head_dim,
+        v_page + (t + 7) * num_kv_heads * head_dim,
+      };
+
+      // Issue all 16 loads (8 K + 8 V) up front so the V loads can hide
+      // behind the K dot+reduce work. Without this hoisting, the compiler
+      // emits V loads inside the o-update loop, serialized after the K
+      // reduce chain.
+      const int load_off = tid * ELEMS_PER_THREAD;
+      __half k0_0 = kt[0][load_off + 0]; __half k0_1 = kt[0][load_off + 1];
+      __half k0_2 = kt[0][load_off + 2]; __half k0_3 = kt[0][load_off + 3];
+      __half k1_0 = kt[1][load_off + 0]; __half k1_1 = kt[1][load_off + 1];
+      __half k1_2 = kt[1][load_off + 2]; __half k1_3 = kt[1][load_off + 3];
+      __half k2_0 = kt[2][load_off + 0]; __half k2_1 = kt[2][load_off + 1];
+      __half k2_2 = kt[2][load_off + 2]; __half k2_3 = kt[2][load_off + 3];
+      __half k3_0 = kt[3][load_off + 0]; __half k3_1 = kt[3][load_off + 1];
+      __half k3_2 = kt[3][load_off + 2]; __half k3_3 = kt[3][load_off + 3];
+      __half k4_0 = kt[4][load_off + 0]; __half k4_1 = kt[4][load_off + 1];
+      __half k4_2 = kt[4][load_off + 2]; __half k4_3 = kt[4][load_off + 3];
+      __half k5_0 = kt[5][load_off + 0]; __half k5_1 = kt[5][load_off + 1];
+      __half k5_2 = kt[5][load_off + 2]; __half k5_3 = kt[5][load_off + 3];
+      __half k6_0 = kt[6][load_off + 0]; __half k6_1 = kt[6][load_off + 1];
+      __half k6_2 = kt[6][load_off + 2]; __half k6_3 = kt[6][load_off + 3];
+      __half k7_0 = kt[7][load_off + 0]; __half k7_1 = kt[7][load_off + 1];
+      __half k7_2 = kt[7][load_off + 2]; __half k7_3 = kt[7][load_off + 3];
+
+      __half v0_0 = vt[0][load_off + 0]; __half v0_1 = vt[0][load_off + 1];
+      __half v0_2 = vt[0][load_off + 2]; __half v0_3 = vt[0][load_off + 3];
+      __half v1_0 = vt[1][load_off + 0]; __half v1_1 = vt[1][load_off + 1];
+      __half v1_2 = vt[1][load_off + 2]; __half v1_3 = vt[1][load_off + 3];
+      __half v2_0 = vt[2][load_off + 0]; __half v2_1 = vt[2][load_off + 1];
+      __half v2_2 = vt[2][load_off + 2]; __half v2_3 = vt[2][load_off + 3];
+      __half v3_0 = vt[3][load_off + 0]; __half v3_1 = vt[3][load_off + 1];
+      __half v3_2 = vt[3][load_off + 2]; __half v3_3 = vt[3][load_off + 3];
+      __half v4_0 = vt[4][load_off + 0]; __half v4_1 = vt[4][load_off + 1];
+      __half v4_2 = vt[4][load_off + 2]; __half v4_3 = vt[4][load_off + 3];
+      __half v5_0 = vt[5][load_off + 0]; __half v5_1 = vt[5][load_off + 1];
+      __half v5_2 = vt[5][load_off + 2]; __half v5_3 = vt[5][load_off + 3];
+      __half v6_0 = vt[6][load_off + 0]; __half v6_1 = vt[6][load_off + 1];
+      __half v6_2 = vt[6][load_off + 2]; __half v6_3 = vt[6][load_off + 3];
+      __half v7_0 = vt[7][load_off + 0]; __half v7_1 = vt[7][load_off + 1];
+      __half v7_2 = vt[7][load_off + 2]; __half v7_3 = vt[7][load_off + 3];
+
+      // 8 parallel dot products (independent FMA chains, no dependency)
+      float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+      float d4 = 0.0f, d5 = 0.0f, d6 = 0.0f, d7 = 0.0f;
+      d0 += q_reg[0] * __half2float(k0_0); d0 += q_reg[1] * __half2float(k0_1);
+      d0 += q_reg[2] * __half2float(k0_2); d0 += q_reg[3] * __half2float(k0_3);
+      d1 += q_reg[0] * __half2float(k1_0); d1 += q_reg[1] * __half2float(k1_1);
+      d1 += q_reg[2] * __half2float(k1_2); d1 += q_reg[3] * __half2float(k1_3);
+      d2 += q_reg[0] * __half2float(k2_0); d2 += q_reg[1] * __half2float(k2_1);
+      d2 += q_reg[2] * __half2float(k2_2); d2 += q_reg[3] * __half2float(k2_3);
+      d3 += q_reg[0] * __half2float(k3_0); d3 += q_reg[1] * __half2float(k3_1);
+      d3 += q_reg[2] * __half2float(k3_2); d3 += q_reg[3] * __half2float(k3_3);
+      d4 += q_reg[0] * __half2float(k4_0); d4 += q_reg[1] * __half2float(k4_1);
+      d4 += q_reg[2] * __half2float(k4_2); d4 += q_reg[3] * __half2float(k4_3);
+      d5 += q_reg[0] * __half2float(k5_0); d5 += q_reg[1] * __half2float(k5_1);
+      d5 += q_reg[2] * __half2float(k5_2); d5 += q_reg[3] * __half2float(k5_3);
+      d6 += q_reg[0] * __half2float(k6_0); d6 += q_reg[1] * __half2float(k6_1);
+      d6 += q_reg[2] * __half2float(k6_2); d6 += q_reg[3] * __half2float(k6_3);
+      d7 += q_reg[0] * __half2float(k7_0); d7 += q_reg[1] * __half2float(k7_1);
+      d7 += q_reg[2] * __half2float(k7_2); d7 += q_reg[3] * __half2float(k7_3);
+
+      // Interleaved wave-reduce: 8 dots, 5 xor offsets, 5 cycles total
+      d0 += __shfl_xor(d0, 16); d1 += __shfl_xor(d1, 16);
+      d2 += __shfl_xor(d2, 16); d3 += __shfl_xor(d3, 16);
+      d4 += __shfl_xor(d4, 16); d5 += __shfl_xor(d5, 16);
+      d6 += __shfl_xor(d6, 16); d7 += __shfl_xor(d7, 16);
+      d0 += __shfl_xor(d0, 8);  d1 += __shfl_xor(d1, 8);
+      d2 += __shfl_xor(d2, 8);  d3 += __shfl_xor(d3, 8);
+      d4 += __shfl_xor(d4, 8);  d5 += __shfl_xor(d5, 8);
+      d6 += __shfl_xor(d6, 8);  d7 += __shfl_xor(d7, 8);
+      d0 += __shfl_xor(d0, 4);  d1 += __shfl_xor(d1, 4);
+      d2 += __shfl_xor(d2, 4);  d3 += __shfl_xor(d3, 4);
+      d4 += __shfl_xor(d4, 4);  d5 += __shfl_xor(d5, 4);
+      d6 += __shfl_xor(d6, 4);  d7 += __shfl_xor(d7, 4);
+      d0 += __shfl_xor(d0, 2);  d1 += __shfl_xor(d1, 2);
+      d2 += __shfl_xor(d2, 2);  d3 += __shfl_xor(d3, 2);
+      d4 += __shfl_xor(d4, 2);  d5 += __shfl_xor(d5, 2);
+      d6 += __shfl_xor(d6, 2);  d7 += __shfl_xor(d7, 2);
+      d0 += __shfl_xor(d0, 1);  d1 += __shfl_xor(d1, 1);
+      d2 += __shfl_xor(d2, 1);  d3 += __shfl_xor(d3, 1);
+      d4 += __shfl_xor(d4, 1);  d5 += __shfl_xor(d5, 1);
+      d6 += __shfl_xor(d6, 1);  d7 += __shfl_xor(d7, 1);
+
+      float s0 = d0 * scale, s1 = d1 * scale, s2 = d2 * scale, s3 = d3 * scale;
+      float s4 = d4 * scale, s5 = d5 * scale, s6 = d6 * scale, s7 = d7 * scale;
+
+      float s[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+
+      // Online softmax: one max update for all 8 tokens
+      float m_new = m;
+      #pragma unroll
+      for (int k = 0; k < 8; k++) m_new = (s[k] > m_new) ? s[k] : m_new;
+
+      float exp_shift = __expf(m - m_new);
+      float e[8];
+      #pragma unroll
+      for (int k = 0; k < 8; k++) e[k] = __expf(s[k] - m_new);
+
+      float e_sum = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < 8; k++) e_sum += e[k];
+      l = exp_shift * l + e_sum;
+
+      // 8 parallel output updates (V already loaded)
+      o[0] = exp_shift * o[0] + (e[0] * __half2float(v0_0) + e[1] * __half2float(v1_0) +
+                                  e[2] * __half2float(v2_0) + e[3] * __half2float(v3_0) +
+                                  e[4] * __half2float(v4_0) + e[5] * __half2float(v5_0) +
+                                  e[6] * __half2float(v6_0) + e[7] * __half2float(v7_0));
+      o[1] = exp_shift * o[1] + (e[0] * __half2float(v0_1) + e[1] * __half2float(v1_1) +
+                                  e[2] * __half2float(v2_1) + e[3] * __half2float(v3_1) +
+                                  e[4] * __half2float(v4_1) + e[5] * __half2float(v5_1) +
+                                  e[6] * __half2float(v6_1) + e[7] * __half2float(v7_1));
+      o[2] = exp_shift * o[2] + (e[0] * __half2float(v0_2) + e[1] * __half2float(v1_2) +
+                                  e[2] * __half2float(v2_2) + e[3] * __half2float(v3_2) +
+                                  e[4] * __half2float(v4_2) + e[5] * __half2float(v5_2) +
+                                  e[6] * __half2float(v6_2) + e[7] * __half2float(v7_2));
+      o[3] = exp_shift * o[3] + (e[0] * __half2float(v0_3) + e[1] * __half2float(v1_3) +
+                                  e[2] * __half2float(v2_3) + e[3] * __half2float(v3_3) +
+                                  e[4] * __half2float(v4_3) + e[5] * __half2float(v5_3) +
+                                  e[6] * __half2float(v6_3) + e[7] * __half2float(v7_3));
+
+      m = m_new;
+    }
+
+    // Tail: <8 leftover tokens, fall back to the serialized path
+    for (; t < tokens_this_page; t++) {
       const __half *kt = k_page + t * num_kv_heads * head_dim;
       const __half *vt = v_page + t * num_kv_heads * head_dim;
 
-      // Dot product q·k for this token: each thread computes partial sum
       float dot = 0.0f;
       #pragma unroll
       for (int i = 0; i < ELEMS_PER_THREAD; i++)
         dot += q_reg[i] * __half2float(kt[tid * ELEMS_PER_THREAD + i]);
 
-      // Wave reduce dot product
       dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
       dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
-      float s = dot * scale;  // scaled attention score
+      float s = dot * scale;
 
-      // Online softmax update
       float m_new = (s > m) ? s : m;
-      float exp_shift = expf(m - m_new);
-      float exp_s     = expf(s - m_new);
+      float exp_shift = __expf(m - m_new);
+      float exp_s     = __expf(s - m_new);
 
       l = exp_shift * l + exp_s;
 
-      // Update output accumulator
       #pragma unroll
       for (int i = 0; i < ELEMS_PER_THREAD; i++) {
         float vi = __half2float(vt[tid * ELEMS_PER_THREAD + i]);
