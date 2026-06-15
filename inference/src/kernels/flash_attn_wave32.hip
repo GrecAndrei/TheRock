@@ -508,8 +508,8 @@ static constexpr uint32_t GQA_BLK_SZ   = WAVE * 8;  // 8 warps = 256 threads
 // sharing K/V reads via L1 across the warps in the same block.
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t SK_SPLITS = 16;
-static constexpr uint32_t SK_BLK_SZ = WAVE * SK_SPLITS;  // 512 threads
+static constexpr uint32_t SK_SPLITS = 32;
+static constexpr uint32_t SK_BLK_SZ = WAVE * SK_SPLITS;  // 1024 threads
 
 __global__ void __launch_bounds__(SK_BLK_SZ, 1)
 kernel_flash_attn_decode_splitk(
