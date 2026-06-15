@@ -992,10 +992,11 @@ extern "C" void therock_flash_attn_decode(
     const void *q, const void *k_pages, const void *v_pages,
     const uint32_t *page_table, void *out)
 {
-  // Split-K path: multi-warp per query head, only when KV is large enough
-  // that the per-query-head work warrants parallel splits.  Each split is a
-  // warp that processes 1/SK_SPLITS of the K range; cross-warp combine in LDS.
-  if (head_dim == HEAD_DIM && total_kv_tokens >= 256) {
+  // Split-K path: multi-warp per query head.  Each split is a warp that
+  // processes 1/SK_SPLITS of the K range; cross-warp combine in LDS.
+  // Threshold of 32 ensures each split has at least 1 token; in practice we
+  // want at least 8 (one batch of the unrolled loop) per split for best perf.
+  if (head_dim == HEAD_DIM && total_kv_tokens >= 64) {
     dim3 grid(num_q_heads);
     dim3 block(SK_BLK_SZ);
     hipLaunchKernelGGL(kernel_flash_attn_decode_splitk, grid, block, 0, stream,
