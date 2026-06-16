@@ -22,10 +22,11 @@ int main() {
   const int n = sizeof(kv_sizes)/sizeof(kv_sizes[0]);
 
   // Run for 2 configs: H_q=8 H_kv=8 (no GQA, baseline) and H_q=8 H_kv=1 (GQA, 8x share)
-  for (int config = 0; config < 2; config++) {
+  for (int config = 0; config < 3; config++) {
     int H_Q, H_KV;
-    if (config == 0) { H_Q = 8; H_KV = 8; printf("\n=== H_q=%d H_kv=%d (no GQA, baseline) ===\n", H_Q, H_KV); }
-    else              { H_Q = 8; H_KV = 1; printf("\n=== H_q=%d H_kv=%d (8x GQA, LDS-shared) ===\n", H_Q, H_KV); }
+    if (config == 0)      { H_Q = 8;  H_KV = 8; printf("\n=== H_q=%d H_kv=%d (no GQA, baseline) ===\n", H_Q, H_KV); }
+    else if (config == 1) { H_Q = 8;  H_KV = 1; printf("\n=== H_q=%d H_kv=%d (8x GQA, LDS-shared) ===\n", H_Q, H_KV); }
+    else                  { H_Q = 32; H_KV = 8; printf("\n=== H_q=%d H_kv=%d (4x GQA, LLaMA-3 8B / Mistral 7B) ===\n", H_Q, H_KV); }
 
     for (int sidx = 0; sidx < n; sidx++) {
       int TOTAL_KV = kv_sizes[sidx];
