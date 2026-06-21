@@ -1,22 +1,26 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// TheRock inference: load and run a Gemma 4 12B GGUF (Q4_0) on gfx1032.
+// TheRock inference: GPU-accelerated GGUF model runner.
 // Single-file standalone runner. No llama.cpp dependency.
 //
 // Build:
 //   hipcc -O3 --offload-arch=gfx1032 -I../include run_gguf.hip -lamdhip64 -o run_gguf
 //
 // Usage:
-//   ./run_gguf <model.gguf> [prompt]
+//   ./run_gguf <model.gguf> [config.json] [--chat] [prompt]
+//   ./run_gguf <model.gguf> --cfg gemma4_12b_q4.json [--chat] [prompt]
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+#include "drm_allocator.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cctype>
 #include <cmath>
 #include <vector>
 #include <string>
@@ -463,11 +467,14 @@ static void append_chat_turn_tokens(const Tokenizer &tok, const char *role,
   if (open_next_model_turn) append_model_generation_prompt(tok, ids);
 }
 
+static void forward_decode(Model *model, RunState *state, uint32_t token);
+static void forward_prefill_batch(Model *model, RunState *state,
+                                  const uint32_t *tokens, int n_tokens);
+
 static void prefill_tokens(Model *model, RunState *state, const std::vector<uint32_t> &tokens) {
-  for (size_t i = 0; i < tokens.size(); ) {
-    int batch = std::min((int)(tokens.size() - i), 16);
-    forward_prefill_batch(model, state, tokens.data() + i, batch);
-    i += batch;
+  for (size_t i = 0; i < tokens.size(); i += 16) {
+    int chunk = std::min<int>(16, tokens.size() - i);
+    forward_prefill_batch(model, state, tokens.data() + i, chunk);
   }
 }
 
@@ -480,7 +487,8 @@ static constexpr int Q4_BLOCK = 32;
 
 // Q4_0 fused dequant-GEMV: y[n] = sum_k dequant(W[n,k]) * x[k]
 // Grid: (N,), Block: (32,)
-// Optimized: 4-byte vector loads for activation, unrolled inner loop
+// Each wave processes one output row. Threads stride over Q4_0 blocks.
+// Minimal register pressure for maximum occupancy on gfx1032.
 __global__ void __launch_bounds__(WAVE)
 kern_gemv_q4_0(int N, int K,
                const __half    * __restrict__ x,
@@ -503,10 +511,10 @@ kern_gemv_q4_0(int N, int K,
     #pragma unroll
     for (int i = 0; i < 16; i++) {
       uint8_t packed = b.qs[i];
-      block_acc += scale * ((float)(packed & 0xF) - 8.0f) * __half2float(xblk[i]);
-      block_acc += scale * ((float)(packed >> 4)  - 8.0f) * __half2float(xblk[i + 16]);
+      block_acc += ((float)(packed & 0xF) - 8.0f) * __half2float(xblk[i]);
+      block_acc += ((float)(packed >> 4)  - 8.0f) * __half2float(xblk[i + 16]);
     }
-    acc += block_acc;
+    acc += scale * block_acc;
   }
 
   acc += __shfl_xor(acc, 16);
@@ -825,7 +833,7 @@ kern_rope(uint32_t n_heads, uint32_t head_dim, uint32_t pos,
 // Phase 2: reduce across splits
 // This parallelizes the KV scan across wavefronts, letting the GPU overlap memory latency.
 
-static constexpr int ATTN_SPLIT_SIZE = 64; // tokens per split
+static constexpr uint32_t ATTN_SPLIT_SIZE = 64; // tokens per split
 
 __device__ __forceinline__ uint32_t cache_phys_index(uint32_t cache_start,
                                                      uint32_t cache_capacity,
@@ -1130,13 +1138,11 @@ kern_attn_decode_i8(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
     out[qh * head_dim + tid * (head_dim / WAVE) + i] = __float2half(o[i] * l_inv);
 }
 
-// Global Gemma layers use 16:1 GQA. Process all 16 query heads in a single
-// block so the shared K/V head is streamed once instead of 16 times.
-static constexpr int GLOBAL_GQA_HEADS = 16;
-static constexpr int GLOBAL_GQA_BLOCK = GLOBAL_GQA_HEADS * WAVE;
-
-__global__ void __launch_bounds__(GLOBAL_GQA_BLOCK)
+// Global Gemma layers use MQA/GQA. Process all query heads in a single
+// block so the shared K/V head is streamed once instead of N times.
+__global__ void __launch_bounds__(1024)
 kern_attn_split_gqa_q4(uint32_t head_dim,
+                       uint32_t n_q_heads,
                        uint32_t seq_len,
                        uint32_t cache_capacity,
                        uint32_t cache_start,
@@ -1152,27 +1158,27 @@ kern_attn_split_gqa_q4(uint32_t head_dim,
   int tid = threadIdx.x;
   int qh = tid / WAVE;
   int lane = tid & (WAVE - 1);
-  if (qh >= GLOBAL_GQA_HEADS) return;
+  if (qh >= (int)n_q_heads) return;
 
   uint32_t ept = head_dim / WAVE;
   uint32_t t_start = split_id * ATTN_SPLIT_SIZE;
   uint32_t t_end = min(t_start + ATTN_SPLIT_SIZE, seq_len);
   if (t_start >= seq_len) {
     if (lane == 0) {
-      uint32_t ml_idx = split_id * GLOBAL_GQA_HEADS * 2 + qh * 2;
+      uint32_t ml_idx = split_id * n_q_heads * 2 + qh * 2;
       split_ml[ml_idx] = -1e9f;
       split_ml[ml_idx + 1] = 0.0f;
     }
     return;
   }
 
-  float q_reg[16];
+  float q_reg[32];
   for (uint32_t i = 0; i < ept; i++)
     q_reg[i] = __half2float(q[qh * head_dim + lane * ept + i]);
 
   float m = -1e9f;
   float l = 0.0f;
-  float o[16] = {};
+  float o[32] = {};
 
   for (uint32_t t = t_start; t < t_end; t++) {
     uint32_t phys_t = cache_phys_index(cache_start, cache_capacity, t);
@@ -1201,12 +1207,12 @@ kern_attn_split_gqa_q4(uint32_t head_dim,
     m = m_new;
   }
 
-  uint32_t o_base = (split_id * GLOBAL_GQA_HEADS + qh) * head_dim + lane * ept;
+  uint32_t o_base = (split_id * n_q_heads + qh) * head_dim + lane * ept;
   for (uint32_t i = 0; i < ept; i++)
     split_o[o_base + i] = o[i];
 
   if (lane == 0) {
-    uint32_t ml_idx = split_id * GLOBAL_GQA_HEADS * 2 + qh * 2;
+    uint32_t ml_idx = split_id * n_q_heads * 2 + qh * 2;
     split_ml[ml_idx] = m;
     split_ml[ml_idx + 1] = l;
   }
@@ -1214,7 +1220,7 @@ kern_attn_split_gqa_q4(uint32_t head_dim,
 
 // Q6_K GEMV for lm_head: y[n] = sum_k dequant(W[n,k]) * x[k]
 // All 32 threads collaborate on EACH Q6_K block (256 elem / 32 = 8 elem/thread).
-// Sequential over blocks, parallel within block. 264 GB/s on gfx1032.
+// Sequential over blocks, parallel within block.
 __global__ void __launch_bounds__(WAVE)
 kern_gemv_q6k(int N, int K,
               const __half       * __restrict__ x,
@@ -1618,161 +1624,23 @@ __device__ static inline void wmma_16x16x16_f16(
     float *acc            // [8] per lane
 ) {
   uint32_t lid = threadIdx.x & 31u;
-  uint32_t lowHalf = lid < 16u;
-  uint32_t laneInHalf = lid & 15u;
+  uint32_t row = lid & 15u;
+  uint32_t col_start = (lid < 16u) ? 0u : 8u;
 
-  // Each lane loads its row of A (16 fp16 = 8 pairs) and its col of B
-  uint32_t a_row = laneInHalf;
-  uint32_t b_col = laneInHalf;
-
-  // Pack A row into 8 half2 pairs
-  uint32_t aPairs[8];
   #pragma unroll
-  for (int i = 0; i < 8; i++) {
-    const __half *ap = a_lds + a_row * 16 + i * 2;
-    aPairs[i] = *reinterpret_cast<const uint32_t*>(ap);
-  }
+  for (int k_pair = 0; k_pair < 8; k_pair++) {
+    const __half *ap = a_lds + row * 16 + k_pair * 2;
+    uint32_t a_val = *reinterpret_cast<const uint32_t*>(ap);
 
-  // Pack B col into 8 half2 pairs
-  uint32_t bPairs[8];
-  #pragma unroll
-  for (int i = 0; i < 8; i++) {
-    const __half *bp = b_lds + b_col * 16 + i * 2;
-    bPairs[i] = *reinterpret_cast<const uint32_t*>(bp);
-  }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      int col = col_start + i;
+      const __half *bp = b_lds + col * 16 + k_pair * 2;
+      uint32_t b_val = *reinterpret_cast<const uint32_t*>(bp);
 
-  // Exchange A rows between halves: low half needs rows from high half's lanes and vice versa
-  uint32_t aOther[8];
-  #pragma unroll
-  for (int i = 0; i < 8; i++)
-    aOther[i] = wmma_permlanex16(aPairs[i]);
-
-  // Each lane needs the A row corresponding to B's column index within its 8-lane DPP group.
-  // Low half: my B col is laneInHalf, I need A rows 0-7 from low half, 8-15 from high half
-  // High half: my B col is laneInHalf, I need A rows 0-7 from low half, 8-15 from high half
-  // DPP8 broadcasts within groups of 8 lanes. Within each 8-lane group, lane j holds A row j (or j+8).
-  // Use bpermute to rearrange so that within each 8-lane DPP subgroup, lane j has A row j.
-
-  uint32_t myGroup = (lid & 7u); // 0-7 within 8-lane group
-  // For the DPP8 pattern: lane j in the 8-group will broadcast its A, computing dot(A_row_j, B_col_mine)
-  // So each lane just needs its own A row — but in the right register for bpermute to distribute
-  // Actually: we need A_row_j available at lane j within each 8-lane group.
-  // Low-half lanes 0-7 naturally have A rows 0-7. Lanes 8-15 have A rows 8-15.
-  // The DPP8 pattern [j,j,j,j,j,j,j,j] broadcasts lane j's value to all 8 lanes in the subgroup.
-  // So for computing C[myRow][col], where col iterates 0-7 within the DPP subgroup:
-  // accum[col] += A[myRow][k_pair] * B[col_of_lane_j][k_pair]  via DPP8 broadcast of B
-
-  // Wait — rethinking. The standard approach:
-  // Each lane holds B column data. DPP8 broadcasts B from lane j to all lanes in the 8-group.
-  // Each lane has its own A row. So: acc[j] += dot2(myA[pair], broadcast_from_j(B[pair]))
-  // This gives each lane: C[myRow][col_j] for j in the 8-lane group.
-
-  // But we have 32 lanes and 16 columns. Low half covers cols 0-7 of each row, high half covers 8-15.
-  // Lane l (l<16): row = l, accumulates cols 0-7 via DPP8 within lanes 0-7
-  //                        accumulates cols 8-15 via cross-half exchange + DPP8 within lanes 8-15
-  // Hmm, this is getting complex. Let me use a simpler decomposition:
-
-  // Simpler: lanes 0-15 = "group A" (rows 0-15), lanes 16-31 = "group B" (also rows 0-15 but different cols)
-  // Group A lanes 0-7: each lane j holds B col j, accumulates C[row][0..7]
-  // Group A lanes 8-15: each lane j holds B col j, accumulates C[row][8..15]
-
-  // With DPP8, in lanes 0-7: broadcast lane j's B → all get B[col_j], multiply with own A → C[row][col_j]
-  // Same for lanes 8-15.
-  // But wait, lanes 0-7 would only produce 8 columns. We need 16 columns per row.
-  // Solution: lanes 0-15 produce cols 0-7 (using DPP within their 8-lane subgroups: 0-7 and 8-15)
-  //           lanes 16-31 produce cols 8-15
-
-  // Actually this doesn't work cleanly either because DPP8 operates on fixed 8-lane groups (0-7, 8-15, 16-23, 24-31).
-  // Lane 0 is in DPP group 0 (lanes 0-7), lane 8 is in DPP group 1 (lanes 8-15), etc.
-
-  // The rocWMMA approach: use ds_bpermute to redistribute A rows so that within each DPP8 group,
-  // lane j has the A row needed. Then DPP8 broadcasts A from lane j, each lane has its own B, computes dot.
-  // Final: permlanex16 to exchange partial sums between halves.
-
-  // Let me just follow rocWMMA's proven algorithm exactly:
-  // 1. Low half (lanes 0-15): each lane l has A[l] and B[l]
-  // 2. High half (lanes 16-31): each lane l has A[l-16] and B[l-16]  (same rows/cols)
-  // 3. We use permlanex16 to get the other half's A data
-  // 4. Combine: low half builds aPairs from (own low, other high), high from (other low, own high)
-  //    This gives each half the full 16×16 A matrix distributed across 16 lanes
-  // 5. bpermute: each lane fetches A[col_within_8group] from the appropriate lane
-  // 6. DPP8: iterate over 8 columns, broadcasting A[row_j] while using own B[col]
-  // 7. permlanex16: exchange results between halves, accumulate
-
-  // Following rocWMMA's select_half2_bits: interleave low/high pairs
-  uint32_t aFull[8], bFull[8];
-  #pragma unroll
-  for (int i = 0; i < 8; i++) {
-    uint32_t lo = aPairs[i];
-    uint32_t hi = aOther[i];
-    // Low half takes own low 16 bits + other's high 16 bits (column pairs interleaved)
-    aFull[i] = lowHalf ? ((lo & 0xFFFF) | (hi & 0xFFFF0000u))
-                       : ((hi & 0xFFFF) | (lo & 0xFFFF0000u));
-    // B: same exchange
-    uint32_t bOth = wmma_permlanex16(bPairs[i]);
-    bFull[i] = lowHalf ? ((bPairs[i] & 0xFFFF) | (bOth & 0xFFFF0000u))
-                       : ((bOth & 0xFFFF) | (bPairs[i] & 0xFFFF0000u));
-  }
-
-  // bpermute: get A rows for DPP8 subgroup matching
-  // Within the 8-lane DPP subgroup, we'll broadcast A from each lane.
-  // Each lane needs A data rearranged so lane j in the 8-group has A row j (or j+8).
-  uint32_t srcLane = (lid & 7u) + (lowHalf ? 0u : 8u);
-  uint32_t aRows[8];
-  #pragma unroll
-  for (int i = 0; i < 8; i++)
-    aRows[i] = wmma_bpermute(aFull[i], srcLane);
-
-  // DPP8 core: 8 pairs × 8 broadcasts = 64 FMAs (= 128 multiplies for the 16×16×16)
-  float localAcc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  #pragma unroll
-  for (int pair = 0; pair < 8; pair++) {
-    half2_vec aP = reinterpret_cast<half2_vec&>(aRows[pair]);
-    half2_vec bP = reinterpret_cast<half2_vec&>(bFull[pair]);
-    // DPP8 broadcasts A from lane j, each lane multiplies with its own B
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[0,0,0,0,0,0,0,0]"
-                 : "=v"(localAcc[0]) : "v"(aP), "v"(bP), "0"(localAcc[0]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[1,1,1,1,1,1,1,1]"
-                 : "=v"(localAcc[1]) : "v"(aP), "v"(bP), "0"(localAcc[1]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[2,2,2,2,2,2,2,2]"
-                 : "=v"(localAcc[2]) : "v"(aP), "v"(bP), "0"(localAcc[2]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[3,3,3,3,3,3,3,3]"
-                 : "=v"(localAcc[3]) : "v"(aP), "v"(bP), "0"(localAcc[3]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[4,4,4,4,4,4,4,4]"
-                 : "=v"(localAcc[4]) : "v"(aP), "v"(bP), "0"(localAcc[4]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[5,5,5,5,5,5,5,5]"
-                 : "=v"(localAcc[5]) : "v"(aP), "v"(bP), "0"(localAcc[5]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[6,6,6,6,6,6,6,6]"
-                 : "=v"(localAcc[6]) : "v"(aP), "v"(bP), "0"(localAcc[6]));
-    asm volatile("v_dot2c_f32_f16_dpp %0, %1, %2 dpp8:[7,7,7,7,7,7,7,7]"
-                 : "=v"(localAcc[7]) : "v"(aP), "v"(bP), "0"(localAcc[7]));
-  }
-
-  // Exchange partial results between halves
-  uint32_t partnerAcc[8];
-  #pragma unroll
-  for (int i = 0; i < 8; i++)
-    partnerAcc[i] = wmma_permlanex16(reinterpret_cast<uint32_t&>(localAcc[i]));
-
-  // Accumulate: low half gets even-indexed results, high half gets odd-indexed
-  if (lowHalf) {
-    acc[0] += localAcc[0];
-    acc[1] += localAcc[2];
-    acc[2] += localAcc[4];
-    acc[3] += localAcc[6];
-    acc[4] += reinterpret_cast<float&>(partnerAcc[0]);
-    acc[5] += reinterpret_cast<float&>(partnerAcc[2]);
-    acc[6] += reinterpret_cast<float&>(partnerAcc[4]);
-    acc[7] += reinterpret_cast<float&>(partnerAcc[6]);
-  } else {
-    acc[0] += reinterpret_cast<float&>(partnerAcc[1]);
-    acc[1] += reinterpret_cast<float&>(partnerAcc[3]);
-    acc[2] += reinterpret_cast<float&>(partnerAcc[5]);
-    acc[3] += reinterpret_cast<float&>(partnerAcc[7]);
-    acc[4] += localAcc[1];
-    acc[5] += localAcc[3];
-    acc[6] += localAcc[5];
-    acc[7] += localAcc[7];
+      asm volatile("v_dot2c_f32_f16 %0, %1, %2"
+                   : "=v"(acc[i]) : "v"(a_val), "v"(b_val), "0"(acc[i]));
+    }
   }
 }
 
@@ -1941,20 +1809,224 @@ kern_gemm_q4_0_wmma_padded(int M_real, int N, int K,
 // Model structure
 // ============================================================================
 
-static constexpr uint32_t HIDDEN     = 3840;
-static constexpr uint32_t FFN        = 15360;
-static constexpr uint32_t N_LAYERS   = 48;
-static constexpr float    EPS        = 1e-6f;
+// ============================================================================
+// Model Configuration (loaded from JSON)
+// ============================================================================
+
+struct ModelConfig {
+  uint32_t hidden_size = 0;
+  uint32_t intermediate_size = 0;
+  uint32_t num_layers = 0;
+  uint32_t num_attention_heads = 0;
+  uint32_t head_dim = 0;
+  uint32_t global_head_dim = 0;
+  uint32_t swa_kv_heads = 0;
+  uint32_t global_kv_heads = 0;
+  uint32_t vocab_size = 0;
+  uint32_t max_seq_len = 0;
+  uint32_t sliding_window = 0;
+  uint32_t attn_split_size = 64;
+  uint32_t attn_split_threshold = 64;
+  uint32_t norm_threads = 256;
+  float rms_norm_eps = 1e-6f;
+  float final_logit_softcap = 0.0f;
+  float rope_theta_swa = 10000.0f;
+  float rope_theta_global = 1000000.0f;
+  float partial_rotary_factor = 1.0f;
+  bool attention_k_eq_v = false;
+  uint8_t layer_types[256] = {}; // 0=sliding, 1=global, up to 256 layers
+  uint32_t num_global_layers = 0;
+
+  // Derived
+  uint32_t max_q_heads() const { return num_attention_heads; }
+  uint32_t max_head_dim() const { return global_head_dim > head_dim ? global_head_dim : head_dim; }
+  uint32_t max_q_dim() const { return num_attention_heads * max_head_dim(); }
+  uint32_t max_kv_dim() const { return (swa_kv_heads > global_kv_heads ? swa_kv_heads : global_kv_heads) * max_head_dim(); }
+  bool is_global(uint32_t l) const { return l < num_layers && layer_types[l] == 1; }
+};
+
+// Minimal JSON parser — returns 0 on success, non-zero on error.
+// Supports: string, number (int/float), bool, array-of-strings, nested objects (1 level).
+// Assumes ASCIZ C strings.
+static const char *json_skip_ws(const char *p) {
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+  return p;
+}
+
+static const char *json_parse_string(const char *p, char *out, size_t out_sz) {
+  p = json_skip_ws(p);
+  if (*p != '"') return nullptr;
+  p++;
+  size_t n = 0;
+  while (*p && *p != '"') {
+    if (n + 1 < out_sz) out[n++] = *p;
+    p++;
+  }
+  out[n] = '\0';
+  if (*p != '"') return nullptr;
+  return p + 1;
+}
+
+static const char *json_parse_number(const char *p, float *fval, int *ival) {
+  p = json_skip_ws(p);
+  char *end;
+  float f = strtof(p, &end);
+  if (end == p) return nullptr;
+  *fval = f;
+  // Check if integer-like (no '.' or 'e'/'E')
+  bool is_int = true;
+  for (const char *q = p; q < end; q++) {
+    if (*q == '.' || *q == 'e' || *q == 'E') { is_int = false; break; }
+  }
+  if (is_int) *ival = (int)f;
+  return end;
+}
+
+static const char *json_parse_bool(const char *p, bool *val) {
+  p = json_skip_ws(p);
+  if (strncmp(p, "true", 4) == 0) { *val = true; return p + 4; }
+  if (strncmp(p, "false", 5) == 0) { *val = false; return p + 5; }
+  return nullptr;
+}
+
+static const char *json_match(const char *p, char c) {
+  p = json_skip_ws(p);
+  if (*p != c) return nullptr;
+  return p + 1;
+}
+
+// Parse an array of strings like ["sliding","global",...]
+static const char *json_parse_str_array(const char *p, uint8_t *out, uint32_t max_items, uint32_t *count) {
+  p = json_match(p, '[');
+  if (!p) return nullptr;
+  *count = 0;
+  p = json_skip_ws(p);
+  if (*p == ']') return p + 1; // empty array
+  for (;;) {
+    if (*count >= max_items) return nullptr;
+    char buf[32];
+    p = json_parse_string(p, buf, sizeof(buf));
+    if (!p) return nullptr;
+    if (strcmp(buf, "global") == 0 || strcmp(buf, "full_attention") == 0)
+      out[(*count)++] = 1;
+    else if (strcmp(buf, "sliding") == 0 || strcmp(buf, "sliding_attention") == 0)
+      out[(*count)++] = 0;
+    else
+      out[(*count)++] = 0; // unknown → sliding default
+    p = json_skip_ws(p);
+    if (*p == ']') return p + 1;
+    p = json_match(p, ',');
+    if (!p) return nullptr;
+  }
+}
+
+static bool cfg_load_from_json(const char *path, ModelConfig *cfg) {
+  FILE *f = fopen(path, "rb");
+  if (!f) { fprintf(stderr, "Cannot open config: %s\n", path); return false; }
+  fseek(f, 0, SEEK_END);
+  size_t sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  std::vector<char> buf(sz + 1);
+  fread(buf.data(), 1, sz, f);
+  fclose(f);
+  buf[sz] = '\0';
+
+  const char *p = buf.data();
+  p = json_match(p, '{');
+  if (!p) { fprintf(stderr, "Config: expected '{\n"); return false; }
+
+  float fval = 0;
+  int ival = 0;
+  bool bval = false;
+
+  while (*p) {
+    p = json_skip_ws(p);
+    if (*p == '}') return true; // done
+    if (*p == ',') { p++; continue; }
+    char key[64];
+    p = json_parse_string(p, key, sizeof(key));
+    if (!p) { fprintf(stderr, "Config: expected key string\n"); return false; }
+    p = json_match(p, ':');
+    if (!p) { fprintf(stderr, "Config: expected ':' after %s\n", key); return false; }
+
+#define CFG_NUM_FIELD(name) \
+    if (strcmp(key, #name) == 0) { p = json_parse_number(p, &fval, &ival); if (!p) return false; cfg->name = (uint32_t)ival; continue; }
+
+#define CFG_FLT_FIELD(name) \
+    if (strcmp(key, #name) == 0) { p = json_parse_number(p, &fval, &ival); if (!p) return false; cfg->name = fval; continue; }
+
+#define CFG_BOOL_FIELD(name) \
+    if (strcmp(key, #name) == 0) { p = json_parse_bool(p, &bval); if (!p) return false; cfg->name = bval; continue; }
+
+    CFG_NUM_FIELD(hidden_size)
+    CFG_NUM_FIELD(intermediate_size)
+    CFG_NUM_FIELD(num_layers)
+    CFG_NUM_FIELD(num_attention_heads)
+    CFG_NUM_FIELD(head_dim)
+    CFG_NUM_FIELD(global_head_dim)
+    CFG_NUM_FIELD(swa_kv_heads)
+    CFG_NUM_FIELD(global_kv_heads)
+    CFG_NUM_FIELD(vocab_size)
+    CFG_NUM_FIELD(max_seq_len)
+    CFG_NUM_FIELD(sliding_window)
+    CFG_NUM_FIELD(attn_split_size)
+    CFG_NUM_FIELD(attn_split_threshold)
+    CFG_NUM_FIELD(norm_threads)
+    CFG_FLT_FIELD(rms_norm_eps)
+    CFG_FLT_FIELD(final_logit_softcap)
+    CFG_FLT_FIELD(rope_theta_swa)
+    CFG_FLT_FIELD(rope_theta_global)
+    CFG_FLT_FIELD(partial_rotary_factor)
+    CFG_BOOL_FIELD(attention_k_eq_v)
+
+#undef CFG_NUM_FIELD
+#undef CFG_FLT_FIELD
+#undef CFG_BOOL_FIELD
+
+    if (strcmp(key, "layer_types") == 0) {
+      p = json_parse_str_array(p, cfg->layer_types, 256, &cfg->num_global_layers);
+      if (!p) { fprintf(stderr, "Config: bad layer_types array\n"); return false; }
+      // Recount global layers
+      cfg->num_global_layers = 0;
+      for (uint32_t i = 0; i < cfg->num_layers; i++)
+        if (cfg->layer_types[i] == 1) cfg->num_global_layers++;
+      continue;
+    }
+
+    // Unknown key: skip value
+    fprintf(stderr, "Config: skipping unknown key '%s'\n", key);
+    p = json_skip_ws(p);
+    if (*p == '"') {
+      p++; while (*p && *p != '"') p++; if (*p == '"') p++;
+    } else if (*p == '[') {
+      p++; int depth = 1;
+      while (*p && depth > 0) { if (*p == '[') depth++; if (*p == ']') depth--; p++; }
+    } else if (*p == '{') {
+      p++; int depth = 1;
+      while (*p && depth > 0) { if (*p == '{') depth++; if (*p == '}') depth--; p++; }
+    } else {
+      const char *next = json_parse_number(p, &fval, &ival); 
+      if (!next) next = json_parse_bool(p, &bval);
+      p = next;
+    }
+  }
+  fprintf(stderr, "Config: unexpected end of file\n");
+  return false;
+}
+
+// ============================================================================
+// Model Structures
+// ============================================================================
 
 struct LayerWeights {
   // All Q4_0 pointers (device)
-  void *wq;       // [HIDDEN, q_dim]
-  void *wk;       // [HIDDEN, kv_dim] — nullptr for non-KV layers
-  void *wv;       // [HIDDEN, kv_dim] — nullptr if uses K as V
-  void *wo;       // [q_dim, HIDDEN]
-  void *ffn_gate; // [HIDDEN, FFN]
-  void *ffn_up;   // [HIDDEN, FFN]
-  void *ffn_down; // [FFN, HIDDEN]
+  void *wq;       // [hidden_size, q_dim]
+  void *wk;       // [hidden_size, kv_dim] — nullptr for non-KV layers
+  void *wv;       // [hidden_size, kv_dim] — nullptr if uses K as V
+  void *wo;       // [q_dim, hidden_size]
+  void *ffn_gate; // [hidden_size, FFN]
+  void *ffn_up;   // [hidden_size, FFN]
+  void *ffn_down; // [FFN, hidden_size]
 
   // F32 norm weights (device)
   float *attn_norm;
@@ -1992,24 +2064,25 @@ struct LayerWeights {
 };
 
 struct Model {
-  LayerWeights layers[N_LAYERS];
-  float *output_norm; // [HIDDEN] F32 on device
-  float *rope_freqs;  // [256] F32 on device (for global layers)
+  ModelConfig cfg;
+  std::vector<LayerWeights> layers;
+  float *output_norm; // [hidden_size] F32 on device
+  float *rope_freqs;  // [global_head_dim/2] F32 on device (for global layers)
   uint32_t vocab_size;
   float final_logit_softcap;
   float rope_freq_base;
   float rope_freq_base_swa;
 
   // Embedding table: Q6_K on GPU for lm_head AND token embedding
-  Q6_K_Block *embed_q6k_dev;           // [vocab_size * HIDDEN / 256] Q6_K blocks on GPU
+  Q6_K_Block *embed_q6k_dev;           // [vocab_size * hidden_size / 256] Q6_K blocks on GPU
   __half *logits_dev;                   // [vocab_size] on GPU for argmax
   uint32_t *argmax_dev;                 // GPU argmax result
 
   // Per-token RoPE rows (GPU) reused across all layers of the same type
-  float *rope_cos_swa_row;    // [128]
-  float *rope_sin_swa_row;    // [128]
-  float *rope_cos_global_row; // [256]
-  float *rope_sin_global_row; // [256]
+  float *rope_cos_swa_row;    // [head_dim / 2]
+  float *rope_sin_swa_row;    // [head_dim / 2]
+  float *rope_cos_global_row; // [global_head_dim / 2]
+  float *rope_sin_global_row; // [global_head_dim / 2]
   uint32_t max_seq;
   uint32_t sliding_window;
 
@@ -2061,31 +2134,34 @@ static void dequant_q6k_row(__half *out, const uint8_t *data, uint64_t n_element
 // Model Loading
 // ============================================================================
 
-static void* upload_q4_0(const void *host_data, uint64_t n_elements) {
+static void* upload_q4_0(const void *host_data, size_t n_elements) {
   size_t bytes = tensor_bytes(GGML_TYPE_Q4_0, n_elements);
   void *dev;
-  HIP_CHECK(hipMalloc(&dev, bytes));
+  HIP_MALLOC_VRAM(&dev, bytes);
   HIP_CHECK(hipMemcpy(dev, host_data, bytes, hipMemcpyHostToDevice));
   return dev;
 }
 
-static float* upload_f32(const void *host_data, uint64_t n_elements) {
+static float* upload_f32(const void *host_data, size_t n_elements) {
   size_t bytes = n_elements * sizeof(float);
-  float *dev;
-  HIP_CHECK(hipMalloc(&dev, bytes));
+  void *dev;
+  HIP_MALLOC_VRAM(&dev, bytes);
   HIP_CHECK(hipMemcpy(dev, host_data, bytes, hipMemcpyHostToDevice));
-  return dev;
+  return (float*)dev;
 }
 
 static bool load_model(GGUFFile *gguf, Model *model) {
-  // Architecture params
-  model->vocab_size = 262144;  // from embedding tensor
-  model->final_logit_softcap = 30.0f;
-  model->rope_freq_base = 1000000.0f;
-  model->rope_freq_base_swa = 10000.0f;
-  model->max_seq = 65536;
-  model->sliding_window = 1024;
+  const ModelConfig &cfg = model->cfg;
 
+  // Derive from config
+  model->vocab_size = cfg.vocab_size;
+  model->final_logit_softcap = cfg.final_logit_softcap;
+  model->rope_freq_base = cfg.rope_theta_global;
+  model->rope_freq_base_swa = cfg.rope_theta_swa;
+  model->max_seq = cfg.max_seq_len;
+  model->sliding_window = cfg.sliding_window;
+
+  // Override from GGUF metadata if present
   if (gguf->kv_float.count("gemma4.final_logit_softcapping"))
     model->final_logit_softcap = gguf->kv_float["gemma4.final_logit_softcapping"];
   if (gguf->kv_float.count("gemma4.rope.freq_base"))
@@ -2098,9 +2174,11 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     model->max_seq = (uint32_t)std::min<uint64_t>(gguf->kv_uint["gemma4.context_length"], model->max_seq);
   model->max_seq = getenv_u32("THEROCK_MAX_SEQ", model->max_seq);
 
-  // SWA pattern: layers 5,11,17,23,29,35,41,47 are global (non-SWA)
-  // From metadata: sliding_window_pattern = [T,T,T,T,T,F,T,T,T,T] repeating
-  auto is_global = [](int l) { return (l % 6 == 5); };
+  uint32_t HIDDEN = cfg.hidden_size;
+  uint32_t FFN = cfg.intermediate_size;
+  uint32_t N_LAYERS = cfg.num_layers;
+
+  model->layers.resize(N_LAYERS);
 
   size_t total_gpu_bytes = 0;
 
@@ -2112,8 +2190,8 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     uint64_t n_elem = t.n_elements;
     size_t q6k_bytes = tensor_bytes(GGML_TYPE_Q6_K, n_elem);
 
-    // Upload Q6_K to GPU — used for BOTH token embedding (row lookup) and lm_head (full GEMV)
-    HIP_CHECK(hipMalloc(&model->embed_q6k_dev, q6k_bytes));
+    // Upload Q6_K to GPU (lm_head) - strictly pinned VRAM
+    HIP_MALLOC_VRAM(&model->embed_q6k_dev, q6k_bytes);
     HIP_CHECK(hipMemcpy(model->embed_q6k_dev, gguf->tensor_data(t), q6k_bytes, hipMemcpyHostToDevice));
 
     // Allocate logits buffer and argmax result on GPU
@@ -2129,7 +2207,7 @@ static bool load_model(GGUFFile *gguf, Model *model) {
   {
     auto it = gguf->tensors.find("output_norm.weight");
     if (it == gguf->tensors.end()) { fprintf(stderr, "Missing output_norm\n"); return false; }
-    model->output_norm = upload_f32(gguf->tensor_data(it->second), it->second.n_elements);
+    model->output_norm = (float*)upload_f32(gguf->tensor_data(it->second), it->second.n_elements);
   }
 
   // Rope freqs (shared across global layers)
@@ -2148,12 +2226,12 @@ static bool load_model(GGUFFile *gguf, Model *model) {
     LayerWeights &lw = model->layers[l];
     char name[128];
 
-    lw.is_swa = !is_global(l);
+    lw.is_swa = !cfg.is_global(l);
     lw.attn_window = lw.is_swa ? model->sliding_window : model->max_seq;
-    lw.has_kv = true;  // all layers in 12B have their own KV
-    lw.head_dim = lw.is_swa ? 256 : 512;
-    lw.n_q_heads = 16;
-    lw.n_kv_heads = lw.is_swa ? 8 : 1;
+    lw.has_kv = true;
+    lw.head_dim = lw.is_swa ? cfg.head_dim : cfg.global_head_dim;
+    lw.n_q_heads = cfg.num_attention_heads;
+    lw.n_kv_heads = lw.is_swa ? cfg.swa_kv_heads : cfg.global_kv_heads;
     lw.q_dim = lw.n_q_heads * lw.head_dim;
     lw.kv_dim = lw.n_kv_heads * lw.head_dim;
     lw.kv_capacity = lw.is_swa ? std::min(model->max_seq, lw.attn_window) : model->max_seq;
@@ -2265,18 +2343,20 @@ static bool load_model(GGUFFile *gguf, Model *model) {
   // them across all layers of the same type.
   printf("Allocating RoPE row buffers...\n");
   {
-    HIP_CHECK(hipMalloc(&model->rope_cos_swa_row, 128 * sizeof(float)));
-    HIP_CHECK(hipMalloc(&model->rope_sin_swa_row, 128 * sizeof(float)));
-    HIP_CHECK(hipMalloc(&model->rope_cos_global_row, 256 * sizeof(float)));
-    HIP_CHECK(hipMalloc(&model->rope_sin_global_row, 256 * sizeof(float)));
-    total_gpu_bytes += (128 + 128 + 256 + 256) * sizeof(float);
+    uint32_t half_swa = cfg.head_dim / 2;
+    uint32_t half_global = cfg.global_head_dim / 2;
+    HIP_CHECK(hipMalloc(&model->rope_cos_swa_row, half_swa * sizeof(float)));
+    HIP_CHECK(hipMalloc(&model->rope_sin_swa_row, half_swa * sizeof(float)));
+    HIP_CHECK(hipMalloc(&model->rope_cos_global_row, half_global * sizeof(float)));
+    HIP_CHECK(hipMalloc(&model->rope_sin_global_row, half_global * sizeof(float)));
+    total_gpu_bytes += (half_swa + half_swa + half_global + half_global) * sizeof(float);
   }
 
   // Split attention scratch: max_splits = max_seq / ATTN_SPLIT_SIZE + 1
   {
-    uint32_t max_splits = (model->max_seq + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
-    uint32_t max_q_heads = 16;
-    uint32_t max_head_dim = 512;
+    uint32_t max_splits = (model->max_seq + cfg.attn_split_size - 1) / cfg.attn_split_size;
+    uint32_t max_q_heads = cfg.max_q_heads();
+    uint32_t max_head_dim = cfg.max_head_dim();
     size_t split_o_bytes = (size_t)max_splits * max_q_heads * max_head_dim * sizeof(float);
     size_t split_ml_bytes = (size_t)max_splits * max_q_heads * 2 * sizeof(float);
     HIP_CHECK(hipMalloc(&model->attn_split_o, split_o_bytes));
@@ -2289,7 +2369,6 @@ static bool load_model(GGUFFile *gguf, Model *model) {
 }
 
 // Dispatch attention: uses split-K for long sequences, single wave for short
-static constexpr uint32_t ATTN_SPLIT_THRESHOLD = 64;
 
 static inline uint32_t layer_seq_len(const LayerWeights &lw, uint32_t pos) {
   return lw.is_swa ? std::min(pos + 1, lw.attn_window) : (pos + 1);
@@ -2305,13 +2384,18 @@ static inline uint32_t layer_store_index(const LayerWeights &lw, uint32_t pos) {
   return lw.is_swa ? (pos % lw.kv_capacity) : pos;
 }
 
+// ============================================================================
+// Attention Dispatch
+// ============================================================================
+
 static void dispatch_attention_fp16(hipStream_t s, Model *model,
                                     uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
                                     uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
                                     float scale,
                                     const __half *q, const __half *k_cache, const __half *v_cache,
                                     __half *out) {
-  if (seq_len <= ATTN_SPLIT_THRESHOLD) {
+  const uint32_t threshold = model->cfg.attn_split_threshold;
+  if (seq_len <= threshold) {
     hipLaunchKernelGGL(kern_attn_decode, dim3(n_q_heads), dim3(WAVE), 0, s,
                        n_q_heads, n_kv_heads, head_dim, seq_len, cache_capacity, cache_start, scale,
                        q, k_cache, v_cache, out);
@@ -2336,7 +2420,8 @@ static void dispatch_attention_i8(hipStream_t s, Model *model,
                                   const float *k_scale,
                                   const float *v_scale,
                                   __half *out) {
-  if (seq_len <= ATTN_SPLIT_THRESHOLD) {
+  const uint32_t threshold = model->cfg.attn_split_threshold;
+  if (seq_len <= threshold) {
     hipLaunchKernelGGL(kern_attn_decode_i8, dim3(n_q_heads), dim3(WAVE), 0, s,
                        n_q_heads, n_kv_heads, head_dim, seq_len, cache_capacity, cache_start, scale,
                        q, k_cache, v_cache, k_scale, v_scale, out);
@@ -2353,6 +2438,7 @@ static void dispatch_attention_i8(hipStream_t s, Model *model,
 }
 
 static void dispatch_attention_gqa_q4(hipStream_t s, Model *model,
+                                      uint32_t head_dim, uint32_t n_q_heads,
                                       uint32_t seq_len, uint32_t cache_capacity, uint32_t cache_start,
                                       float scale,
                                       const __half *q,
@@ -2361,13 +2447,14 @@ static void dispatch_attention_gqa_q4(hipStream_t s, Model *model,
                                       const float *k_scale,
                                       const float *v_scale,
                                       __half *out) {
+  uint32_t gqa_block = n_q_heads * WAVE;
   uint32_t n_splits = (seq_len + ATTN_SPLIT_SIZE - 1) / ATTN_SPLIT_SIZE;
-  hipLaunchKernelGGL(kern_attn_split_gqa_q4, dim3(n_splits), dim3(GLOBAL_GQA_BLOCK), 0, s,
-                     512, seq_len, cache_capacity, cache_start, scale,
+  hipLaunchKernelGGL(kern_attn_split_gqa_q4, dim3(n_splits), dim3(gqa_block), 0, s,
+                     head_dim, n_q_heads, seq_len, cache_capacity, cache_start, scale,
                      q, k_cache, v_cache, k_scale, v_scale,
                      model->attn_split_o, model->attn_split_ml);
-  hipLaunchKernelGGL(kern_attn_reduce, dim3(GLOBAL_GQA_HEADS), dim3(WAVE), 0, s,
-                     GLOBAL_GQA_HEADS, 512, n_splits,
+  hipLaunchKernelGGL(kern_attn_reduce, dim3(n_q_heads), dim3(WAVE), 0, s,
+                     n_q_heads, head_dim, n_splits,
                      model->attn_split_o, model->attn_split_ml, out);
 }
 
@@ -2379,12 +2466,12 @@ struct RunState {
   __half *hidden;      // [HIDDEN]
   __half *residual;    // [HIDDEN]
   __half *normed;      // [HIDDEN] — pre-norm output to avoid residual copy
-  __half *scratch_q;   // [max_q_dim = 8192]
-  __half *scratch_kv;  // [max_kv_dim = 2048]
-  __half *scratch_v;   // [max_kv_dim = 2048]
-  __half *scratch_attn;// [max_q_dim = 8192]
-  __half *scratch_ffn1;// [FFN]
-  __half *scratch_ffn2;// [FFN]
+  __half *scratch_q;   // [max_q_dim]
+  __half *scratch_kv;  // [max_kv_dim]
+  __half *scratch_v;   // [max_kv_dim]
+  __half *scratch_attn;// [max_q_dim]
+  __half *scratch_ffn1;// [intermediate_size]
+  __half *scratch_ffn2;// [intermediate_size]
   hipStream_t stream;
   uint32_t pos;        // current position in sequence
 
@@ -2400,6 +2487,14 @@ struct RunState {
 };
 
 static void forward_decode(Model *model, RunState *state, uint32_t token) {
+  const ModelConfig &cfg = model->cfg;
+  const uint32_t HIDDEN = cfg.hidden_size;
+  const uint32_t FFN = cfg.intermediate_size;
+  const uint32_t N_LAYERS = cfg.num_layers;
+  const float EPS = cfg.rms_norm_eps;
+  const uint32_t NORM_THREADS = cfg.norm_threads;
+  const uint32_t half_swa = cfg.head_dim / 2;
+  const uint32_t half_global = cfg.global_head_dim / 2;
   hipStream_t s = state->stream;
   uint32_t pos = state->pos;
 
@@ -2407,11 +2502,11 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
   hipLaunchKernelGGL(kern_embed_lookup, dim3((HIDDEN+255)/256), dim3(256), 0, s,
                      token, HIDDEN, sqrtf((float)HIDDEN), model->embed_q6k_dev, state->hidden);
 
-  hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(128), 0, s,
-                     128, pos, model->rope_freq_base_swa, nullptr,
+  hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(half_swa), 0, s,
+                     half_swa, pos, model->rope_freq_base_swa, nullptr,
                      model->rope_cos_swa_row, model->rope_sin_swa_row);
-  hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(256), 0, s,
-                     256, pos, model->rope_freq_base, model->rope_freqs,
+  hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(half_global), 0, s,
+                     half_global, pos, model->rope_freq_base, model->rope_freqs,
                      model->rope_cos_global_row, model->rope_sin_global_row);
 
   __half *normed = state->normed;
@@ -2445,11 +2540,10 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
                          normed, (const Q4_0Block*)lw.wv, state->scratch_v);
     }
 
-    if (lw.wk) {
-      hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
-                         lw.n_kv_heads, lw.head_dim,
-                         state->scratch_v, EPS);
-    }
+    // V normalization: raw RMSNorm without learned weights (per-head)
+    // At this point scratch_v has either WV output or a copy of WK output
+    hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                       lw.n_kv_heads, lw.head_dim, state->scratch_v, EPS);
 
     // 3. Fused Q/K head norms + RoPE using per-token rows.
     const float *cos_row = lw.is_swa ? model->rope_cos_swa_row : model->rope_cos_global_row;
@@ -2470,7 +2564,7 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
     // 5. Store K/V into cache
     if (lw.wk) {
       uint32_t store_idx = layer_store_index(lw, pos);
-      __half *v_src = lw.has_v ? state->scratch_v : state->scratch_kv;
+      __half *v_src = state->scratch_v;  // Always use scratch_v (already normalized)
       if (lw.kv_quant_q4) {
         hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
                            lw.kv_dim, state->scratch_kv, v_src,
@@ -2500,24 +2594,25 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
     // 6. Attention (split-K for long context)
     uint32_t seq_len = layer_seq_len(lw, pos);
     uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+    float attn_scale = 1.0f;
     if (lw.kv_quant_q4) {
-      dispatch_attention_gqa_q4(s, model, seq_len, lw.kv_capacity, cache_start,
-                                1.0f, state->scratch_q,
+      dispatch_attention_gqa_q4(s, model, lw.head_dim, lw.n_q_heads, seq_len, lw.kv_capacity, cache_start,
+                                attn_scale, state->scratch_q,
                                 lw.kv_k_q4, lw.kv_v_q4,
                                 lw.kv_k_scale, lw.kv_v_scale,
                                 state->scratch_attn);
     } else if (lw.kv_quant_i8) {
       dispatch_attention_i8(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                             seq_len, lw.kv_capacity, cache_start,
-                            1.0f, state->scratch_q,
+                            attn_scale, state->scratch_q,
                             lw.kv_k_i8, lw.kv_v_i8,
                             lw.kv_k_scale, lw.kv_v_scale,
                             state->scratch_attn);
     } else {
       dispatch_attention_fp16(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                              seq_len, lw.kv_capacity, cache_start,
-                              1.0f, state->scratch_q,
-                              lw.kv_k, lw.kv_v, state->scratch_attn);
+                               seq_len, lw.kv_capacity, cache_start,
+                               attn_scale, state->scratch_q,
+                               lw.kv_k, lw.kv_v, state->scratch_attn);
     }
 
     // 7. Output projection
@@ -2525,7 +2620,7 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
                        (int)HIDDEN, (int)lw.q_dim,
                        state->scratch_attn, (const Q4_0Block*)lw.wo, state->residual);
 
-    // 8. FUSED: post-attn-norm + residual add (+ layer scale folded in at end)
+    // 8. FUSED: post-attn-norm + residual add
     hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
                        HIDDEN, state->hidden, state->residual, lw.post_attn_norm, EPS, 1.0f);
 
@@ -2568,6 +2663,12 @@ static void forward_decode(Model *model, RunState *state, uint32_t token) {
 // All linear projections use WMMA GEMM, norms and activations remain per-token.
 static void forward_prefill_batch(Model *model, RunState *state,
                                   const uint32_t *tokens, int n_tokens) {
+  const ModelConfig &cfg = model->cfg;
+  const uint32_t HIDDEN = cfg.hidden_size;
+  const uint32_t FFN = cfg.intermediate_size;
+  const uint32_t N_LAYERS = cfg.num_layers;
+  const float EPS = cfg.rms_norm_eps;
+  const uint32_t NORM_THREADS = cfg.norm_threads;
   hipStream_t s = state->stream;
   int M = n_tokens;  // 1..16
 
@@ -2655,12 +2756,10 @@ static void forward_prefill_batch(Model *model, RunState *state,
       }
     }
 
-    if (lw.wk) {
-      for (int t = 0; t < M; t++) {
-        hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
-                           lw.n_kv_heads, lw.head_dim,
-                           state->batch_v + t * lw.kv_dim, EPS);
-      }
+    // V normalization: raw RMSNorm per-head (all M tokens)
+    for (int t = 0; t < M; t++) {
+      hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                         lw.n_kv_heads, lw.head_dim, state->batch_v + t * lw.kv_dim, EPS);
     }
 
     // 3. Per-token: head norm + RoPE, store KV, attention
@@ -2686,8 +2785,7 @@ static void forward_prefill_batch(Model *model, RunState *state,
       // Store K/V to cache
       if (lw.wk) {
         uint32_t store_idx = layer_store_index(lw, pos);
-        __half *v_src = lw.has_v ? (state->batch_v + t * lw.kv_dim)
-                                 : (state->batch_kv + t * lw.kv_dim);
+        __half *v_src = state->batch_v + t * lw.kv_dim;  // Already normalized
         if (lw.kv_quant_q4) {
           hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
                              lw.kv_dim,
@@ -2718,23 +2816,24 @@ static void forward_prefill_batch(Model *model, RunState *state,
       // Attention (causal: token t sees positions 0..pos+t)
       uint32_t seq_len = layer_seq_len(lw, pos);
       uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+      float attn_scale = 1.0f;
       if (lw.kv_quant_q4) {
-        dispatch_attention_gqa_q4(s, model, seq_len, lw.kv_capacity, cache_start,
-                                  1.0f, state->batch_q + t * lw.q_dim,
+        dispatch_attention_gqa_q4(s, model, lw.head_dim, lw.n_q_heads, seq_len, lw.kv_capacity, cache_start,
+                                  attn_scale, state->batch_q + t * lw.q_dim,
                                   lw.kv_k_q4, lw.kv_v_q4,
                                   lw.kv_k_scale, lw.kv_v_scale,
                                   state->scratch_attn);
       } else if (lw.kv_quant_i8) {
         dispatch_attention_i8(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                               seq_len, lw.kv_capacity, cache_start,
-                              1.0f, state->batch_q + t * lw.q_dim,
+                              attn_scale, state->batch_q + t * lw.q_dim,
                               lw.kv_k_i8, lw.kv_v_i8,
                               lw.kv_k_scale, lw.kv_v_scale,
                               state->scratch_attn);
       } else {
         dispatch_attention_fp16(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                                 seq_len, lw.kv_capacity, cache_start,
-                                1.0f, state->batch_q + t * lw.q_dim,
+                                attn_scale, state->batch_q + t * lw.q_dim,
                                 lw.kv_k, lw.kv_v, state->scratch_attn);
       }
 
@@ -2814,6 +2913,8 @@ static void forward_prefill_batch(Model *model, RunState *state,
 
 // GPU-based lm_head + GPU argmax sampling
 static uint32_t sample_greedy(Model *model, RunState *state) {
+  const ModelConfig &cfg = model->cfg;
+  const uint32_t HIDDEN = cfg.hidden_size;
   hipStream_t s = state->stream;
 
   // lm_head: [1 × HIDDEN] @ [vocab × HIDDEN]^T → [1 × vocab]
@@ -2839,6 +2940,14 @@ static uint32_t sample_greedy(Model *model, RunState *state) {
 }
 
 static int run_chat(Model *model, RunState *state, const Tokenizer &tok, const char *system_prompt) {
+  const ModelConfig &cfg = model->cfg;
+  const uint32_t HIDDEN = cfg.hidden_size;
+  const uint32_t FFN = cfg.intermediate_size;
+  const uint32_t N_LAYERS = cfg.num_layers;
+  const float EPS = cfg.rms_norm_eps;
+  const uint32_t NORM_THREADS = cfg.norm_threads;
+  const uint32_t half_swa = cfg.head_dim / 2;
+  const uint32_t half_global = cfg.global_head_dim / 2;
   std::vector<uint32_t> init_tokens;
   if (tok.add_bos_token) init_tokens.push_back(tok.bos_id);
   if (system_prompt && *system_prompt)
@@ -2873,18 +2982,150 @@ static int run_chat(Model *model, RunState *state, const Tokenizer &tok, const c
     auto t0 = std::chrono::high_resolution_clock::now();
     uint32_t generated = 0;
     bool in_hidden_channel = false;
+    hipStream_t s = state->stream;
+
+    // Pipelined decode: submit lm_head+argmax+next_forward all at once,
+    // then sync to retrieve token while GPU is deep into the next forward pass.
     for (; generated < max_new_tokens; generated++) {
-      uint32_t tok_id = sample_greedy(model, state);
-      forward_decode(model, state, tok_id);
+      // Submit sampling (lm_head + softcap + argmax)
+      hipLaunchKernelGGL(kern_gemv_q6k, dim3(model->vocab_size), dim3(WAVE), 0, s,
+                         (int)model->vocab_size, (int)HIDDEN,
+                         state->hidden, model->embed_q6k_dev, model->logits_dev);
+      if (model->final_logit_softcap > 0.0f)
+        hipLaunchKernelGGL(kern_softcap, dim3((model->vocab_size + 255) / 256), dim3(256), 0, s,
+                           model->vocab_size, model->final_logit_softcap, model->logits_dev);
+      HIP_CHECK(hipMemsetAsync(model->argmax_dev, 0, sizeof(uint32_t), s));
+      hipLaunchKernelGGL(kern_argmax_single, dim3(1), dim3(1024), 0, s,
+                         model->logits_dev, model->vocab_size, model->argmax_dev);
+
+      // Record event after argmax completes
+      hipEvent_t ev_sample;
+      HIP_CHECK(hipEventCreateWithFlags(&ev_sample, hipEventDisableTiming));
+      HIP_CHECK(hipEventRecord(ev_sample, s));
+
+      // Launch next token's forward pass (indirect embed → full transformer)
+      hipLaunchKernelGGL(kern_embed_lookup_indirect, dim3((HIDDEN+255)/256), dim3(256), 0, s,
+                         model->argmax_dev, HIDDEN, sqrtf((float)HIDDEN),
+                         model->embed_q6k_dev, state->hidden);
+
+      uint32_t pos = state->pos;
+      hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(half_swa), 0, s,
+                         half_swa, pos, model->rope_freq_base_swa, nullptr,
+                         model->rope_cos_swa_row, model->rope_sin_swa_row);
+      hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(half_global), 0, s,
+                         half_global, pos, model->rope_freq_base, model->rope_freqs,
+                         model->rope_cos_global_row, model->rope_sin_global_row);
+
+      __half *normed = state->normed;
+      for (uint32_t l = 0; l < N_LAYERS; l++) {
+        LayerWeights &lw = model->layers[l];
+        hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                           HIDDEN, state->hidden, lw.attn_norm, EPS, normed);
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.q_dim), dim3(WAVE), 0, s,
+                           (int)lw.q_dim, (int)HIDDEN,
+                           normed, (const Q4_0Block*)lw.wq, state->scratch_q);
+        if (lw.wk) {
+          hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
+                             (int)lw.kv_dim, (int)HIDDEN,
+                             normed, (const Q4_0Block*)lw.wk, state->scratch_kv);
+          if (!lw.has_v)
+            HIP_CHECK(hipMemcpyAsync(state->scratch_v, state->scratch_kv,
+                                     lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
+        }
+        if (lw.has_v && lw.wv)
+          hipLaunchKernelGGL(kern_gemv_q4_0, dim3(lw.kv_dim), dim3(WAVE), 0, s,
+                             (int)lw.kv_dim, (int)HIDDEN,
+                             normed, (const Q4_0Block*)lw.wv, state->scratch_v);
+        hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                           lw.n_kv_heads, lw.head_dim, state->scratch_v, EPS);
+        const float *cos_row = lw.is_swa ? model->rope_cos_swa_row : model->rope_cos_global_row;
+        const float *sin_row = lw.is_swa ? model->rope_sin_swa_row : model->rope_sin_global_row;
+        hipLaunchKernelGGL(kern_headnorm_rope_row, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
+                           lw.n_q_heads, lw.head_dim,
+                           lw.attn_q_norm, cos_row, sin_row, EPS, state->scratch_q);
+        if (lw.wk)
+          hipLaunchKernelGGL(kern_headnorm_rope_row, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                             lw.n_kv_heads, lw.head_dim,
+                             lw.attn_k_norm, cos_row, sin_row, EPS, state->scratch_kv);
+        if (lw.wk) {
+          uint32_t store_idx = layer_store_index(lw, pos);
+          __half *v_src = state->scratch_v;
+          if (lw.kv_quant_q4) {
+            hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
+                               lw.kv_dim, state->scratch_kv, v_src,
+                               lw.kv_k_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                               lw.kv_v_q4 + (size_t)store_idx * (lw.kv_dim / 2),
+                               lw.kv_k_scale + store_idx, lw.kv_v_scale + store_idx);
+          } else if (lw.kv_quant_i8) {
+            hipLaunchKernelGGL(kern_quantize_kv_fp16_to_i8, dim3(1), dim3(256), 0, s,
+                               lw.kv_dim, state->scratch_kv, v_src,
+                               lw.kv_k_i8 + (size_t)store_idx * lw.kv_dim,
+                               lw.kv_v_i8 + (size_t)store_idx * lw.kv_dim,
+                               lw.kv_k_scale + store_idx, lw.kv_v_scale + store_idx);
+          } else {
+            HIP_CHECK(hipMemcpyAsync(lw.kv_k + (size_t)store_idx * lw.kv_dim,
+                                     state->scratch_kv, lw.kv_dim * sizeof(__half),
+                                     hipMemcpyDeviceToDevice, s));
+            HIP_CHECK(hipMemcpyAsync(lw.kv_v + (size_t)store_idx * lw.kv_dim,
+                                     v_src, lw.kv_dim * sizeof(__half),
+                                     hipMemcpyDeviceToDevice, s));
+          }
+        }
+        uint32_t seq_len = layer_seq_len(lw, pos);
+        uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+        float attn_scale = 1.0f;
+        if (lw.kv_quant_q4) {
+          dispatch_attention_gqa_q4(s, model, lw.head_dim, lw.n_q_heads, seq_len, lw.kv_capacity, cache_start,
+                                    attn_scale, state->scratch_q,
+                                    lw.kv_k_q4, lw.kv_v_q4,
+                                    lw.kv_k_scale, lw.kv_v_scale, state->scratch_attn);
+        } else if (lw.kv_quant_i8) {
+          dispatch_attention_i8(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                                seq_len, lw.kv_capacity, cache_start,
+                                attn_scale, state->scratch_q,
+                                lw.kv_k_i8, lw.kv_v_i8,
+                                lw.kv_k_scale, lw.kv_v_scale, state->scratch_attn);
+        } else {
+          dispatch_attention_fp16(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
+                                  seq_len, lw.kv_capacity, cache_start,
+                                  attn_scale, state->scratch_q,
+                                  lw.kv_k, lw.kv_v, state->scratch_attn);
+        }
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
+                           (int)HIDDEN, (int)lw.q_dim,
+                           state->scratch_attn, (const Q4_0Block*)lw.wo, state->residual);
+        hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
+                           HIDDEN, state->hidden, state->residual, lw.post_attn_norm, EPS, 1.0f);
+        hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                           HIDDEN, state->hidden, lw.ffn_norm, EPS, normed);
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(FFN), dim3(WAVE), 0, s,
+                           (int)FFN, (int)HIDDEN,
+                           normed, (const Q4_0Block*)lw.ffn_gate, state->scratch_ffn1);
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(FFN), dim3(WAVE), 0, s,
+                           (int)FFN, (int)HIDDEN,
+                           normed, (const Q4_0Block*)lw.ffn_up, state->scratch_ffn2);
+        hipLaunchKernelGGL(kern_gelu_mul, dim3((FFN+255)/256), dim3(256), 0, s,
+                           FFN, state->scratch_ffn1, state->scratch_ffn2, state->scratch_ffn1);
+        hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
+                           (int)HIDDEN, (int)FFN,
+                           state->scratch_ffn1, (const Q4_0Block*)lw.ffn_down, state->residual);
+        float scale = lw.out_scale_val;
+        hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
+                           HIDDEN, state->hidden, state->residual, lw.post_ffn_norm, EPS, scale);
+      }
+      hipLaunchKernelGGL(kern_rmsnorm, dim3(1), dim3(NORM_THREADS), 0, s,
+                         HIDDEN, state->hidden, model->output_norm, EPS, state->hidden);
+      state->pos++;
+
+      // Wait only on the sample event (completes before forward pass finishes)
+      HIP_CHECK(hipEventSynchronize(ev_sample));
+      HIP_CHECK(hipEventDestroy(ev_sample));
+      uint32_t tok_id;
+      HIP_CHECK(hipMemcpy(&tok_id, model->argmax_dev, sizeof(uint32_t), hipMemcpyDeviceToHost));
+
       if (tok_id == tok.eos_id || tok_id == tok.turn_close_id) break;
-      if (tok_id == tok.channel_open_id) {
-        in_hidden_channel = true;
-        continue;
-      }
-      if (tok_id == tok.channel_close_id) {
-        in_hidden_channel = false;
-        continue;
-      }
+      if (tok_id == tok.channel_open_id) { in_hidden_channel = true; continue; }
+      if (tok_id == tok.channel_close_id) { in_hidden_channel = false; continue; }
       if (in_hidden_channel) continue;
       if (tok_id < tok.id_to_piece.size()) {
         std::string piece = decode_piece_for_display(tok.id_to_piece[tok_id]);
@@ -2913,15 +3154,34 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Usage: run_gguf <model.gguf> [config.json] [--chat] [--system TEXT] [prompt]
+  // If config.json is not provided, try <model_path_stem>.json
   const char *model_path = argv[1];
+  const char *cfg_path = nullptr;
+  int cfg_idx = -1;  // index of config path arg
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--chat") == 0) continue;
+    if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) { i++; continue; }
+    if (strcmp(argv[i], "--cfg") == 0 && i + 1 < argc) { cfg_path = argv[++i]; cfg_idx = i; continue; }
+    if (cfg_idx < 0 && argv[i][0] != '-') {
+      // Could be a prompt or config file. Only treat as config if it ends in .json
+      const char *dot = strrchr(argv[i], '.');
+      if (dot && strcmp(dot, ".json") == 0) { cfg_path = argv[i]; cfg_idx = i; }
+    }
+  }
+  
+  // Reparse remaining args (skip cfg_path)
   bool chat_mode = false;
   const char *prompt = nullptr;
   const char *system_prompt = getenv("THEROCK_SYSTEM_PROMPT");
   for (int i = 2; i < argc; i++) {
+    if (i == cfg_idx) continue;
     if (strcmp(argv[i], "--chat") == 0) {
       chat_mode = true;
     } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
       system_prompt = argv[++i];
+    } else if (strcmp(argv[i], "--cfg") == 0 && i + 1 < argc) {
+      i++;
     } else if (!prompt) {
       prompt = argv[i];
     }
@@ -2943,27 +3203,70 @@ int main(int argc, char **argv) {
   Tokenizer tokenizer;
   if (!load_tokenizer(gguf, &tokenizer)) return 1;
 
+  // Auto-detect config path from model name if not specified
+  if (!cfg_path) {
+    // Try a few patterns: same name as gguf but .json, or model_cfg.json, etc.
+    static char auto_cfg[4096];
+    // Try <model_basename>.json (same directory)
+    const char *slash = strrchr(model_path, '/');
+    const char *basename = slash ? slash + 1 : model_path;
+    const char *dot = strrchr(basename, '.');
+    if (dot) {
+      size_t base_len = dot - model_path;
+      if (base_len < sizeof(auto_cfg) - 5) {
+        memcpy(auto_cfg, model_path, base_len);
+        strcpy(auto_cfg + base_len, ".json");
+        cfg_path = auto_cfg;
+      }
+    }
+  }
+
+  // Load config from JSON
+  ModelConfig cfg = {};
+  if (cfg_path && cfg_load_from_json(cfg_path, &cfg)) {
+    printf("Config loaded from: %s\n", cfg_path);
+    printf("  hidden_size=%u intermediate_size=%u num_layers=%u\n",
+           cfg.hidden_size, cfg.intermediate_size, cfg.num_layers);
+  } else {
+    fprintf(stderr, "ERROR: Could not load model config.\n");
+    fprintf(stderr, "Usage: %s <model.gguf> [config.json] [--chat] [--cfg config.json] [prompt]\n", argv[0]);
+    gguf_close(gguf);
+    return 1;
+  }
+
   // Load model to GPU
   Model model = {};
+  model.cfg = cfg;
   if (!load_model(gguf, &model)) return 1;
+
+  const uint32_t HIDDEN = cfg.hidden_size;
+  const uint32_t FFN = cfg.intermediate_size;
+  const uint32_t N_LAYERS = cfg.num_layers;
+  const float EPS = cfg.rms_norm_eps;
+  const uint32_t NORM_THREADS = cfg.norm_threads;
+  const uint32_t half_swa = cfg.head_dim / 2;
+  const uint32_t half_global = cfg.global_head_dim / 2;
+
+  const uint32_t max_q_dim = cfg.max_q_dim();
+  const uint32_t max_kv_dim = cfg.max_kv_dim();
 
   // Allocate run state
   RunState state = {};
   HIP_CHECK(hipMalloc(&state.hidden, HIDDEN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.residual, HIDDEN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.normed, HIDDEN * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.scratch_q, 8192 * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.scratch_kv, 2048 * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.scratch_v, 2048 * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.scratch_attn, 8192 * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.scratch_q, max_q_dim * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.scratch_kv, max_kv_dim * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.scratch_v, max_kv_dim * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.scratch_attn, max_q_dim * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.scratch_ffn1, FFN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.scratch_ffn2, FFN * sizeof(__half)));
   // Batch prefill buffers (16 tokens max)
   HIP_CHECK(hipMalloc(&state.batch_x, 16 * HIDDEN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.batch_normed, 16 * HIDDEN * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.batch_q, 16 * 8192 * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.batch_kv, 16 * 2048 * sizeof(__half)));
-  HIP_CHECK(hipMalloc(&state.batch_v, 16 * 2048 * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_q, 16 * max_q_dim * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_kv, 16 * max_kv_dim * sizeof(__half)));
+  HIP_CHECK(hipMalloc(&state.batch_v, 16 * max_kv_dim * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.batch_ffn1, 16 * FFN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.batch_ffn2, 16 * FFN * sizeof(__half)));
   HIP_CHECK(hipMalloc(&state.batch_out, 16 * HIDDEN * sizeof(__half)));
@@ -3061,11 +3364,11 @@ int main(int argc, char **argv) {
     __half *normed = state.normed;
     uint32_t pos = state.pos;
 
-    hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(128), 0, s,
-                       128, pos, model.rope_freq_base_swa, nullptr,
+    hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(half_swa), 0, s,
+                       half_swa, pos, model.rope_freq_base_swa, nullptr,
                        model.rope_cos_swa_row, model.rope_sin_swa_row);
-    hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(256), 0, s,
-                       256, pos, model.rope_freq_base, model.rope_freqs,
+    hipLaunchKernelGGL(kern_fill_rope_row, dim3(1), dim3(half_global), 0, s,
+                       half_global, pos, model.rope_freq_base, model.rope_freqs,
                        model.rope_cos_global_row, model.rope_sin_global_row);
 
     for (uint32_t l = 0; l < N_LAYERS; l++) {
@@ -3093,11 +3396,10 @@ int main(int argc, char **argv) {
                            (int)lw.kv_dim, (int)HIDDEN,
                            normed, (const Q4_0Block*)lw.wv, state.scratch_v);
       }
-      if (lw.wk) {
-        hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
-                           lw.n_kv_heads, lw.head_dim,
-                           state.scratch_v, EPS);
-      }
+
+      // V normalization: raw RMSNorm per-head
+      hipLaunchKernelGGL(kern_rmsnorm_head_noscale, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
+                         lw.n_kv_heads, lw.head_dim, state.scratch_v, EPS);
 
       const float *cos_row = lw.is_swa ? model.rope_cos_swa_row : model.rope_cos_global_row;
       const float *sin_row = lw.is_swa ? model.rope_sin_swa_row : model.rope_sin_global_row;
@@ -3113,7 +3415,7 @@ int main(int argc, char **argv) {
 
       if (lw.wk) {
         uint32_t store_idx = layer_store_index(lw, pos);
-        __half *v_src = lw.has_v ? state.scratch_v : state.scratch_kv;
+        __half *v_src = state.scratch_v;  // Already normalized
         if (lw.kv_quant_q4) {
           hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
                              lw.kv_dim, state.scratch_kv, v_src,
@@ -3140,23 +3442,24 @@ int main(int argc, char **argv) {
 
       uint32_t seq_len = layer_seq_len(lw, pos);
       uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
+      float attn_scale = 1.0f;
       if (lw.kv_quant_q4) {
-        dispatch_attention_gqa_q4(s, &model, seq_len, lw.kv_capacity, cache_start,
-                                  1.0f, state.scratch_q,
+        dispatch_attention_gqa_q4(s, &model, lw.head_dim, lw.n_q_heads, seq_len, lw.kv_capacity, cache_start,
+                                  attn_scale, state.scratch_q,
                                   lw.kv_k_q4, lw.kv_v_q4,
                                   lw.kv_k_scale, lw.kv_v_scale,
                                   state.scratch_attn);
       } else if (lw.kv_quant_i8) {
         dispatch_attention_i8(s, &model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                               seq_len, lw.kv_capacity, cache_start,
-                              1.0f, state.scratch_q,
+                              attn_scale, state.scratch_q,
                               lw.kv_k_i8, lw.kv_v_i8,
                               lw.kv_k_scale, lw.kv_v_scale,
                               state.scratch_attn);
       } else {
         dispatch_attention_fp16(s, &model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                                 seq_len, lw.kv_capacity, cache_start,
-                                1.0f, state.scratch_q,
+                                attn_scale, state.scratch_q,
                                 lw.kv_k, lw.kv_v, state.scratch_attn);
       }
 
