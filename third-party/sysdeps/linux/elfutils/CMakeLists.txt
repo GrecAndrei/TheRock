@@ -100,6 +100,7 @@ add_custom_target(
       # Escaping: Double $ to satisfy CMake, then double $ to satisfy configure,
       # then escaped single quotes to make it to the linker command line.
       "LDFLAGS=${CMAKE_SHARED_LINKER_FLAGS} -Wl,-rpath=\\'\\$$\\$$ORIGIN\\'"
+      "CFLAGS=-Wno-discarded-qualifiers"
       "CPPFLAGS=${EXTRA_CPPFLAGS}"
       --
     "${CMAKE_CURRENT_BINARY_DIR}/s/configure"

@@ -505,6 +505,7 @@ add_subdirectory(comm-libs)
 add_subdirectory(math-libs)
 add_subdirectory(ml-libs)
 add_subdirectory(media-libs)
+add_subdirectory(inference)
 
 if(THEROCK_BUILD_TESTING)
   add_subdirectory(examples)
