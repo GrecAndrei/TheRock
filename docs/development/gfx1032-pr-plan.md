@@ -30,46 +30,46 @@ TheRock is a monorepo that vendors sources via git submodules:
 
 ## Commits in `rocm-libraries` submodule (→ PR to ROCm/rocm-libraries)
 
-Branch: `gfx103-wmma-experiments`
+### PR branches (pushed to `GrecAndrei/rocm-libraries` fork):
 
-| # | Commit | Files | Lines | Priority | Standalone? |
-|---|--------|-------|-------|----------|-------------|
-| 1 | `e9ec5ad` stinkytofu: add missing `#include <cstdint>` | 10 | +10 | High | ✅ Yes |
-| 2 | `4fee212` tensilelite: add gfx1031/1032/1034/1035 to `AMDGPU::Processor` enum | 2 | +32 | **Critical** | ✅ Yes |
-| 3 | `36b6491` hipblaslt: register gfx1032 in supported architectures | 2 | +6 | High | Depends on #2 |
-| 4 | `613f346` hipblaslt: fall back to system cblas when BLIS unavailable | 1 | +10 | Medium | ✅ Yes |
-| 5 | `5b1a9a9` hipblaslt: add QuickTuning infrastructure | 10 | +953/-42 | Medium | Experimental |
-| 6 | `4b45bf6` hipblaslt: add generated gfx1032 Tensile logic YAML | 46 | +301k | Low | Mechanical |
+| PR | Branch | Upstream URL | Risk |
+|----|--------|-------------|------|
+| **PR-A** | `pr-a/fix-amdgpu-processor-enum` | `ROCm/rocm-libraries:develop` ← `GrecAndrei/rocm-libraries:pr-a/fix-amdgpu-processor-enum` | 🟢 Safe |
+| **PR-B** | `pr-b/register-gfx1032-arch` | `ROCm/rocm-libraries:develop` ← `GrecAndrei/rocm-libraries:pr-b/register-gfx1032-arch` | 🟢 Safe |
+| **PR-C** | `pr-c/cblas-fallback` | `ROCm/rocm-libraries:develop` ← `GrecAndrei/rocm-libraries:pr-c/cblas-fallback` | 🟡 Fixed |
+| PR-D | `gfx103-wmma-experiments` | (stays in fork — experimental) | 🔴 High |
 
-### Suggested PR split for rocm-libraries
-
-**PR-A (Critical bugfix — highest priority, smallest, most reviewable):**
-> Commits #1 + #2 — stinkytofu `#include <cstdint>` + AMDGPU::Processor enum fix.
+### PR-A: Critical bugfix (2 commits, +42 lines)
+> stinkytofu `#include <cstdint>` + AMDGPU::Processor enum fix (gfx1031/1032/1034/1035).
 >
-> This is the one-line-root-cause fix that unblocks **all** RDNA2 consumer GPUs
-> (gfx1031 RX 6700 XT, gfx1032 RX 6600/6650 XT, gfx1034, gfx1035). Without it,
-> `TensileLibrary_lazy_gfx103*.dat` silently fails to load with
+> This is the root-cause fix that unblocks **all** RDNA2 consumer GPUs.
+> Without it, `TensileLibrary_lazy_gfx103*.dat` silently fails to load with
 > `Enum not found! gfx1032`.
 >
-> Target: `ROCm/rocm-libraries` → `projects/hipblaslt/tensilelite/`
+> **Status: Ready to submit.** Clean, small, follows existing patterns.
 
-**PR-B (Architecture registration):**
-> Commit #3 — adds gfx1032 to the Python + CMake arch lists so Tensile generates
-> kernels for it. Logically depends on PR-A but is a separate concern.
+### PR-B: Architecture registration (1 commit, +6 lines, depends on PR-A)
+> Adds gfx1032 to Python `Architectures.py` + CMake `tensilelite_supported_architectures.cmake`.
 >
-> Target: `ROCm/rocm-libraries` → `projects/hipblaslt/`
+> **Status: Ready to submit** (mark as depending on PR-A).
 
-**PR-C (Bench client build fix):**
-> Commit #4 — lets the bench client link against system libcblas when BLIS/AOCL
-> is not installed. Useful for distros that ship reference BLAS but not AOCL.
+### PR-C: cblas fallback (1 commit, +24 lines, independent)
+> Opt-in fallback (`-DHIPBLASLT_ENABLE_CBLAS_FALLBACK=ON`) for bench client
+> when BLIS is unavailable. Uses pkg-config first, then find_library.
+> No hardcoded paths. Emits WARNING if flag set but cblas not found.
 >
-> Target: `ROCm/rocm-libraries` → `projects/hipblaslt/clients/`
+> **Status: Ready to submit.** Fixed from original — now opt-in, no hardcoded paths.
 
-**PR-D (QuickTuning + generated Tensile logic — experimental):**
-> Commits #5 + #6 — the QuickTuning runtime feature and the generated gfx1032
-> Tensile YAML logic files. This is the larger, experimental work.
+### PR-D: QuickTuning + generated Tensile logic (experimental, stays in fork)
+> QuickTuning runtime + generated gfx1032 Tensile YAML (301k lines).
+> Now gated behind `HIPBLASLT_ENABLE_QUICKTUNING=OFF` by default —
+> zero overhead when disabled, no code in the hot path.
 >
-> Target: `ROCm/rocm-libraries` → `projects/hipblaslt/library/`
+> **Status: NOT ready for upstream.** Still needs:
+> - Run the GSU/WGM sweep to populate `tuning_gfx1032.json` with real data
+> - Move `test_quicktuning.cpp`/`bench_gsuwgm.cpp` to `clients/`
+> - Consider using existing UserDrivenTuning mechanism instead of parallel system
+> - Add generation provenance for the 301k YAML lines
 
 ---
 
