@@ -1218,6 +1218,182 @@ kern_attn_split_gqa_q4(uint32_t head_dim,
   }
 }
 
+__global__ void __launch_bounds__(32)
+kern_attn_batched_i8(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                     uint32_t seq_len_base, uint32_t cache_capacity, uint32_t cache_start,
+                     float scale,
+                     const __half * __restrict__ q_batch,
+                     const int8_t * __restrict__ k_cache,
+                     const int8_t * __restrict__ v_cache,
+                     const float  * __restrict__ k_scale,
+                     const float  * __restrict__ v_scale,
+                     __half       * __restrict__ out_batch,
+                     uint32_t q_dim, uint32_t batch_size, uint32_t state_pos, bool is_swa) {
+  int qh = blockIdx.x;
+  if (qh >= (int)n_q_heads) return;
+  int kvh = qh / (n_q_heads / n_kv_heads);
+  int tid = threadIdx.x;
+
+  uint32_t ept = head_dim / 32;
+
+  float q_reg[16][16];
+  for (int t = 0; t < batch_size; t++) {
+    for (uint32_t i = 0; i < ept; i++) {
+      q_reg[t][i] = __half2float(q_batch[t * q_dim + qh * head_dim + tid * ept + i]);
+    }
+  }
+
+  float m[16], l[16], o[16][16];
+  for (int t = 0; t < batch_size; t++) {
+    m[t] = -1e9f; l[t] = 0.0f;
+    for (uint32_t i = 0; i < ept; i++) o[t][i] = 0.0f;
+  }
+
+  uint32_t max_seq = seq_len_base + batch_size;
+  uint32_t end_pos = state_pos + batch_size - 1;
+
+  for (uint32_t step = 0; step < max_seq; step++) {
+    uint32_t phys_t = cache_capacity > 0 ? ((cache_start + step) % cache_capacity) : (cache_start + step);
+    uint32_t P;
+    if (cache_capacity == 0) {
+      P = state_pos + 1 - seq_len_base + step;
+    } else {
+      P = end_pos - ((end_pos + cache_capacity - phys_t) % cache_capacity);
+    }
+
+    const int8_t *kt = k_cache + (size_t)phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    const int8_t *vt = v_cache + (size_t)phys_t * n_kv_heads * head_dim + kvh * head_dim;
+    float ks = k_scale[phys_t];
+    float vs = v_scale[phys_t];
+
+    float kt_reg[16], vt_reg[16];
+    for (uint32_t i = 0; i < ept; i++) {
+      kt_reg[i] = (float)kt[tid * ept + i] * ks;
+      vt_reg[i] = (float)vt[tid * ept + i] * vs;
+    }
+
+    for (int t = 0; t < batch_size; t++) {
+      if (P > state_pos + t) continue;
+      if (is_swa && (state_pos + t >= cache_capacity) && (P <= state_pos + t - cache_capacity)) continue;
+
+      float dot = 0.0f;
+      for (uint32_t i = 0; i < ept; i++) dot += q_reg[t][i] * kt_reg[i];
+
+      dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+      dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+#ifdef __HIP_PLATFORM_AMD__
+      dot += __shfl_xor(dot, 32);
+#endif
+
+      float s_val = dot * scale;
+      float m_new = fmaxf(m[t], s_val);
+      float exp_shift = expf(m[t] - m_new);
+      float exp_s = expf(s_val - m_new);
+      l[t] = exp_shift * l[t] + exp_s;
+
+      for (uint32_t i = 0; i < ept; i++)
+        o[t][i] = exp_shift * o[t][i] + exp_s * vt_reg[i];
+      m[t] = m_new;
+    }
+  }
+
+  for (int t = 0; t < batch_size; t++) {
+    float l_inv = (l[t] > 0.0f) ? (1.0f / l[t]) : 0.0f;
+    for (uint32_t i = 0; i < ept; i++) {
+      out_batch[t * q_dim + qh * head_dim + tid * ept + i] = __float2half(o[t][i] * l_inv);
+    }
+  }
+}
+
+__global__ void __launch_bounds__(1024)
+kern_attn_batched_gqa_q4(uint32_t head_dim,
+                       uint32_t n_q_heads,
+                       uint32_t seq_len_base,
+                       uint32_t cache_capacity,
+                       uint32_t cache_start,
+                       float scale,
+                       const __half * __restrict__ q_batch,
+                       const uint8_t * __restrict__ k_cache,
+                       const uint8_t * __restrict__ v_cache,
+                       const float   * __restrict__ k_scale,
+                       const float   * __restrict__ v_scale,
+                       __half        * __restrict__ out_batch,
+                       uint32_t q_dim, uint32_t batch_size, uint32_t state_pos, bool is_swa) {
+  int tid = threadIdx.x;
+  int qh = tid / 32;
+  int lane = tid & 31;
+  if (qh >= (int)n_q_heads) return;
+
+  uint32_t ept = head_dim / 32;
+
+  float q_reg[16][16];
+  for (int t = 0; t < batch_size; t++) {
+    for (uint32_t i = 0; i < ept; i++) {
+      q_reg[t][i] = __half2float(q_batch[t * q_dim + qh * head_dim + lane * ept + i]);
+    }
+  }
+
+  float m[16], l[16], o[16][16];
+  for (int t = 0; t < batch_size; t++) {
+    m[t] = -1e9f; l[t] = 0.0f;
+    for (uint32_t i = 0; i < ept; i++) o[t][i] = 0.0f;
+  }
+
+  uint32_t max_seq = seq_len_base + batch_size;
+  uint32_t end_pos = state_pos + batch_size - 1;
+
+  for (uint32_t step = 0; step < max_seq; step++) {
+    uint32_t phys_t = cache_capacity > 0 ? ((cache_start + step) % cache_capacity) : (cache_start + step);
+    uint32_t P;
+    if (cache_capacity == 0) {
+      P = state_pos + 1 - seq_len_base + step;
+    } else {
+      P = end_pos - ((end_pos + cache_capacity - phys_t) % cache_capacity);
+    }
+
+    const uint8_t *kt = k_cache + (size_t)phys_t * (head_dim / 2);
+    const uint8_t *vt = v_cache + (size_t)phys_t * (head_dim / 2);
+    float ks = k_scale[phys_t];
+    float vs = v_scale[phys_t];
+
+    for (int t = 0; t < batch_size; t++) {
+      if (P > state_pos + t) continue;
+      if (is_swa && (state_pos + t >= cache_capacity) && (P <= state_pos + t - cache_capacity)) continue;
+
+      float dot = 0.0f;
+      for (uint32_t i = 0; i < ept; i++) {
+        uint32_t idx = lane * ept + i;
+        dot += q_reg[t][i] * ((float)unpack_q4_signed(kt, idx) * ks);
+      }
+
+      dot += __shfl_xor(dot, 16); dot += __shfl_xor(dot, 8);
+      dot += __shfl_xor(dot, 4);  dot += __shfl_xor(dot, 2); dot += __shfl_xor(dot, 1);
+#ifdef __HIP_PLATFORM_AMD__
+      dot += __shfl_xor(dot, 32);
+#endif
+
+      float s_val = dot * scale;
+      float m_new = fmaxf(m[t], s_val);
+      float exp_shift = expf(m[t] - m_new);
+      float exp_s = expf(s_val - m_new);
+      l[t] = exp_shift * l[t] + exp_s;
+
+      for (uint32_t i = 0; i < ept; i++) {
+        uint32_t idx = lane * ept + i;
+        o[t][i] = exp_shift * o[t][i] + exp_s * ((float)unpack_q4_signed(vt, idx) * vs);
+      }
+      m[t] = m_new;
+    }
+  }
+
+  for (int t = 0; t < batch_size; t++) {
+    float l_inv = (l[t] > 0.0f) ? (1.0f / l[t]) : 0.0f;
+    for (uint32_t i = 0; i < ept; i++) {
+      out_batch[t * q_dim + qh * head_dim + lane * ept + i] = __float2half(o[t][i] * l_inv);
+    }
+  }
+}
+
 // Q6_K GEMV for lm_head: y[n] = sum_k dequant(W[n,k]) * x[k]
 // All 32 threads collaborate on EACH Q6_K block (256 elem / 32 = 8 elem/thread).
 // Sequential over blocks, parallel within block.
@@ -2762,48 +2938,37 @@ static void forward_prefill_batch(Model *model, RunState *state,
                          lw.n_kv_heads, lw.head_dim, state->batch_v + t * lw.kv_dim, EPS);
     }
 
-    // 3. Per-token: head norm + RoPE, store KV, attention
+    // 3. Per-token: head norm + RoPE, store KV
     for (int t = 0; t < M; t++) {
       uint32_t pos = state->pos + t;
       const float *freq_factors = lw.is_swa ? nullptr : model->rope_freqs;
       float freq_base = lw.is_swa ? model->rope_freq_base_swa : model->rope_freq_base;
 
-      // Q head norm + RoPE
       hipLaunchKernelGGL(kern_headnorm_rope_dynamic, dim3(lw.n_q_heads), dim3(WAVE), 0, s,
                          lw.n_q_heads, lw.head_dim, pos,
                          freq_base, freq_factors, lw.attn_q_norm, EPS,
                          state->batch_q + t * lw.q_dim);
 
-      // K head norm + RoPE
       if (lw.wk) {
         hipLaunchKernelGGL(kern_headnorm_rope_dynamic, dim3(lw.n_kv_heads), dim3(WAVE), 0, s,
                            lw.n_kv_heads, lw.head_dim, pos,
                            freq_base, freq_factors, lw.attn_k_norm, EPS,
                            state->batch_kv + t * lw.kv_dim);
-      }
 
-      // Store K/V to cache
-      if (lw.wk) {
         uint32_t store_idx = layer_store_index(lw, pos);
-        __half *v_src = state->batch_v + t * lw.kv_dim;  // Already normalized
+        __half *v_src = state->batch_v + t * lw.kv_dim;
         if (lw.kv_quant_q4) {
           hipLaunchKernelGGL(kern_quantize_kv_fp16_to_q4, dim3(1), dim3(256), 0, s,
-                             lw.kv_dim,
-                             state->batch_kv + t * lw.kv_dim,
-                             v_src,
+                             lw.kv_dim, state->batch_kv + t * lw.kv_dim, v_src,
                              lw.kv_k_q4 + (size_t)store_idx * (lw.kv_dim / 2),
                              lw.kv_v_q4 + (size_t)store_idx * (lw.kv_dim / 2),
-                             lw.kv_k_scale + store_idx,
-                             lw.kv_v_scale + store_idx);
+                             lw.kv_k_scale + store_idx, lw.kv_v_scale + store_idx);
         } else if (lw.kv_quant_i8) {
           hipLaunchKernelGGL(kern_quantize_kv_fp16_to_i8, dim3(1), dim3(256), 0, s,
-                             lw.kv_dim,
-                             state->batch_kv + t * lw.kv_dim,
-                             v_src,
+                             lw.kv_dim, state->batch_kv + t * lw.kv_dim, v_src,
                              lw.kv_k_i8 + (size_t)store_idx * lw.kv_dim,
                              lw.kv_v_i8 + (size_t)store_idx * lw.kv_dim,
-                             lw.kv_k_scale + store_idx,
-                             lw.kv_v_scale + store_idx);
+                             lw.kv_k_scale + store_idx, lw.kv_v_scale + store_idx);
         } else {
           HIP_CHECK(hipMemcpyAsync(lw.kv_k + (size_t)store_idx * lw.kv_dim,
                                    state->batch_kv + t * lw.kv_dim,
@@ -2812,38 +2977,46 @@ static void forward_prefill_batch(Model *model, RunState *state,
                                    v_src, lw.kv_dim * sizeof(__half), hipMemcpyDeviceToDevice, s));
         }
       }
+    }
 
-      // Attention (causal: token t sees positions 0..pos+t)
-      uint32_t seq_len = layer_seq_len(lw, pos);
-      uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
-      float attn_scale = 1.0f;
-      if (lw.kv_quant_q4) {
-        dispatch_attention_gqa_q4(s, model, lw.head_dim, lw.n_q_heads, seq_len, lw.kv_capacity, cache_start,
-                                  attn_scale, state->batch_q + t * lw.q_dim,
-                                  lw.kv_k_q4, lw.kv_v_q4,
-                                  lw.kv_k_scale, lw.kv_v_scale,
-                                  state->scratch_attn);
-      } else if (lw.kv_quant_i8) {
-        dispatch_attention_i8(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
-                              seq_len, lw.kv_capacity, cache_start,
-                              attn_scale, state->batch_q + t * lw.q_dim,
-                              lw.kv_k_i8, lw.kv_v_i8,
-                              lw.kv_k_scale, lw.kv_v_scale,
-                              state->scratch_attn);
-      } else {
+    // 4. Batched Attention
+    uint32_t seq_len_base = layer_seq_len(lw, state->pos);
+    uint32_t cache_start_base = layer_cache_start(lw, state->pos, seq_len_base);
+    float attn_scale = 1.0f;
+
+    __half *attn_out = state->batch_normed;
+
+    if (lw.kv_quant_q4) {
+      int blocks = (lw.n_q_heads * 32 + 1023) / 1024;
+      hipLaunchKernelGGL(kern_attn_batched_gqa_q4, dim3(blocks), dim3(1024), 0, s,
+                         lw.head_dim, lw.n_q_heads, seq_len_base, lw.kv_capacity, cache_start_base,
+                         attn_scale, state->batch_q, lw.kv_k_q4, lw.kv_v_q4, lw.kv_k_scale, lw.kv_v_scale,
+                         attn_out, lw.q_dim, M, state->pos, lw.is_swa);
+    } else if (lw.kv_quant_i8) {
+      hipLaunchKernelGGL(kern_attn_batched_i8, dim3(lw.n_q_heads), dim3(32), 0, s,
+                         lw.n_q_heads, lw.n_kv_heads, lw.head_dim, seq_len_base, lw.kv_capacity, cache_start_base,
+                         attn_scale, state->batch_q, lw.kv_k_i8, lw.kv_v_i8, lw.kv_k_scale, lw.kv_v_scale,
+                         attn_out, lw.q_dim, M, state->pos, lw.is_swa);
+    } else {
+      // Fallback
+      for (int t = 0; t < M; t++) {
+        uint32_t pos = state->pos + t;
+        uint32_t seq_len = layer_seq_len(lw, pos);
+        uint32_t cache_start = layer_cache_start(lw, pos, seq_len);
         dispatch_attention_fp16(s, model, lw.n_q_heads, lw.n_kv_heads, lw.head_dim,
                                 seq_len, lw.kv_capacity, cache_start,
                                 attn_scale, state->batch_q + t * lw.q_dim,
-                                lw.kv_k, lw.kv_v, state->scratch_attn);
+                                lw.kv_k, lw.kv_v, attn_out + t * lw.q_dim);
       }
+    }
 
-      // Output projection for this token: [1 × q_dim] × [HIDDEN × q_dim]^T → [1 × HIDDEN]
+    // 5. Output projection per-token
+    for (int t = 0; t < M; t++) {
       hipLaunchKernelGGL(kern_gemv_q4_0, dim3(HIDDEN), dim3(WAVE), 0, s,
                          (int)HIDDEN, (int)lw.q_dim,
-                         state->scratch_attn, (const Q4_0Block*)lw.wo,
+                         attn_out + t * lw.q_dim, (const Q4_0Block*)lw.wo,
                          state->batch_out + t * HIDDEN);
 
-      // Fused post-attn-norm + residual add
       hipLaunchKernelGGL(kern_fused_postnorm_residadd, dim3(1), dim3(NORM_THREADS), 0, s,
                          HIDDEN, state->batch_x + t * HIDDEN,
                          state->batch_out + t * HIDDEN, lw.post_attn_norm, EPS, 1.0f);
@@ -3182,6 +3355,16 @@ int main(int argc, char **argv) {
       system_prompt = argv[++i];
     } else if (strcmp(argv[i], "--cfg") == 0 && i + 1 < argc) {
       i++;
+    } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
+      std::string prompt_file = argv[++i];
+      FILE *f = fopen(prompt_file.c_str(), "r");
+      if (f) {
+        fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
+        char *string = (char *)malloc(fsize + 1);
+        size_t ret = fread(string, fsize, 1, f); (void)ret; fclose(f); string[fsize] = 0;
+        static std::string prompt_str; prompt_str = string; free(string);
+        prompt = prompt_str.c_str();
+      }
     } else if (!prompt) {
       prompt = argv[i];
     }

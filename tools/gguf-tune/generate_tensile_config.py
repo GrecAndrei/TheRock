@@ -33,6 +33,36 @@ DTYPE_TO_TENSILE = {
 DEFAULT_DTYPE = {"DataType": "h", "ComputeDataType": "s"}
 
 
+# WMMA MatrixInstruction parameters for RDNA2 (gfx103x).
+# Format: [MIA, NIB, K, B, NumThreads, MIBlockM, MIBlockN, MIToMFMA_M, MIToMFMA_N]
+# RDNA2 has WMMA 16x16x16 but no MFMA. We enumerate tile size combinations.
+_WMMA_RDNA2_INSTRUCTIONS = [
+    # [16,16,16,1,1, MIBlockM, MIWavefrontM, MIWavefrontN, 1]
+    *[[16, 16, 16, 1, 1, mb, wm, wn, 1]
+      for mb in [1]
+      for wm in [1, 2, 4, 8]
+      for wn in [1, 2, 4]],
+]
+
+# Tile parameters to sweep — wave32 (gfx1032 default)
+_RDNA2_FORK_PARAMS = [
+    ("MatrixInstruction", _WMMA_RDNA2_INSTRUCTIONS),
+    ("DepthU",            [16, 32, 64, 128]),
+    ("GlobalSplitU",      [1, 2, 4, 8]),
+    ("GlobalSplitUAlgorithm", ["MultipleBuffer"]),
+    ("PrefetchGlobalRead", [1, 2]),
+    ("PrefetchLocalRead",  [1]),
+    ("WorkGroupMapping",   [1, 4]),
+    ("StaggerU",          [0, 4]),
+    ("StaggerUStride",    [256]),
+    ("VectorWidthA",      [-1]),
+    ("VectorWidthB",      [-1]),
+    ("GlobalReadVectorWidthA", [-1]),
+    ("GlobalReadVectorWidthB", [-1]),
+    ("StoreVectorWidth",  [-1]),
+]
+
+
 def group_shapes_by_dtype(shapes: list) -> dict:
     """Group shapes by their Tensile data type config."""
     groups = {}
@@ -43,6 +73,10 @@ def group_shapes_by_dtype(shapes: list) -> dict:
             groups[key] = {"tensile": tensile_dtype, "shapes": []}
         groups[key]["shapes"].append(shape)
     return groups
+
+
+def _is_rdna2(gfx_target: str) -> bool:
+    return gfx_target.startswith("gfx103")
 
 
 def generate_yaml(result: dict, gfx_target: str, output_path: Path) -> None:
@@ -58,11 +92,16 @@ def generate_yaml(result: dict, gfx_target: str, output_path: Path) -> None:
     lines.append("GlobalParameters:")
     lines.append("  PrintLevel: 1")
     lines.append("  ForceRedoBenchmarkProblems: True")
-    lines.append("  ForceRedoLibraryLogic: True")
-    lines.append("  ForceRedoLibraryClient: True")
+    lines.append("  PrintSolutionRejectionReason: False")
+    lines.append("  NewClient: 2")
+    lines.append("  KernelTime: True")
+    lines.append("  NumWarmups: 10")
+    lines.append("  EnqueuesPerSync: 10")
+    lines.append("  NumElementsToValidate: 0")
+    lines.append("  SkipSlowSolutionRatio: 0.5")
     lines.append(f"  Platform: 0")
     lines.append(f"  Device: 0")
-    lines.append(f"  LibraryFormat: msgpack")
+    lines.append(f"  LibraryFormat: yaml")
     lines.append("")
     lines.append("BenchmarkProblems:")
 
@@ -78,9 +117,29 @@ def generate_yaml(result: dict, gfx_target: str, output_path: Path) -> None:
         lines.append(f"      TransposeB: T")
         lines.append(f"      UseBeta: True")
         lines.append(f"      HighPrecisionAccumulate: True")
+        lines.append(f"      Batched: True")
         lines.append(f"    - BenchmarkForks: 0")
         lines.append(f"      InitialSolutionParameters:")
         lines.append(f"      BenchmarkCommonParameters:")
+        lines.append(f"        - KernelLanguage: [Assembly]")
+
+        fork_params = _RDNA2_FORK_PARAMS if _is_rdna2(gfx_target) else []
+        if fork_params:
+            lines.append(f"      ForkParameters:")
+            for param_name, values in fork_params:
+                if isinstance(values[0], list):
+                    lines.append(f"        - {param_name}:")
+                    for v in values:
+                        lines.append(f"          - {v}")
+                else:
+                    vals_str = ", ".join(str(v) for v in values)
+                    lines.append(f"        - {param_name}: [{vals_str}]")
+        else:
+            lines.append(f"      ForkParameters:")
+        lines.append(f"      BenchmarkForkParameters:")
+        lines.append(f"      JoinParameters:")
+        lines.append(f"      BenchmarkJoinParameters:")
+        lines.append(f"      BenchmarkFinalParameters:")
         lines.append(f"        - ProblemSizes:")
 
         seen = set()
@@ -91,23 +150,7 @@ def generate_yaml(result: dict, gfx_target: str, output_path: Path) -> None:
             seen.add(key)
             # Tensile ProblemSizes format: [M, N, batch, K]
             lines.append(f"          - Exact: [{shape['M']}, {shape['N']}, 1, {shape['K']}]")
-
-        lines.append(f"      ForkParameters:")
-        lines.append(f"      BenchmarkForkParameters:")
-        lines.append(f"      JoinParameters:")
-        lines.append(f"      BenchmarkJoinParameters:")
-        lines.append(f"      BenchmarkFinalParameters:")
-        lines.append(f"        - ProblemSizes:")
-        lines.append(f"          FinalParameters:")
         lines.append("")
-
-    lines.append("LibraryLogic:")
-    lines.append(f"  ScheduleName: {gfx_target}_inference")
-    lines.append(f"  DeviceNames: [{gfx_target}]")
-    lines.append(f"  ArchitectureName: {gfx_target}")
-    lines.append("")
-    lines.append("LibraryClient:")
-    lines.append("")
 
     output_path.write_text("\n".join(lines))
     print(f"Written: {output_path}", file=sys.stderr)
