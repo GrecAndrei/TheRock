@@ -73,6 +73,69 @@ void hip_check(hipError_t status, const char *operation) {
     }
 }
 
+// The semantic executor streams one quantized matrix at a time because the
+// target weights do not fit beside a 128K cache.  Keep the staging allocations
+// resident across projections: hipMalloc/hipFree for every projection was
+// dominating the otherwise useful first-token correctness pass.
+struct MatvecWorkspace {
+    void *weights = nullptr;
+    std::size_t weight_capacity = 0;
+    float *input = nullptr;
+    std::size_t input_capacity = 0;
+    float *output = nullptr;
+    std::size_t output_capacity = 0;
+
+    ~MatvecWorkspace() {
+        if (output) (void) hipFree(output);
+        if (input) (void) hipFree(input);
+        if (weights) (void) hipFree(weights);
+    }
+
+    void reserve_weights(std::size_t bytes) {
+        if (bytes <= weight_capacity) {
+            return;
+        }
+        if (weights) {
+            hip_check(hipFree(weights), "hipFree native matvec weight staging");
+            weights = nullptr;
+            weight_capacity = 0;
+        }
+        hip_check(hipMalloc(&weights, bytes), "hipMalloc native matvec weight staging");
+        weight_capacity = bytes;
+    }
+
+    void reserve_input(std::size_t values) {
+        if (values <= input_capacity) {
+            return;
+        }
+        if (input) {
+            hip_check(hipFree(input), "hipFree native matvec input staging");
+            input = nullptr;
+            input_capacity = 0;
+        }
+        hip_check(hipMalloc(reinterpret_cast<void **>(&input), values * sizeof(float)), "hipMalloc native matvec input staging");
+        input_capacity = values;
+    }
+
+    void reserve_output(std::size_t values) {
+        if (values <= output_capacity) {
+            return;
+        }
+        if (output) {
+            hip_check(hipFree(output), "hipFree native matvec output staging");
+            output = nullptr;
+            output_capacity = 0;
+        }
+        hip_check(hipMalloc(reinterpret_cast<void **>(&output), values * sizeof(float)), "hipMalloc native matvec output staging");
+        output_capacity = values;
+    }
+};
+
+MatvecWorkspace &matvec_workspace() {
+    static MatvecWorkspace workspace;
+    return workspace;
+}
+
 __device__ __forceinline__ void scale_min(const std::uint8_t *packed, int index,
                                            std::uint8_t &scale, std::uint8_t &minimum) {
     if (index < 4) {
@@ -1195,6 +1258,32 @@ void launch_k_matvec_batch8(std::uint32_t type, const void *weights, const float
     }
 }
 
+void launch_k_matvec(std::uint32_t type, const void *weights, const float *input,
+                     float *output, std::size_t input_size, std::size_t output_size) {
+    const dim3 grid(static_cast<unsigned int>(output_size));
+    const dim3 block(kWarpSize);
+    const int blocks_per_row = static_cast<int>(input_size / kQuantBlock);
+    switch (type) {
+    case 12:
+        hipLaunchKernelGGL(q4k_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q4KBlock *>(weights), input, output,
+                           blocks_per_row, static_cast<int>(output_size));
+        return;
+    case 13:
+        hipLaunchKernelGGL(q5k_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q5KBlock *>(weights), input, output,
+                           blocks_per_row, static_cast<int>(output_size));
+        return;
+    case 14:
+        hipLaunchKernelGGL(q6k_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q6KBlock *>(weights), input, output,
+                           blocks_per_row, static_cast<int>(output_size));
+        return;
+    default:
+        throw std::invalid_argument("matrix is not a supported K-quant type");
+    }
+}
+
 void launch_n23q4_matvec_batch8(const N23Q4TileGroup *weights,
                                 const std::int8_t *input, const float *input_scales,
                                 const int *input_sums, float *output,
@@ -1504,6 +1593,21 @@ Q4KBenchmarkResult benchmark_q6k_batch8(const void *weights, std::size_t input_s
                                         std::size_t output_size, int iterations) {
     return benchmark_k_matvec<Q6KBlock>(weights, input_size, output_size, iterations, true,
                                         q6k_reference_row);
+}
+
+void execute_k_matvec(const void *weights, std::uint32_t weight_type,
+                      const float *input, std::size_t input_size,
+                      float *output, std::size_t output_size) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &workspace = matvec_workspace();
+    workspace.reserve_weights(weight_bytes);
+    workspace.reserve_input(input_size);
+    workspace.reserve_output(output_size);
+    hip_check(hipMemcpy(workspace.weights, weights, weight_bytes, hipMemcpyHostToDevice), "hipMemcpy native matvec weights");
+    hip_check(hipMemcpy(workspace.input, input, input_size * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy native matvec input");
+    launch_k_matvec(weight_type, workspace.weights, workspace.input, workspace.output, input_size, output_size);
+    hip_check(hipGetLastError(), "native matvec launch");
+    hip_check(hipMemcpy(output, workspace.output, output_size * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy native matvec output");
 }
 
 FfnBenchmarkResult benchmark_ffn_batch8(const void *gate_weights, std::uint32_t gate_type,

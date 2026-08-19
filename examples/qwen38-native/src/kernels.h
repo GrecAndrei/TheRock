@@ -53,5 +53,8 @@ FfnBenchmarkResult benchmark_ffn_batch8_n23q4(const void *gate_weights,
                                                std::size_t input_size,
                                                std::size_t hidden_size,
                                                std::size_t output_size, int iterations);
+void execute_k_matvec(const void *weights, std::uint32_t weight_type,
+                      const float *input, std::size_t input_size,
+                      float *output, std::size_t output_size);
 
 } // namespace qwen_native

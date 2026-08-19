@@ -19,6 +19,8 @@ build/qwen38-native bench-matvec ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
     blk.0.ffn_gate.weight 100
 build/qwen38-native bench-ffn ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
 build/qwen38-native bench-gdn
+build/qwen38-native show-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
+build/qwen38-native target-first-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
 ```
 
 ## N23Q4
@@ -75,6 +77,17 @@ The 48 recurrent target layers use a fused gated-delta state update. The
 checks it against a CPU recurrence with identical FP16 state rounding. It
 measures 0.153 ms per recurrent layer on this device with maximum error
 `3.96e-6`.
+
+`target-first-token` is the first semantic target-trunk checkpoint. It accepts
+a raw tokenizer ID, fetches the real Q4_K embedding, executes all 64 live
+layers, applies the final norm and Q6_K output head, then reports the top
+token. At position zero, causal attention is exactly the current V, so no
+attention cache read is needed; recurrent layers use their zero initial state.
+It is deliberately not advertised as a decoding benchmark: the command streams
+the target weights through a persistent HIP arena for correctness work, while
+the final verifier will retain its N23Q4 hot set and evaluate eight proposals
+per target pass. On this machine the semantic position-zero pass takes 2.34 s,
+down from 20.45 s before persistent staging removed per-projection allocations.
 
 For 128K context, the target has only 16 full-attention layers; its other 48
 layers use fixed-size recurrent state. The `N23KV4` cache format stores the
