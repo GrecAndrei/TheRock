@@ -103,6 +103,62 @@ __global__ void q4k_matvec_kernel(const Q4KBlock *__restrict__ weights,
     }
 }
 
+__global__ void q4k_matvec_batch8_kernel(const Q4KBlock *__restrict__ weights,
+                                         const float *__restrict__ input,
+                                         float *__restrict__ output,
+                                         int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) {
+        return;
+    }
+
+    float sums[8] = {};
+    const Q4KBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const Q4KBlock &block = row_weights[block_index];
+        const float scale_all = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        const float min_all = __half2float(*reinterpret_cast<const __half *>(&block.dmin));
+
+#pragma unroll
+        for (int group = 0; group < 4; ++group) {
+            std::uint8_t scale0 = 0;
+            std::uint8_t min0 = 0;
+            std::uint8_t scale1 = 0;
+            std::uint8_t min1 = 0;
+            scale_min(block.scales, group * 2, scale0, min0);
+            scale_min(block.scales, group * 2 + 1, scale1, min1);
+            const std::uint8_t quant = block.quants[group * kWarpSize + lane];
+            const int index0 = block_index * kQuantBlock + group * 64 + lane;
+            const int index1 = index0 + 32;
+            const float weight0 = scale_all * static_cast<float>(scale0) * static_cast<float>(quant & 0x0F)
+                                - min_all * static_cast<float>(min0);
+            const float weight1 = scale_all * static_cast<float>(scale1) * static_cast<float>(quant >> 4)
+                                - min_all * static_cast<float>(min1);
+#pragma unroll
+            for (int batch = 0; batch < 8; ++batch) {
+                const float *batch_input = input + static_cast<std::size_t>(batch) * input_size;
+                sums[batch] = fmaf(weight0, batch_input[index0], sums[batch]);
+                sums[batch] = fmaf(weight1, batch_input[index1], sums[batch]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
 __global__ void n23q4_matvec_kernel(const N23Q4TileGroup *__restrict__ weights,
                                     const std::int8_t *__restrict__ input,
                                     const float *__restrict__ input_scales,
@@ -155,6 +211,73 @@ __global__ void n23q4_matvec_kernel(const N23Q4TileGroup *__restrict__ weights,
     }
     if (lane_in_row == 0 && row < rows) {
         output[row] = sum;
+    }
+}
+
+__global__ void n23q4_batch8_kernel(const N23Q4TileGroup *__restrict__ weights,
+                                    const std::int8_t *__restrict__ input,
+                                    const float *__restrict__ input_scales,
+                                    const int *__restrict__ input_sums,
+                                    float *__restrict__ output,
+                                    int input_size, int groups_per_row, int rows) {
+    const int tile = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int row_in_tile = lane / 8;
+    const int lane_in_row = lane & 7;
+    const int row = tile * 4 + row_in_tile;
+    if (lane >= kWarpSize) {
+        return;
+    }
+
+    float sums[8] = {};
+    const auto *tile_weights = weights + static_cast<std::size_t>(tile) * groups_per_row;
+    for (int group = 0; group < groups_per_row; ++group) {
+        const auto &packed = tile_weights[group];
+        const auto *nibbles = packed.quants[row_in_tile] + 2 * lane_in_row;
+        const std::uint8_t low = nibbles[0];
+        const std::uint8_t high = nibbles[1];
+        const int w0 = ((static_cast<int>(low & 0x0F) ^ 8) - 8);
+        const int w1 = ((static_cast<int>(low >> 4) ^ 8) - 8);
+        const int w2 = ((static_cast<int>(high & 0x0F) ^ 8) - 8);
+        const int w3 = ((static_cast<int>(high >> 4) ^ 8) - 8);
+        const std::uint32_t weight_word = static_cast<std::uint8_t>(w0)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w1)) << 8)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w2)) << 16)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w3)) << 24);
+        const float weight_scale = __half2float(
+            *reinterpret_cast<const __half *>(&packed.scales[row_in_tile]));
+        const float weight_bias = __half2float(
+            *reinterpret_cast<const __half *>(&packed.biases[row_in_tile]));
+
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            const auto *input_word = reinterpret_cast<const std::uint32_t *>(
+                input + static_cast<std::size_t>(batch) * input_size
+                + static_cast<std::size_t>(group) * 32 + lane_in_row * 4);
+            const int dot = __builtin_amdgcn_sdot4(static_cast<int>(weight_word),
+                                                    static_cast<int>(*input_word), 0, false);
+            const std::size_t group_index = static_cast<std::size_t>(batch) * groups_per_row + group;
+            sums[batch] += (static_cast<float>(dot) * weight_scale
+                            + 0.125F * static_cast<float>(input_sums[group_index]) * weight_bias)
+                         * input_scales[group_index];
+        }
+    }
+
+#pragma unroll
+    for (int offset = 4; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            const float other = __shfl_down(sums[batch], offset, kWarpSize);
+            if (lane_in_row + offset < 8) {
+                sums[batch] += other;
+            }
+        }
+    }
+    if (lane_in_row == 0 && row < rows) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
     }
 }
 
@@ -405,6 +528,86 @@ Q4KBenchmarkResult benchmark_q4k(const void *weights, std::size_t input_size,
     }
 }
 
+Q4KBenchmarkResult benchmark_q4k_batch8(const void *weights, std::size_t input_size,
+                                        std::size_t output_size, int iterations) {
+    if (input_size == 0 || input_size % kQuantBlock != 0 || output_size == 0 || iterations <= 0) {
+        throw std::invalid_argument("invalid Q4_K batch-8 benchmark dimensions or iteration count");
+    }
+    constexpr std::size_t batch_size = 8;
+    const auto blocks_per_row = input_size / kQuantBlock;
+    const auto weight_bytes = blocks_per_row * output_size * sizeof(Q4KBlock);
+    std::vector<float> input(input_size * batch_size);
+    std::mt19937 generator(42);
+    std::uniform_real_distribution<float> distribution(-1.0F, 1.0F);
+    std::generate(input.begin(), input.end(), [&] { return distribution(generator); });
+    std::vector<float> output(output_size * batch_size);
+
+    void *device_weights = nullptr;
+    float *device_input = nullptr;
+    float *device_output = nullptr;
+    hipEvent_t begin = nullptr;
+    hipEvent_t end = nullptr;
+    hip_check(hipMalloc(&device_weights, weight_bytes), "hipMalloc batch8 weights");
+    try {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_input), input.size() * sizeof(float)), "hipMalloc batch8 input");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_output), output.size() * sizeof(float)), "hipMalloc batch8 output");
+        hip_check(hipMemcpy(device_weights, weights, weight_bytes, hipMemcpyHostToDevice), "hipMemcpy batch8 weights");
+        hip_check(hipMemcpy(device_input, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy batch8 input");
+        hip_check(hipEventCreate(&begin), "hipEventCreate batch8 begin");
+        hip_check(hipEventCreate(&end), "hipEventCreate batch8 end");
+
+        const dim3 grid(static_cast<unsigned int>(output_size));
+        const dim3 block(kWarpSize);
+        for (int i = 0; i < 5; ++i) {
+            hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid, block, 0, nullptr,
+                               static_cast<const Q4KBlock *>(device_weights), device_input,
+                               device_output, static_cast<int>(input_size),
+                               static_cast<int>(blocks_per_row), static_cast<int>(output_size));
+        }
+        hip_check(hipDeviceSynchronize(), "Q4_K batch8 warmup");
+        hip_check(hipEventRecord(begin), "hipEventRecord batch8 begin");
+        for (int i = 0; i < iterations; ++i) {
+            hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid, block, 0, nullptr,
+                               static_cast<const Q4KBlock *>(device_weights), device_input,
+                               device_output, static_cast<int>(input_size),
+                               static_cast<int>(blocks_per_row), static_cast<int>(output_size));
+        }
+        hip_check(hipEventRecord(end), "hipEventRecord batch8 end");
+        hip_check(hipEventSynchronize(end), "hipEventSynchronize batch8");
+        float elapsed = 0.0F;
+        hip_check(hipEventElapsedTime(&elapsed, begin, end), "hipEventElapsedTime batch8");
+        hip_check(hipMemcpy(output.data(), device_output, output.size() * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy batch8 output");
+
+        Q4KBenchmarkResult result;
+        result.milliseconds = elapsed / static_cast<float>(iterations);
+        result.bandwidth_gbps = static_cast<float>(weight_bytes) / (result.milliseconds * 1.0e6F);
+        const auto *host_weights = static_cast<const Q4KBlock *>(weights);
+        const std::size_t rows_to_check = std::min<std::size_t>(output_size, 8);
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            for (std::size_t row = 0; row < rows_to_check; ++row) {
+                const float expected = q4k_reference_row(host_weights + row * blocks_per_row,
+                                                         input.data() + batch * input_size,
+                                                         blocks_per_row);
+                result.max_absolute_error = std::max(
+                    result.max_absolute_error, std::abs(expected - output[batch * output_size + row]));
+            }
+        }
+        hip_check(hipEventDestroy(end), "hipEventDestroy batch8 end");
+        hip_check(hipEventDestroy(begin), "hipEventDestroy batch8 begin");
+        hip_check(hipFree(device_output), "hipFree batch8 output");
+        hip_check(hipFree(device_input), "hipFree batch8 input");
+        hip_check(hipFree(device_weights), "hipFree batch8 weights");
+        return result;
+    } catch (...) {
+        if (end) (void) hipEventDestroy(end);
+        if (begin) (void) hipEventDestroy(begin);
+        if (device_output) (void) hipFree(device_output);
+        if (device_input) (void) hipFree(device_input);
+        (void) hipFree(device_weights);
+        throw;
+    }
+}
+
 Q4KBenchmarkResult benchmark_n23q4_from_q4k(const void *weights, std::size_t input_size,
                                              std::size_t output_size, int iterations) {
     if (input_size == 0 || input_size % kQuantBlock != 0 || output_size == 0 || iterations <= 0) {
@@ -490,6 +693,109 @@ Q4KBenchmarkResult benchmark_n23q4_from_q4k(const void *weights, std::size_t inp
         if (device_output) (void) hipFree(device_output);
         if (device_scales) (void) hipFree(device_scales);
         if (device_sums) (void) hipFree(device_sums);
+        if (device_input) (void) hipFree(device_input);
+        (void) hipFree(device_weights);
+        throw;
+    }
+}
+
+Q4KBenchmarkResult benchmark_n23q4_batch8_from_q4k(const void *weights, std::size_t input_size,
+                                                    std::size_t output_size, int iterations) {
+    if (input_size == 0 || input_size % kQuantBlock != 0 || output_size == 0 || iterations <= 0) {
+        throw std::invalid_argument("invalid N23Q4 batch-8 benchmark dimensions or iteration count");
+    }
+    constexpr std::size_t batch_size = 8;
+    const auto groups_per_row = input_size / 32;
+    const auto tiles = (output_size + 3) / 4;
+    const auto *q4k_weights = static_cast<const Q4KBlock *>(weights);
+    auto packed_weights = convert_to_n23q4(q4k_weights, input_size, output_size);
+    std::vector<float> input(input_size * batch_size);
+    std::mt19937 generator(42);
+    std::uniform_real_distribution<float> distribution(-1.0F, 1.0F);
+    std::generate(input.begin(), input.end(), [&] { return distribution(generator); });
+    std::vector<std::int8_t> quantized_input;
+    std::vector<float> input_scales;
+    std::vector<int> input_sums;
+    quantize_input_q8(input, quantized_input, input_scales, input_sums);
+    std::vector<float> output(output_size * batch_size);
+
+    N23Q4TileGroup *device_weights = nullptr;
+    std::int8_t *device_input = nullptr;
+    float *device_scales = nullptr;
+    int *device_sums = nullptr;
+    float *device_output = nullptr;
+    hipEvent_t begin = nullptr;
+    hipEvent_t end = nullptr;
+    hip_check(hipMalloc(reinterpret_cast<void **>(&device_weights), packed_weights.size() * sizeof(N23Q4TileGroup)), "hipMalloc N23Q4 batch8 weights");
+    try {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_input), quantized_input.size()), "hipMalloc N23Q4 batch8 input");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_scales), input_scales.size() * sizeof(float)), "hipMalloc N23Q4 batch8 scales");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_sums), input_sums.size() * sizeof(int)), "hipMalloc N23Q4 batch8 sums");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_output), output.size() * sizeof(float)), "hipMalloc N23Q4 batch8 output");
+        hip_check(hipMemcpy(device_weights, packed_weights.data(), packed_weights.size() * sizeof(N23Q4TileGroup), hipMemcpyHostToDevice), "hipMemcpy N23Q4 batch8 weights");
+        hip_check(hipMemcpy(device_input, quantized_input.data(), quantized_input.size(), hipMemcpyHostToDevice), "hipMemcpy N23Q4 batch8 input");
+        hip_check(hipMemcpy(device_scales, input_scales.data(), input_scales.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy N23Q4 batch8 scales");
+        hip_check(hipMemcpy(device_sums, input_sums.data(), input_sums.size() * sizeof(int), hipMemcpyHostToDevice), "hipMemcpy N23Q4 batch8 sums");
+        hip_check(hipEventCreate(&begin), "hipEventCreate N23Q4 batch8 begin");
+        hip_check(hipEventCreate(&end), "hipEventCreate N23Q4 batch8 end");
+
+        const dim3 grid(static_cast<unsigned int>(tiles));
+        const dim3 block(kWarpSize);
+        for (int i = 0; i < 5; ++i) {
+            hipLaunchKernelGGL(n23q4_batch8_kernel, grid, block, 0, nullptr,
+                               device_weights, device_input, device_scales, device_sums,
+                               device_output, static_cast<int>(input_size),
+                               static_cast<int>(groups_per_row), static_cast<int>(output_size));
+        }
+        hip_check(hipDeviceSynchronize(), "N23Q4 batch8 warmup");
+        hip_check(hipEventRecord(begin), "hipEventRecord N23Q4 batch8 begin");
+        for (int i = 0; i < iterations; ++i) {
+            hipLaunchKernelGGL(n23q4_batch8_kernel, grid, block, 0, nullptr,
+                               device_weights, device_input, device_scales, device_sums,
+                               device_output, static_cast<int>(input_size),
+                               static_cast<int>(groups_per_row), static_cast<int>(output_size));
+        }
+        hip_check(hipEventRecord(end), "hipEventRecord N23Q4 batch8 end");
+        hip_check(hipEventSynchronize(end), "hipEventSynchronize N23Q4 batch8");
+        float elapsed = 0.0F;
+        hip_check(hipEventElapsedTime(&elapsed, begin, end), "hipEventElapsedTime N23Q4 batch8");
+        hip_check(hipMemcpy(output.data(), device_output, output.size() * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy N23Q4 batch8 output");
+
+        Q4KBenchmarkResult result;
+        result.milliseconds = elapsed / static_cast<float>(iterations);
+        result.bandwidth_gbps = static_cast<float>(packed_weights.size() * sizeof(N23Q4TileGroup))
+                              / (result.milliseconds * 1.0e6F);
+        const auto blocks_per_row = input_size / kQuantBlock;
+        const std::size_t rows_to_check = std::min<std::size_t>(output_size, 8);
+        double squared_error = 0.0;
+        double squared_reference = 0.0;
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            for (std::size_t row = 0; row < rows_to_check; ++row) {
+                const float expected = q4k_reference_row(q4k_weights + row * blocks_per_row,
+                                                         input.data() + batch * input_size,
+                                                         blocks_per_row);
+                const float actual = output[batch * output_size + row];
+                const float difference = expected - actual;
+                result.max_absolute_error = std::max(result.max_absolute_error, std::abs(difference));
+                squared_error += static_cast<double>(difference) * difference;
+                squared_reference += static_cast<double>(expected) * expected;
+            }
+        }
+        result.relative_rmse = static_cast<float>(std::sqrt(squared_error / squared_reference));
+        hip_check(hipEventDestroy(end), "hipEventDestroy N23Q4 batch8 end");
+        hip_check(hipEventDestroy(begin), "hipEventDestroy N23Q4 batch8 begin");
+        hip_check(hipFree(device_output), "hipFree N23Q4 batch8 output");
+        hip_check(hipFree(device_sums), "hipFree N23Q4 batch8 sums");
+        hip_check(hipFree(device_scales), "hipFree N23Q4 batch8 scales");
+        hip_check(hipFree(device_input), "hipFree N23Q4 batch8 input");
+        hip_check(hipFree(device_weights), "hipFree N23Q4 batch8 weights");
+        return result;
+    } catch (...) {
+        if (end) (void) hipEventDestroy(end);
+        if (begin) (void) hipEventDestroy(begin);
+        if (device_output) (void) hipFree(device_output);
+        if (device_sums) (void) hipFree(device_sums);
+        if (device_scales) (void) hipFree(device_scales);
         if (device_input) (void) hipFree(device_input);
         (void) hipFree(device_weights);
         throw;
