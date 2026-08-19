@@ -49,5 +49,12 @@ VRAM for weights than Q8 K/V. The built-in `plan-128k` command measures the
 exact model metadata and reports 4.25 GiB for target Q8 KV versus 2.25 GiB for
 N23KV4, reclaiming 2.00 GiB for target weights on this card.
 
+The real 131,072-token N23KV4 key-score benchmark reaches 212 GB/s and 2.14
+ms per full-attention layer for one query. Its eight-query verifier reads each
+cached key once and completes in 6.86 ms/layer, 2.50x faster than launching the
+single-query pass eight times. CPU-vs-GPU error is below `5e-7`. The production
+attention path will fuse online softmax and V accumulation so the 8 x 24 x
+128K score matrix is never written to VRAM.
+
 The previous llama.cpp integration remains under `../qwen38-dflash` only as a
 correctness and throughput baseline while the native path is completed.

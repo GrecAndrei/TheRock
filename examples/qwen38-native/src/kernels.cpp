@@ -40,6 +40,12 @@ struct N23Q4TileGroup {
 };
 static_assert(sizeof(N23Q4TileGroup) == 80);
 
+struct N23KV4Group {
+    std::uint16_t scale;
+    std::uint8_t quants[16];
+};
+static_assert(sizeof(N23KV4Group) == 18);
+
 void hip_check(hipError_t status, const char *operation) {
     if (status != hipSuccess) {
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
@@ -277,6 +283,147 @@ __global__ void n23q4_batch8_kernel(const N23Q4TileGroup *__restrict__ weights,
 #pragma unroll
         for (int batch = 0; batch < 8; ++batch) {
             output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
+__global__ void n23kv4_score_kernel(const N23KV4Group *__restrict__ keys,
+                                    const std::int8_t *__restrict__ queries,
+                                    const float *__restrict__ query_scales,
+                                    float *__restrict__ scores,
+                                    int context_size) {
+    constexpr int warps_per_block = 4;
+    constexpr int groups_per_head = 8;
+    constexpr int query_heads = 24;
+    constexpr int kv_heads = 4;
+    constexpr int queries_per_kv = query_heads / kv_heads;
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int token = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    const int query_head = static_cast<int>(blockIdx.y);
+    if (token >= context_size || query_head >= query_heads) {
+        return;
+    }
+    const int kv_head = query_head / queries_per_kv;
+    const int lane_group = lane / 8;
+    const int lane_in_group = lane & 7;
+    const auto *token_keys = keys
+        + (static_cast<std::size_t>(kv_head) * context_size + token) * groups_per_head;
+    float partial = 0.0F;
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int group = half * 4 + lane_group;
+        const auto &key_group = token_keys[group];
+        const auto *nibbles = key_group.quants + 2 * lane_in_group;
+        const std::uint8_t low = nibbles[0];
+        const std::uint8_t high = nibbles[1];
+        const int w0 = ((static_cast<int>(low & 0x0F) ^ 8) - 8);
+        const int w1 = ((static_cast<int>(low >> 4) ^ 8) - 8);
+        const int w2 = ((static_cast<int>(high & 0x0F) ^ 8) - 8);
+        const int w3 = ((static_cast<int>(high >> 4) ^ 8) - 8);
+        const std::uint32_t key_word = static_cast<std::uint8_t>(w0)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w1)) << 8)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w2)) << 16)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w3)) << 24);
+        const auto *query_word = reinterpret_cast<const std::uint32_t *>(
+            queries + (static_cast<std::size_t>(query_head) * groups_per_head + group) * 32
+            + lane_in_group * 4);
+        const int dot = __builtin_amdgcn_sdot4(static_cast<int>(key_word),
+                                                static_cast<int>(*query_word), 0, false);
+        const float key_scale = __half2float(*reinterpret_cast<const __half *>(&key_group.scale));
+        partial += static_cast<float>(dot) * key_scale
+                 * query_scales[query_head * groups_per_head + group];
+    }
+
+#pragma unroll
+    for (int offset = 4; offset > 0; offset /= 2) {
+        const float other = __shfl_down(partial, offset, kWarpSize);
+        if (lane_in_group + offset < 8) {
+            partial += other;
+        }
+    }
+    const float group0 = __shfl(partial, 0, kWarpSize);
+    const float group1 = __shfl(partial, 8, kWarpSize);
+    const float group2 = __shfl(partial, 16, kWarpSize);
+    const float group3 = __shfl(partial, 24, kWarpSize);
+    if (lane == 0) {
+        scores[static_cast<std::size_t>(query_head) * context_size + token]
+            = group0 + group1 + group2 + group3;
+    }
+}
+
+__global__ void n23kv4_score_batch8_kernel(const N23KV4Group *__restrict__ keys,
+                                           const std::int8_t *__restrict__ queries,
+                                           const float *__restrict__ query_scales,
+                                           float *__restrict__ scores,
+                                           int context_size) {
+    constexpr int warps_per_block = 4;
+    constexpr int groups_per_head = 8;
+    constexpr int query_heads = 24;
+    constexpr int kv_heads = 4;
+    constexpr int queries_per_kv = query_heads / kv_heads;
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int token = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    const int query_head = static_cast<int>(blockIdx.y);
+    if (token >= context_size || query_head >= query_heads) {
+        return;
+    }
+    const int kv_head = query_head / queries_per_kv;
+    const int lane_group = lane / 8;
+    const int lane_in_group = lane & 7;
+    const auto *token_keys = keys
+        + (static_cast<std::size_t>(kv_head) * context_size + token) * groups_per_head;
+    float partial[8] = {};
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int group = half * 4 + lane_group;
+        const auto &key_group = token_keys[group];
+        const auto *nibbles = key_group.quants + 2 * lane_in_group;
+        const std::uint8_t low = nibbles[0];
+        const std::uint8_t high = nibbles[1];
+        const int w0 = ((static_cast<int>(low & 0x0F) ^ 8) - 8);
+        const int w1 = ((static_cast<int>(low >> 4) ^ 8) - 8);
+        const int w2 = ((static_cast<int>(high & 0x0F) ^ 8) - 8);
+        const int w3 = ((static_cast<int>(high >> 4) ^ 8) - 8);
+        const std::uint32_t key_word = static_cast<std::uint8_t>(w0)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w1)) << 8)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w2)) << 16)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w3)) << 24);
+        const float key_scale = __half2float(*reinterpret_cast<const __half *>(&key_group.scale));
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            const std::size_t query_group = (static_cast<std::size_t>(batch) * query_heads
+                                             + query_head) * groups_per_head + group;
+            const auto *query_word = reinterpret_cast<const std::uint32_t *>(
+                queries + query_group * 32 + lane_in_group * 4);
+            const int dot = __builtin_amdgcn_sdot4(static_cast<int>(key_word),
+                                                    static_cast<int>(*query_word), 0, false);
+            partial[batch] += static_cast<float>(dot) * key_scale * query_scales[query_group];
+        }
+    }
+
+#pragma unroll
+    for (int offset = 4; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            const float other = __shfl_down(partial[batch], offset, kWarpSize);
+            if (lane_in_group + offset < 8) {
+                partial[batch] += other;
+            }
+        }
+    }
+#pragma unroll
+    for (int batch = 0; batch < 8; ++batch) {
+        const float total = __shfl(partial[batch], 0, kWarpSize)
+                          + __shfl(partial[batch], 8, kWarpSize)
+                          + __shfl(partial[batch], 16, kWarpSize)
+                          + __shfl(partial[batch], 24, kWarpSize);
+        if (lane == 0) {
+            scores[(static_cast<std::size_t>(batch) * query_heads + query_head)
+                   * context_size + token] = total;
         }
     }
 }
@@ -798,6 +945,242 @@ Q4KBenchmarkResult benchmark_n23q4_batch8_from_q4k(const void *weights, std::siz
         if (device_scales) (void) hipFree(device_scales);
         if (device_input) (void) hipFree(device_input);
         (void) hipFree(device_weights);
+        throw;
+    }
+}
+
+Q4KBenchmarkResult benchmark_n23kv4(std::size_t context_size, int iterations) {
+    if (context_size == 0 || iterations <= 0) {
+        throw std::invalid_argument("invalid N23KV4 benchmark context or iteration count");
+    }
+    constexpr std::size_t head_size = 256;
+    constexpr std::size_t groups_per_head = head_size / 32;
+    constexpr std::size_t query_heads = 24;
+    constexpr std::size_t kv_heads = 4;
+    const std::size_t key_groups = context_size * kv_heads * groups_per_head;
+    std::vector<N23KV4Group> keys(key_groups);
+    std::vector<std::int8_t> queries(query_heads * head_size);
+    std::vector<float> query_scales(query_heads * groups_per_head);
+    std::vector<float> scores(query_heads * context_size);
+    std::mt19937 generator(42);
+    std::uniform_int_distribution<int> q4_distribution(-8, 7);
+    std::uniform_int_distribution<int> q8_distribution(-127, 127);
+    std::uniform_real_distribution<float> scale_distribution(0.001F, 0.02F);
+    for (auto &group : keys) {
+        group.scale = float_to_fp16(scale_distribution(generator));
+        for (auto &byte : group.quants) {
+            const int first = q4_distribution(generator);
+            const int second = q4_distribution(generator);
+            byte = static_cast<std::uint8_t>((first & 0x0F) | ((second & 0x0F) << 4));
+        }
+    }
+    for (auto &value : queries) {
+        value = static_cast<std::int8_t>(q8_distribution(generator));
+    }
+    for (auto &scale : query_scales) {
+        scale = scale_distribution(generator);
+    }
+
+    N23KV4Group *device_keys = nullptr;
+    std::int8_t *device_queries = nullptr;
+    float *device_query_scales = nullptr;
+    float *device_scores = nullptr;
+    hipEvent_t begin = nullptr;
+    hipEvent_t end = nullptr;
+    const std::size_t key_bytes = keys.size() * sizeof(N23KV4Group);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&device_keys), key_bytes), "hipMalloc N23KV4 keys");
+    try {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_queries), queries.size()), "hipMalloc N23KV4 queries");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_query_scales), query_scales.size() * sizeof(float)), "hipMalloc N23KV4 query scales");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_scores), scores.size() * sizeof(float)), "hipMalloc N23KV4 scores");
+        hip_check(hipMemcpy(device_keys, keys.data(), key_bytes, hipMemcpyHostToDevice), "hipMemcpy N23KV4 keys");
+        hip_check(hipMemcpy(device_queries, queries.data(), queries.size(), hipMemcpyHostToDevice), "hipMemcpy N23KV4 queries");
+        hip_check(hipMemcpy(device_query_scales, query_scales.data(), query_scales.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy N23KV4 query scales");
+        hip_check(hipEventCreate(&begin), "hipEventCreate N23KV4 begin");
+        hip_check(hipEventCreate(&end), "hipEventCreate N23KV4 end");
+
+        const dim3 block(128);
+        const dim3 grid(static_cast<unsigned int>((context_size + 3) / 4), query_heads);
+        for (int i = 0; i < 3; ++i) {
+            hipLaunchKernelGGL(n23kv4_score_kernel, grid, block, 0, nullptr,
+                               device_keys, device_queries, device_query_scales,
+                               device_scores, static_cast<int>(context_size));
+        }
+        hip_check(hipDeviceSynchronize(), "N23KV4 warmup");
+        hip_check(hipEventRecord(begin), "hipEventRecord N23KV4 begin");
+        for (int i = 0; i < iterations; ++i) {
+            hipLaunchKernelGGL(n23kv4_score_kernel, grid, block, 0, nullptr,
+                               device_keys, device_queries, device_query_scales,
+                               device_scores, static_cast<int>(context_size));
+        }
+        hip_check(hipEventRecord(end), "hipEventRecord N23KV4 end");
+        hip_check(hipEventSynchronize(end), "hipEventSynchronize N23KV4");
+        float elapsed = 0.0F;
+        hip_check(hipEventElapsedTime(&elapsed, begin, end), "hipEventElapsedTime N23KV4");
+        hip_check(hipMemcpy(scores.data(), device_scores, scores.size() * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy N23KV4 scores");
+
+        Q4KBenchmarkResult result;
+        result.milliseconds = elapsed / static_cast<float>(iterations);
+        const std::size_t effective_key_bytes = key_bytes * (query_heads / kv_heads);
+        result.bandwidth_gbps = static_cast<float>(effective_key_bytes)
+                              / (result.milliseconds * 1.0e6F);
+        const std::size_t tokens_to_check = std::min<std::size_t>(context_size, 16);
+        for (std::size_t query_head = 0; query_head < query_heads; ++query_head) {
+            const std::size_t kv_head = query_head / (query_heads / kv_heads);
+            for (std::size_t token = 0; token < tokens_to_check; ++token) {
+                float expected = 0.0F;
+                const auto *token_keys = keys.data()
+                    + (kv_head * context_size + token) * groups_per_head;
+                for (std::size_t group = 0; group < groups_per_head; ++group) {
+                    const float key_scale = fp16_to_float(token_keys[group].scale);
+                    const float query_scale = query_scales[query_head * groups_per_head + group];
+                    int dot = 0;
+                    for (int i = 0; i < 32; ++i) {
+                        const auto byte = token_keys[group].quants[i / 2];
+                        const int nibble = (byte >> ((i & 1) * 4)) & 0x0F;
+                        const int key = nibble >= 8 ? nibble - 16 : nibble;
+                        dot += key * queries[(query_head * groups_per_head + group) * 32 + i];
+                    }
+                    expected += static_cast<float>(dot) * key_scale * query_scale;
+                }
+                const float actual = scores[query_head * context_size + token];
+                result.max_absolute_error = std::max(result.max_absolute_error, std::abs(expected - actual));
+            }
+        }
+        hip_check(hipEventDestroy(end), "hipEventDestroy N23KV4 end");
+        hip_check(hipEventDestroy(begin), "hipEventDestroy N23KV4 begin");
+        hip_check(hipFree(device_scores), "hipFree N23KV4 scores");
+        hip_check(hipFree(device_query_scales), "hipFree N23KV4 query scales");
+        hip_check(hipFree(device_queries), "hipFree N23KV4 queries");
+        hip_check(hipFree(device_keys), "hipFree N23KV4 keys");
+        return result;
+    } catch (...) {
+        if (end) (void) hipEventDestroy(end);
+        if (begin) (void) hipEventDestroy(begin);
+        if (device_scores) (void) hipFree(device_scores);
+        if (device_query_scales) (void) hipFree(device_query_scales);
+        if (device_queries) (void) hipFree(device_queries);
+        (void) hipFree(device_keys);
+        throw;
+    }
+}
+
+Q4KBenchmarkResult benchmark_n23kv4_batch8(std::size_t context_size, int iterations) {
+    if (context_size == 0 || iterations <= 0) {
+        throw std::invalid_argument("invalid N23KV4 batch-8 benchmark context or iteration count");
+    }
+    constexpr std::size_t batch_size = 8;
+    constexpr std::size_t head_size = 256;
+    constexpr std::size_t groups_per_head = head_size / 32;
+    constexpr std::size_t query_heads = 24;
+    constexpr std::size_t kv_heads = 4;
+    const std::size_t key_groups = context_size * kv_heads * groups_per_head;
+    std::vector<N23KV4Group> keys(key_groups);
+    std::vector<std::int8_t> queries(batch_size * query_heads * head_size);
+    std::vector<float> query_scales(batch_size * query_heads * groups_per_head);
+    std::vector<float> scores(batch_size * query_heads * context_size);
+    std::mt19937 generator(42);
+    std::uniform_int_distribution<int> q4_distribution(-8, 7);
+    std::uniform_int_distribution<int> q8_distribution(-127, 127);
+    std::uniform_real_distribution<float> scale_distribution(0.001F, 0.02F);
+    for (auto &group : keys) {
+        group.scale = float_to_fp16(scale_distribution(generator));
+        for (auto &byte : group.quants) {
+            const int first = q4_distribution(generator);
+            const int second = q4_distribution(generator);
+            byte = static_cast<std::uint8_t>((first & 0x0F) | ((second & 0x0F) << 4));
+        }
+    }
+    for (auto &value : queries) {
+        value = static_cast<std::int8_t>(q8_distribution(generator));
+    }
+    for (auto &scale : query_scales) {
+        scale = scale_distribution(generator);
+    }
+
+    N23KV4Group *device_keys = nullptr;
+    std::int8_t *device_queries = nullptr;
+    float *device_query_scales = nullptr;
+    float *device_scores = nullptr;
+    hipEvent_t begin = nullptr;
+    hipEvent_t end = nullptr;
+    const std::size_t key_bytes = keys.size() * sizeof(N23KV4Group);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&device_keys), key_bytes), "hipMalloc N23KV4 batch8 keys");
+    try {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_queries), queries.size()), "hipMalloc N23KV4 batch8 queries");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_query_scales), query_scales.size() * sizeof(float)), "hipMalloc N23KV4 batch8 query scales");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_scores), scores.size() * sizeof(float)), "hipMalloc N23KV4 batch8 scores");
+        hip_check(hipMemcpy(device_keys, keys.data(), key_bytes, hipMemcpyHostToDevice), "hipMemcpy N23KV4 batch8 keys");
+        hip_check(hipMemcpy(device_queries, queries.data(), queries.size(), hipMemcpyHostToDevice), "hipMemcpy N23KV4 batch8 queries");
+        hip_check(hipMemcpy(device_query_scales, query_scales.data(), query_scales.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy N23KV4 batch8 query scales");
+        hip_check(hipEventCreate(&begin), "hipEventCreate N23KV4 batch8 begin");
+        hip_check(hipEventCreate(&end), "hipEventCreate N23KV4 batch8 end");
+
+        const dim3 block(128);
+        const dim3 grid(static_cast<unsigned int>((context_size + 3) / 4), query_heads);
+        for (int i = 0; i < 3; ++i) {
+            hipLaunchKernelGGL(n23kv4_score_batch8_kernel, grid, block, 0, nullptr,
+                               device_keys, device_queries, device_query_scales,
+                               device_scores, static_cast<int>(context_size));
+        }
+        hip_check(hipDeviceSynchronize(), "N23KV4 batch8 warmup");
+        hip_check(hipEventRecord(begin), "hipEventRecord N23KV4 batch8 begin");
+        for (int i = 0; i < iterations; ++i) {
+            hipLaunchKernelGGL(n23kv4_score_batch8_kernel, grid, block, 0, nullptr,
+                               device_keys, device_queries, device_query_scales,
+                               device_scores, static_cast<int>(context_size));
+        }
+        hip_check(hipEventRecord(end), "hipEventRecord N23KV4 batch8 end");
+        hip_check(hipEventSynchronize(end), "hipEventSynchronize N23KV4 batch8");
+        float elapsed = 0.0F;
+        hip_check(hipEventElapsedTime(&elapsed, begin, end), "hipEventElapsedTime N23KV4 batch8");
+        hip_check(hipMemcpy(scores.data(), device_scores, scores.size() * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy N23KV4 batch8 scores");
+
+        Q4KBenchmarkResult result;
+        result.milliseconds = elapsed / static_cast<float>(iterations);
+        const std::size_t effective_key_bytes = key_bytes * (query_heads / kv_heads);
+        result.bandwidth_gbps = static_cast<float>(effective_key_bytes)
+                              / (result.milliseconds * 1.0e6F);
+        const std::size_t tokens_to_check = std::min<std::size_t>(context_size, 8);
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            for (std::size_t query_head = 0; query_head < query_heads; ++query_head) {
+                const std::size_t kv_head = query_head / (query_heads / kv_heads);
+                for (std::size_t token = 0; token < tokens_to_check; ++token) {
+                    float expected = 0.0F;
+                    const auto *token_keys = keys.data()
+                        + (kv_head * context_size + token) * groups_per_head;
+                    for (std::size_t group = 0; group < groups_per_head; ++group) {
+                        const std::size_t query_group = (batch * query_heads + query_head)
+                                                      * groups_per_head + group;
+                        int dot = 0;
+                        for (int i = 0; i < 32; ++i) {
+                            const auto byte = token_keys[group].quants[i / 2];
+                            const int nibble = (byte >> ((i & 1) * 4)) & 0x0F;
+                            const int key = nibble >= 8 ? nibble - 16 : nibble;
+                            dot += key * queries[query_group * 32 + i];
+                        }
+                        expected += static_cast<float>(dot) * fp16_to_float(token_keys[group].scale)
+                                  * query_scales[query_group];
+                    }
+                    const float actual = scores[(batch * query_heads + query_head) * context_size + token];
+                    result.max_absolute_error = std::max(result.max_absolute_error, std::abs(expected - actual));
+                }
+            }
+        }
+        hip_check(hipEventDestroy(end), "hipEventDestroy N23KV4 batch8 end");
+        hip_check(hipEventDestroy(begin), "hipEventDestroy N23KV4 batch8 begin");
+        hip_check(hipFree(device_scores), "hipFree N23KV4 batch8 scores");
+        hip_check(hipFree(device_query_scales), "hipFree N23KV4 batch8 query scales");
+        hip_check(hipFree(device_queries), "hipFree N23KV4 batch8 queries");
+        hip_check(hipFree(device_keys), "hipFree N23KV4 batch8 keys");
+        return result;
+    } catch (...) {
+        if (end) (void) hipEventDestroy(end);
+        if (begin) (void) hipEventDestroy(begin);
+        if (device_scores) (void) hipFree(device_scores);
+        if (device_query_scales) (void) hipFree(device_query_scales);
+        if (device_queries) (void) hipFree(device_queries);
+        (void) hipFree(device_keys);
         throw;
     }
 }

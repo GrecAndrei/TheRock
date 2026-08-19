@@ -261,11 +261,28 @@ void plan_128k(const std::string &target_path, const std::string &draft_path) {
               << "  reclaimed for weights: " << gib(native_weight_budget - q8_weight_budget) << " GiB\n";
 }
 
+void bench_kv4(std::size_t context_size, int iterations) {
+    std::cout << "N23KV4 24Q/4KV-head score benchmark\n"
+              << "  context: " << context_size << " tokens\n";
+    const auto result = qwen_native::benchmark_n23kv4(context_size, iterations);
+    std::cout << "  latency:      " << std::fixed << std::setprecision(3)
+              << result.milliseconds << " ms per layer\n"
+              << "  effective BW: " << std::setprecision(2) << result.bandwidth_gbps << " GB/s\n"
+              << "  max error:    " << std::scientific << result.max_absolute_error << '\n';
+    const auto batch8 = qwen_native::benchmark_n23kv4_batch8(context_size, iterations);
+    std::cout << "  eight-query verifier:\n"
+              << "    latency:      " << std::fixed << std::setprecision(3)
+              << batch8.milliseconds << " ms per layer\n"
+              << "    reused-key BW:" << std::setprecision(2) << ' ' << batch8.bandwidth_gbps << " GB/s\n"
+              << "    max error:    " << std::scientific << batch8.max_absolute_error << '\n';
+}
+
 void usage(const char *program) {
     std::cout << "Usage:\n"
               << "  " << program << " device\n"
               << "  " << program << " inspect MODEL.gguf [--tensors]\n"
               << "  " << program << " bench-q4 MODEL.gguf TENSOR [ITERATIONS]\n"
+              << "  " << program << " bench-kv4 [CONTEXT] [ITERATIONS]\n"
               << "  " << program << " plan-128k TARGET.gguf DFLASH.gguf\n";
 }
 
@@ -293,6 +310,12 @@ int main(int argc, char **argv) {
         }
         if (argc == 4 && std::string(argv[1]) == "plan-128k") {
             plan_128k(argv[2], argv[3]);
+            return EXIT_SUCCESS;
+        }
+        if (argc >= 2 && argc <= 4 && std::string(argv[1]) == "bench-kv4") {
+            const auto context = argc >= 3 ? static_cast<std::size_t>(std::stoull(argv[2])) : 131072;
+            const int iterations = argc >= 4 ? std::stoi(argv[3]) : 20;
+            bench_kv4(context, iterations);
             return EXIT_SUCCESS;
         }
         usage(argv[0]);
