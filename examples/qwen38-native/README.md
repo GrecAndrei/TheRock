@@ -55,8 +55,8 @@ cached key once and completes in 6.86 ms/layer, 2.50x faster than launching the
 single-query pass eight times. CPU-vs-GPU error is below `5e-7`.
 
 The fused online-softmax and V path never writes the 8 x 24 x 128K score
-matrix to VRAM. With eight queries sharing each K/V read
-and 64 context partitions, a fully populated 128K cache takes 25.90 ms per
+matrix to VRAM. Its gfx1032 tile shares each K/V load across eight queries.
+With 64 context partitions, a fully populated 128K cache takes 25.90 ms per
 full-attention layer (about 414 ms across all 16 layers), with CPU-vs-GPU error
 near `2e-9`. This is deliberately reported separately from “128K capacity with
 a short prompt”: allocated context capacity does not mean 128K cache entries
