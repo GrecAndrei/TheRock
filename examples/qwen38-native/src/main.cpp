@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <map>
 #include <numeric>
+#include <sstream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -118,6 +119,20 @@ void show_token(const std::string &path, std::size_t token) {
         throw std::out_of_range("token ID is outside the tokenizer vocabulary");
     }
     std::cout << "token " << token << ": " << std::quoted(tokens[token]) << '\n';
+}
+
+void find_token(const std::string &path, const std::string &needle) {
+    const qwen_native::GgufFile model(path);
+    const auto *metadata = model.find_metadata("tokenizer.ggml.tokens");
+    if (!metadata || !std::holds_alternative<std::vector<std::string>>(*metadata)) {
+        throw std::runtime_error("GGUF does not contain a string tokenizer vocabulary");
+    }
+    const auto &tokens = std::get<std::vector<std::string>>(*metadata);
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        if (tokens[index] == needle) {
+            std::cout << index << '\n';
+        }
+    }
 }
 
 class Mapping {
@@ -496,6 +511,16 @@ public:
         double seconds = 0.0;
     };
 
+    struct BatchStepResult {
+        std::array<std::uint32_t, 8> next_tokens{};
+        std::array<float, 8> top_logits{};
+        double seconds = 0.0;
+        double recurrent_seconds = 0.0;
+        double attention_seconds = 0.0;
+        double ffn_seconds = 0.0;
+        double output_seconds = 0.0;
+    };
+
     NativeTargetSession(const std::string &path, std::size_t context_capacity,
                         std::size_t resident_weight_budget)
         : model_(path), mapping_(path), context_capacity_(context_capacity) {
@@ -533,6 +558,7 @@ public:
             state.matrix.assign(kRecurrentValueHeads * kRecurrentHeadSize * kRecurrentHeadSize, 0.0F);
             state.convolution.assign(3 * (2 * kRecurrentKeyHeads * kRecurrentHeadSize +
                                           kRecurrentValueHeads * kRecurrentHeadSize), 0.0F);
+            state.device_matrix = qwen_native::create_gated_delta_state();
         }
         attention_.resize(16);
         // Reserve a modest working set.  The cache grows on demand, so declaring
@@ -564,6 +590,29 @@ public:
     [[nodiscard]] qwen_native::ResidentWeightCacheStats resident_weight_stats() const {
         return qwen_native::resident_weight_cache_stats();
     }
+    [[nodiscard]] const std::array<std::vector<float>, 5> &dflash_features() const {
+        return dflash_features_;
+    }
+    void set_resident_weight_budget(std::size_t bytes) {
+        qwen_native::set_resident_weight_cache_budget(bytes);
+    }
+    void freeze_target_weight_cache() { allow_dynamic_target_cache_ = false; }
+    std::vector<float> dflash_token_embedding(std::uint32_t token) const {
+        if (token >= vocabulary_size_) {
+            throw std::out_of_range("input token ID is outside the target vocabulary");
+        }
+        return embedding(token);
+    }
+    std::vector<float> dflash_output_logits_batch8(const std::vector<float> &hidden) const {
+        return projection_batch8("output.weight", hidden);
+    }
+
+    ~NativeTargetSession() {
+        for (auto &state : recurrent_) {
+            qwen_native::destroy_gated_delta_state(state.device_matrix);
+            state.device_matrix = nullptr;
+        }
+    }
 
     StepResult step(std::uint32_t token) {
         if (token >= vocabulary_size_) {
@@ -574,9 +623,20 @@ public:
         }
         const auto started = std::chrono::steady_clock::now();
         auto hidden = embedding(token);
+        for (auto &feature : dflash_features_) {
+            feature.clear();
+        }
         std::size_t recurrent_index = 0;
         std::size_t attention_index = 0;
         for (int layer = 0; layer < 64; ++layer) {
+            switch (layer) {
+            case 6: dflash_features_[0] = hidden; break;
+            case 20: dflash_features_[1] = hidden; break;
+            case 34: dflash_features_[2] = hidden; break;
+            case 48: dflash_features_[3] = hidden; break;
+            case 62: dflash_features_[4] = hidden; break;
+            default: break;
+            }
             const std::string prefix = "blk." + std::to_string(layer) + ".";
             const auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", kEmbedding),
                                                   kEmbedding, epsilon_);
@@ -605,11 +665,83 @@ public:
         return {static_cast<std::uint32_t>(std::distance(logits.begin(), best)), *best, elapsed};
     }
 
+    // This is the target side of speculative verification.  The recurrent
+    // state is still advanced in token order, but every quantized projection
+    // is issued as one native batch-8 HIP kernel.  Consequently cold target
+    // weights cross PCIe once per proposed block rather than eight times.
+    BatchStepResult step_batch8(const std::array<std::uint32_t, 8> &tokens) {
+        if (active_tokens_ + tokens.size() > context_capacity_) {
+            throw std::runtime_error("native target context is full");
+        }
+        for (const auto token : tokens) {
+            if (token >= vocabulary_size_) {
+                throw std::out_of_range("input token ID is outside the target vocabulary");
+            }
+        }
+        const auto started = std::chrono::steady_clock::now();
+        BatchStepResult result;
+        prepare_batch_recurrent_states();
+        auto hidden = embeddings_batch8(tokens);
+        std::size_t recurrent_index = 0;
+        std::size_t attention_index = 0;
+        for (int layer = 0; layer < 64; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            const auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", kEmbedding),
+                                                  kEmbedding, epsilon_);
+            std::vector<float> attention_output;
+            const auto attention_started = std::chrono::steady_clock::now();
+            if ((layer + 1) % 4 != 0) {
+                attention_output = recurrent_layer_batch8(prefix, attention_input,
+                                                          recurrent_.at(recurrent_index++));
+            } else {
+                attention_output = full_attention_layer_batch8(prefix, attention_input,
+                                                               attention_.at(attention_index++));
+            }
+            const double attention_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - attention_started).count();
+            if ((layer + 1) % 4 != 0) {
+                result.recurrent_seconds += attention_elapsed;
+            } else {
+                result.attention_seconds += attention_elapsed;
+            }
+            hidden = add_vectors(hidden, attention_output);
+            const auto ffn_input = rms_norm(hidden, f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                                            kEmbedding, epsilon_);
+            const auto ffn_started = std::chrono::steady_clock::now();
+            auto gate = projection_batch8(prefix + "ffn_gate.weight", ffn_input);
+            const auto up = projection_batch8(prefix + "ffn_up.weight", ffn_input);
+            for (std::size_t index = 0; index < gate.size(); ++index) {
+                gate[index] = silu(gate[index]) * up[index];
+            }
+            hidden = add_vectors(hidden, projection_batch8(prefix + "ffn_down.weight", gate));
+            result.ffn_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - ffn_started).count();
+        }
+        const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
+                                           kEmbedding, epsilon_);
+        const auto output_started = std::chrono::steady_clock::now();
+        const auto logits = projection_batch8("output.weight", final_hidden);
+        result.output_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - output_started).count();
+        for (std::size_t batch = 0; batch < tokens.size(); ++batch) {
+            const float *begin = logits.data() + batch * vocabulary_size_;
+            const float *best = std::max_element(begin, begin + vocabulary_size_);
+            result.next_tokens[batch] = static_cast<std::uint32_t>(best - begin);
+            result.top_logits[batch] = *best;
+        }
+        active_tokens_ += tokens.size();
+        result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return result;
+    }
+
 private:
     struct RecurrentState {
         std::vector<float> matrix;
         // Three previous q/k/v vectors, stored channel-major.
         std::vector<float> convolution;
+        void *device_matrix = nullptr;
+        bool host_matrix_current = true;
+        bool device_matrix_current = true;
     };
 
     struct AttentionCache {
@@ -619,6 +751,22 @@ private:
         std::vector<std::uint16_t> keys;
         std::vector<std::uint16_t> values;
     };
+
+    void prepare_batch_recurrent_states() {
+        for (auto &state : recurrent_) {
+            if (!state.device_matrix_current) {
+                qwen_native::upload_gated_delta_state(state.device_matrix, state.matrix.data());
+                state.device_matrix_current = true;
+            }
+        }
+    }
+
+    static void prepare_host_recurrent_state(RecurrentState &state) {
+        if (!state.host_matrix_current) {
+            qwen_native::download_gated_delta_state(state.device_matrix, state.matrix.data());
+            state.host_matrix_current = true;
+        }
+    }
 
     const qwen_native::TensorInfo &tensor(const std::string &name) const {
         return require_tensor(model_, name);
@@ -662,12 +810,29 @@ private:
             throw std::runtime_error("K-quant projection shape/type does not match activation: " + name);
         }
         std::vector<float> output(static_cast<std::size_t>(item.dimensions[1]));
-        const bool keep_resident = name == "output.weight" ||
+        const bool keep_resident = allow_dynamic_target_cache_ && (name == "output.weight" ||
             (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
-                                   name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0 ||
-                                   name.compare(name.size() - 15, 15, ".ssm_out.weight") == 0));
+                                   name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
         qwen_native::execute_k_matvec_cached(tensor_data(mapping_, model_, item), item.type,
                                              input.data(), input.size(), output.data(), output.size(), keep_resident);
+        return output;
+    }
+
+    std::vector<float> projection_batch8(const std::string &name, const std::vector<float> &input) const {
+        constexpr std::size_t batch_size = 8;
+        const auto &item = tensor(name);
+        if (item.dimensions.size() != 2 || input.size() != batch_size * item.dimensions[0] ||
+            (item.type != 12 && item.type != 13 && item.type != 14)) {
+            throw std::runtime_error("batch K-quant projection shape/type does not match activation: " + name);
+        }
+        const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
+        std::vector<float> output(batch_size * outputs);
+        const bool keep_resident = allow_dynamic_target_cache_ && (name == "output.weight" ||
+            (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
+                                   name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
+        qwen_native::execute_k_matvec_cached_batch8(
+            tensor_data(mapping_, model_, item), item.type, input.data(),
+            static_cast<std::size_t>(item.dimensions[0]), output.data(), outputs, keep_resident);
         return output;
     }
 
@@ -690,6 +855,15 @@ private:
                                   kEmbedding);
     }
 
+    std::vector<float> embeddings_batch8(const std::array<std::uint32_t, 8> &tokens) const {
+        std::vector<float> output(tokens.size() * kEmbedding);
+        for (std::size_t batch = 0; batch < tokens.size(); ++batch) {
+            const auto row = embedding(tokens[batch]);
+            std::copy(row.begin(), row.end(), output.begin() + batch * kEmbedding);
+        }
+        return output;
+    }
+
     static float softplus(float value) {
         // Avoid overflow while preserving the values that affect the decay.
         return value > 20.0F ? value : std::log1p(std::exp(value));
@@ -703,11 +877,11 @@ private:
         return bits;
     }
 
-    void apply_rope(std::vector<float> &values, std::size_t heads) const {
+    void apply_rope(std::vector<float> &values, std::size_t heads, std::size_t position) const {
         constexpr std::size_t rotated = 64;
         constexpr std::size_t pairs = rotated / 2;
         const float theta_scale = std::pow(rope_frequency_base_, -2.0F / static_cast<float>(rotated));
-        float theta = static_cast<float>(active_tokens_);
+        float theta = static_cast<float>(position);
         std::array<float, pairs> cosine{};
         std::array<float, pairs> sine{};
         for (std::size_t pair = 0; pair < pairs; ++pair) {
@@ -726,10 +900,11 @@ private:
         }
     }
 
-    std::vector<float> recurrent_layer(const std::string &prefix, const std::vector<float> &input,
-                                       RecurrentState &state) const {
-        const auto qkv = projection(prefix + "attn_qkv.weight", input);
-        const auto z = projection(prefix + "attn_gate.weight", input);
+    std::vector<float> recurrent_layer_from_projected(const std::string &prefix,
+                                                      const std::vector<float> &input,
+                                                      const std::vector<float> &qkv,
+                                                      const std::vector<float> &z,
+                                                      RecurrentState &state) const {
         const auto beta_unscaled = f32_projection(prefix + "ssm_beta.weight", input);
         const auto alpha = f32_projection(prefix + "ssm_alpha.weight", input);
         const auto *conv_weights = f32_vector(prefix + "ssm_conv1d.weight", 4 * qkv.size());
@@ -797,14 +972,96 @@ private:
         for (std::size_t index = 0; index < normalized.size(); ++index) {
             normalized[index] *= silu(z[index]);
         }
+        state.host_matrix_current = true;
+        state.device_matrix_current = false;
         return projection(prefix + "ssm_out.weight", normalized);
     }
 
-    std::vector<float> full_attention_layer(const std::string &prefix, const std::vector<float> &input,
-                                            AttentionCache &cache) const {
-        const auto q_and_gate = projection(prefix + "attn_q.weight", input);
-        auto keys = projection(prefix + "attn_k.weight", input);
-        const auto values = projection(prefix + "attn_v.weight", input);
+    std::vector<float> recurrent_layer(const std::string &prefix, const std::vector<float> &input,
+                                       RecurrentState &state) const {
+        prepare_host_recurrent_state(state);
+        const auto qkv = projection(prefix + "attn_qkv.weight", input);
+        const auto z = projection(prefix + "attn_gate.weight", input);
+        return recurrent_layer_from_projected(prefix, input, qkv, z, state);
+    }
+
+    std::vector<float> recurrent_layer_batch8(const std::string &prefix, const std::vector<float> &input,
+                                               RecurrentState &state) const {
+        constexpr std::size_t batch_size = 8;
+        const auto qkv = projection_batch8(prefix + "attn_qkv.weight", input);
+        const auto z = projection_batch8(prefix + "attn_gate.weight", input);
+        constexpr std::size_t qkv_width = 2 * kRecurrentKeyHeads * kRecurrentHeadSize +
+                                          kRecurrentValueHeads * kRecurrentHeadSize;
+        constexpr std::size_t recurrent_width = kRecurrentValueHeads * kRecurrentHeadSize;
+        const auto *conv_weights = f32_vector(prefix + "ssm_conv1d.weight", 4 * qkv_width);
+        const auto *dt_bias = f32_vector(prefix + "ssm_dt.bias", kRecurrentValueHeads);
+        const auto *a = f32_vector(prefix + "ssm_a", kRecurrentValueHeads);
+        std::vector<float> normalized_batch(batch_size * recurrent_width);
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            const std::vector<float> input_row(input.begin() + batch * kEmbedding,
+                                               input.begin() + (batch + 1) * kEmbedding);
+            const std::vector<float> qkv_row(qkv.begin() + batch * qkv_width,
+                                             qkv.begin() + (batch + 1) * qkv_width);
+            const std::vector<float> z_row(z.begin() + batch * kRecurrentValueHeads * kRecurrentHeadSize,
+                                           z.begin() + (batch + 1) * kRecurrentValueHeads * kRecurrentHeadSize);
+            const auto beta_unscaled = f32_projection(prefix + "ssm_beta.weight", input_row);
+            const auto alpha = f32_projection(prefix + "ssm_alpha.weight", input_row);
+            std::vector<float> convolved(qkv_width);
+            for (std::size_t channel = 0; channel < qkv_width; ++channel) {
+                float sum = qkv_row[channel] * conv_weights[channel * 4 + 3];
+                for (std::size_t tap = 0; tap < 3; ++tap) {
+                    sum = std::fma(state.convolution[channel * 3 + tap],
+                                   conv_weights[channel * 4 + tap], sum);
+                }
+                convolved[channel] = silu(sum);
+                state.convolution[channel * 3] = state.convolution[channel * 3 + 1];
+                state.convolution[channel * 3 + 1] = state.convolution[channel * 3 + 2];
+                state.convolution[channel * 3 + 2] = qkv_row[channel];
+            }
+            std::vector<float> queries(recurrent_width);
+            std::vector<float> keys(recurrent_width);
+            std::vector<float> values(recurrent_width);
+            for (std::size_t head = 0; head < kRecurrentValueHeads; ++head) {
+                const std::size_t key_head = head % kRecurrentKeyHeads;
+                std::copy_n(convolved.data() + key_head * kRecurrentHeadSize, kRecurrentHeadSize,
+                            queries.data() + head * kRecurrentHeadSize);
+                std::copy_n(convolved.data() + (kRecurrentKeyHeads + key_head) * kRecurrentHeadSize,
+                            kRecurrentHeadSize, keys.data() + head * kRecurrentHeadSize);
+            }
+            std::copy_n(convolved.data() + 2 * kRecurrentKeyHeads * kRecurrentHeadSize,
+                        recurrent_width, values.data());
+            l2_norm_heads(queries, kRecurrentHeadSize, epsilon_);
+            l2_norm_heads(keys, kRecurrentHeadSize, epsilon_);
+            std::array<float, kRecurrentValueHeads> decays{};
+            std::array<float, kRecurrentValueHeads> betas{};
+            for (std::size_t head = 0; head < kRecurrentValueHeads; ++head) {
+                decays[head] = std::exp(softplus(alpha[head] + dt_bias[head]) * a[head]);
+                betas[head] = sigmoid(beta_unscaled[head]);
+            }
+            std::vector<float> recurrent_output(recurrent_width);
+            qwen_native::execute_gated_delta_step(queries.data(), keys.data(), values.data(),
+                                                  decays.data(), betas.data(), state.device_matrix,
+                                                  recurrent_output.data());
+            auto normalized = rms_norm(recurrent_output,
+                                       f32_vector(prefix + "ssm_norm.weight", kRecurrentHeadSize),
+                                       kRecurrentHeadSize, epsilon_);
+            for (std::size_t index = 0; index < normalized.size(); ++index) {
+                normalized[index] *= silu(z_row[index]);
+            }
+            std::copy(normalized.begin(), normalized.end(),
+                      normalized_batch.begin() + batch * recurrent_width);
+        }
+        state.host_matrix_current = false;
+        state.device_matrix_current = true;
+        return projection_batch8(prefix + "ssm_out.weight", normalized_batch);
+    }
+
+    std::vector<float> full_attention_from_projected(const std::string &prefix,
+                                                     const std::vector<float> &q_and_gate,
+                                                     std::vector<float> keys,
+                                                     const std::vector<float> &values,
+                                                     AttentionCache &cache,
+                                                     std::size_t position) const {
         std::vector<float> queries(kAttentionHeads * kAttentionHeadSize);
         for (std::size_t head = 0; head < kAttentionHeads; ++head) {
             std::copy_n(q_and_gate.data() + head * 2 * kAttentionHeadSize, kAttentionHeadSize,
@@ -814,8 +1071,8 @@ private:
                            kAttentionHeadSize, epsilon_);
         keys = rms_norm(keys, f32_vector(prefix + "attn_k_norm.weight", kAttentionHeadSize),
                         kAttentionHeadSize, epsilon_);
-        apply_rope(queries, kAttentionHeads);
-        apply_rope(keys, kAttentionKvHeads);
+        apply_rope(queries, kAttentionHeads, position);
+        apply_rope(keys, kAttentionKvHeads, position);
         for (float value : keys) cache.keys.push_back(float_to_fp16(value));
         for (float value : values) cache.values.push_back(float_to_fp16(value));
 
@@ -857,6 +1114,36 @@ private:
         return projection(prefix + "attn_output.weight", result);
     }
 
+    std::vector<float> full_attention_layer(const std::string &prefix, const std::vector<float> &input,
+                                            AttentionCache &cache) const {
+        const auto q_and_gate = projection(prefix + "attn_q.weight", input);
+        const auto keys = projection(prefix + "attn_k.weight", input);
+        const auto values = projection(prefix + "attn_v.weight", input);
+        return full_attention_from_projected(prefix, q_and_gate, keys, values, cache, active_tokens_);
+    }
+
+    std::vector<float> full_attention_layer_batch8(const std::string &prefix, const std::vector<float> &input,
+                                                   AttentionCache &cache) const {
+        constexpr std::size_t batch_size = 8;
+        const auto q_and_gate = projection_batch8(prefix + "attn_q.weight", input);
+        const auto keys = projection_batch8(prefix + "attn_k.weight", input);
+        const auto values = projection_batch8(prefix + "attn_v.weight", input);
+        std::vector<float> output(batch_size * kEmbedding);
+        constexpr std::size_t q_width = 2 * kAttentionHeads * kAttentionHeadSize;
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            const std::vector<float> q_row(q_and_gate.begin() + batch * q_width,
+                                           q_and_gate.begin() + (batch + 1) * q_width);
+            const std::vector<float> k_row(keys.begin() + batch * kKvWidth,
+                                           keys.begin() + (batch + 1) * kKvWidth);
+            const std::vector<float> v_row(values.begin() + batch * kKvWidth,
+                                           values.begin() + (batch + 1) * kKvWidth);
+            const auto row = full_attention_from_projected(prefix, q_row, k_row, v_row, cache,
+                                                           active_tokens_ + batch);
+            std::copy(row.begin(), row.end(), output.begin() + batch * kEmbedding);
+        }
+        return output;
+    }
+
     qwen_native::GgufFile model_;
     Mapping mapping_;
     std::size_t context_capacity_ = 0;
@@ -864,8 +1151,379 @@ private:
     std::size_t vocabulary_size_ = 0;
     float epsilon_ = 1.0e-6F;
     float rope_frequency_base_ = 1.0e7F;
+    bool allow_dynamic_target_cache_ = true;
     std::vector<RecurrentState> recurrent_;
     std::vector<AttentionCache> attention_;
+    std::array<std::vector<float>, 5> dflash_features_;
+};
+
+// DFlash2's encoder is intentionally a separate native component: it consumes
+// the five target layer-input snapshots and emits the feature that is injected
+// into the draft K/V cache.  It shares the target process' resident HIP cache
+// but never routes execution through llama.cpp or ggml.
+class NativeDflashEncoder {
+public:
+    explicit NativeDflashEncoder(const std::string &path) : model_(path), mapping_(path) {
+        const auto *architecture = model_.find_metadata("general.architecture");
+        if (!architecture || !std::holds_alternative<std::string>(*architecture) ||
+            std::get<std::string>(*architecture) != "dflash") {
+            throw std::runtime_error("native DFlash encoder requires a dflash GGUF model");
+        }
+        const auto &fc = require_tensor(model_, "fc.weight");
+        if (fc.type != 12 || fc.dimensions.size() != 2 || fc.dimensions[0] != 5 * 5120 ||
+            fc.dimensions[1] != 5120) {
+            throw std::runtime_error("DFlash fc.weight is not the expected Q4_K [25600 x 5120] matrix");
+        }
+        const auto &norm = require_tensor(model_, "enc.output_norm.weight");
+        if (norm.type != 0 || norm.dimensions.size() != 1 || norm.dimensions[0] != 5120) {
+            throw std::runtime_error("DFlash encoder output norm is not F32[5120]");
+        }
+    }
+
+    std::vector<float> encode(const std::array<std::vector<float>, 5> &features) const {
+        std::vector<float> fused;
+        fused.reserve(5 * 5120);
+        for (const auto &feature : features) {
+            if (feature.size() != 5120) {
+                throw std::runtime_error("target did not capture all five DFlash layer-input features");
+            }
+            fused.insert(fused.end(), feature.begin(), feature.end());
+        }
+        const auto &fc = require_tensor(model_, "fc.weight");
+        std::vector<float> encoded(5120);
+        qwen_native::execute_k_matvec_cached(
+            tensor_data(mapping_, model_, fc), fc.type, fused.data(), fused.size(), encoded.data(), encoded.size(), true);
+        const auto &norm = require_tensor(model_, "enc.output_norm.weight");
+        return rms_norm(encoded, static_cast<const float *>(tensor_data(mapping_, model_, norm)), 5120, 1.0e-6F);
+    }
+
+    void preload_all_quantized() const {
+        for (const auto &tensor : model_.tensors()) {
+            if (tensor.type == 12 || tensor.type == 13 || tensor.type == 14) {
+                (void) qwen_native::preload_resident_k_matrix(
+                    tensor_data(mapping_, model_, tensor), tensor.type,
+                    static_cast<std::size_t>(tensor.dimensions.at(0)),
+                    static_cast<std::size_t>(tensor.dimensions.at(1)));
+                if (tensor.type == 12) {
+                    qwen_native::preload_n23q4_matrix(
+                        tensor_data(mapping_, model_, tensor),
+                        static_cast<std::size_t>(tensor.dimensions.at(0)),
+                        static_cast<std::size_t>(tensor.dimensions.at(1)));
+                }
+            }
+        }
+    }
+
+    void inject(const std::array<std::vector<float>, 5> &features, std::size_t position) {
+        const auto encoded = encode(features);
+        for (int layer = 0; layer < 5; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            auto keys = projection(prefix + "attn_k.weight", encoded);
+            const auto values = projection(prefix + "attn_v.weight", encoded);
+            keys = rms_norm(keys, f32_vector(prefix + "attn_k_norm.weight", 128), 128, 1.0e-6F);
+            apply_rope(keys, 8, position);
+            append_injected(layer, keys, values);
+        }
+    }
+
+    std::array<std::uint32_t, 7> propose(NativeTargetSession &target, std::uint32_t anchor,
+                                         std::size_t position) const {
+        constexpr std::size_t block = 8;
+        constexpr std::size_t width = 5120;
+        constexpr std::size_t heads = 32;
+        constexpr std::size_t kv_heads = 8;
+        constexpr std::size_t head_size = 128;
+        constexpr std::size_t kv_width = kv_heads * head_size;
+        constexpr std::uint32_t mask = 248070;
+        std::vector<float> hidden(block * width);
+        for (std::size_t item = 0; item < block; ++item) {
+            const auto embedding = target.dflash_token_embedding(item == 0 ? anchor : mask);
+            std::copy(embedding.begin(), embedding.end(), hidden.begin() + item * width);
+        }
+        for (int layer = 0; layer < 5; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", width), width, 1.0e-6F);
+            const auto attention_dynamic = projection_batch8(prefix + "attn_conv_proj.weight", attention_input);
+            attention_input = dynamic_conv(attention_input, attention_dynamic,
+                                           f32_data(prefix + "attn_conv_base", 2 * 2 * width), 0);
+            auto queries = projection_batch8(prefix + "attn_q.weight", attention_input);
+            auto keys = projection_batch8(prefix + "attn_k.weight", attention_input);
+            const auto values = projection_batch8(prefix + "attn_v.weight", attention_input);
+            queries = rms_norm(queries, f32_vector(prefix + "attn_q_norm.weight", head_size), head_size, 1.0e-6F);
+            keys = rms_norm(keys, f32_vector(prefix + "attn_k_norm.weight", head_size), head_size, 1.0e-6F);
+            for (std::size_t item = 0; item < block; ++item) {
+                std::vector<float> q_row(queries.begin() + item * heads * head_size,
+                                         queries.begin() + (item + 1) * heads * head_size);
+                std::vector<float> k_row(keys.begin() + item * kv_width,
+                                         keys.begin() + (item + 1) * kv_width);
+                apply_rope(q_row, heads, position + item);
+                apply_rope(k_row, kv_heads, position + item);
+                std::copy(q_row.begin(), q_row.end(), queries.begin() + item * heads * head_size);
+                std::copy(k_row.begin(), k_row.end(), keys.begin() + item * kv_width);
+            }
+            auto attention = noncausal_attention(layer, queries, keys, values);
+            attention = projection_batch8(prefix + "attn_output.weight", attention);
+            attention = dynamic_conv(attention, attention_dynamic,
+                                     f32_data(prefix + "attn_conv_base", 2 * 2 * width), 1);
+            const auto ffn_input = add_vectors(hidden, attention);
+            auto ffn_hidden = rms_norm(ffn_input, f32_vector(prefix + "ffn_norm.weight", width), width, 1.0e-6F);
+            const auto ffn_dynamic = projection_batch8(prefix + "ffn_conv_proj.weight", ffn_hidden);
+            ffn_hidden = dynamic_conv(ffn_hidden, ffn_dynamic,
+                                      f32_data(prefix + "ffn_conv_base", 2 * 2 * width), 0);
+            auto gate = projection_batch8(prefix + "ffn_gate.weight", ffn_hidden);
+            const auto up = projection_batch8(prefix + "ffn_up.weight", ffn_hidden);
+            for (std::size_t item = 0; item < gate.size(); ++item) {
+                gate[item] = silu(gate[item]) * up[item];
+            }
+            auto ffn_output = projection_batch8(prefix + "ffn_down.weight", gate);
+            ffn_output = dynamic_conv(ffn_output, ffn_dynamic,
+                                      f32_data(prefix + "ffn_conv_base", 2 * 2 * width), 1);
+            hidden = add_vectors(ffn_input, ffn_output);
+        }
+        hidden = rms_norm(hidden, f32_vector("output_norm.weight", 5120), 5120, 1.0e-6F);
+        const auto logits = target.dflash_output_logits_batch8(hidden);
+        const auto selector_hidden = projection_batch8("selector_hidden.weight", hidden);
+        return select(anchor, logits, selector_hidden);
+    }
+
+private:
+    struct InjectedCache {
+        std::vector<std::uint16_t> keys;
+        std::vector<std::uint16_t> values;
+    };
+
+    const qwen_native::TensorInfo &tensor(const std::string &name) const {
+        return require_tensor(model_, name);
+    }
+
+    const float *f32_vector(const std::string &name, std::size_t values) const {
+        const auto &item = tensor(name);
+        if (item.type != 0 || item.dimensions.empty() ||
+            std::accumulate(item.dimensions.begin(), item.dimensions.end(), std::size_t{1},
+                            [](std::size_t left, std::uint64_t right) {
+                                return left * static_cast<std::size_t>(right);
+                            }) != values) {
+            throw std::runtime_error("expected DFlash F32 vector with a different shape: " + name);
+        }
+        return static_cast<const float *>(tensor_data(mapping_, model_, item));
+    }
+
+    const float *f32_data(const std::string &name, std::size_t values) const {
+        return f32_vector(name, values);
+    }
+
+    std::vector<float> projection(const std::string &name, const std::vector<float> &input) const {
+        const auto &item = tensor(name);
+        if (item.dimensions.size() != 2 || item.dimensions[0] != input.size() ||
+            (item.type != 12 && item.type != 13 && item.type != 14)) {
+            throw std::runtime_error("DFlash projection shape/type does not match activation: " + name);
+        }
+        std::vector<float> output(static_cast<std::size_t>(item.dimensions[1]));
+        qwen_native::execute_k_matvec_cached(tensor_data(mapping_, model_, item), item.type,
+                                             input.data(), input.size(), output.data(), output.size(), true);
+        return output;
+    }
+
+    std::vector<float> projection_batch8(const std::string &name, const std::vector<float> &input) const {
+        const auto &item = tensor(name);
+        if (item.dimensions.size() != 2 || input.size() != 8 * item.dimensions[0] ||
+            (item.type != 12 && item.type != 13 && item.type != 14)) {
+            throw std::runtime_error("DFlash batch projection shape/type does not match activation: " + name);
+        }
+        const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
+        std::vector<float> output(8 * outputs);
+        if (item.type == 12) {
+            qwen_native::execute_n23q4_batch8_cached(
+                tensor_data(mapping_, model_, item), input.data(),
+                static_cast<std::size_t>(item.dimensions[0]), outputs, output.data());
+            return output;
+        }
+        qwen_native::execute_k_matvec_cached_batch8(tensor_data(mapping_, model_, item), item.type,
+                                                     input.data(), static_cast<std::size_t>(item.dimensions[0]),
+                                                     output.data(), outputs, true);
+        return output;
+    }
+
+    static void apply_rope(std::vector<float> &values, std::size_t heads, std::size_t position) {
+        constexpr std::size_t rotated = 64;
+        constexpr std::size_t pairs = rotated / 2;
+        const float theta_scale = std::pow(1.0e7F, -2.0F / static_cast<float>(rotated));
+        float theta = static_cast<float>(position);
+        std::array<float, pairs> cosine{};
+        std::array<float, pairs> sine{};
+        for (std::size_t pair = 0; pair < pairs; ++pair) {
+            cosine[pair] = std::cos(theta);
+            sine[pair] = std::sin(theta);
+            theta *= theta_scale;
+        }
+        for (std::size_t head = 0; head < heads; ++head) {
+            float *item = values.data() + head * 128;
+            for (std::size_t pair = 0; pair < pairs; ++pair) {
+                const float left = item[pair];
+                const float right = item[pair + pairs];
+                item[pair] = left * cosine[pair] - right * sine[pair];
+                item[pair + pairs] = left * sine[pair] + right * cosine[pair];
+            }
+        }
+    }
+
+    static std::uint16_t to_fp16(float value) {
+        const __half half = __float2half(value);
+        std::uint16_t bits = 0;
+        std::memcpy(&bits, &half, sizeof(bits));
+        return bits;
+    }
+
+    void append_injected(int layer, const std::vector<float> &keys, const std::vector<float> &values) {
+        auto &cache = injected_.at(layer);
+        constexpr std::size_t kv_width = 8 * 128;
+        constexpr std::size_t window = 2048;
+        if (cache.keys.size() / kv_width == window) {
+            cache.keys.erase(cache.keys.begin(), cache.keys.begin() + kv_width);
+            cache.values.erase(cache.values.begin(), cache.values.begin() + kv_width);
+        }
+        for (const float value : keys) cache.keys.push_back(to_fp16(value));
+        for (const float value : values) cache.values.push_back(to_fp16(value));
+    }
+
+    std::vector<float> dynamic_conv(const std::vector<float> &values, const std::vector<float> &dynamic,
+                                    const float *base, int side) const {
+        constexpr std::size_t block = 8;
+        constexpr std::size_t width = 5120;
+        constexpr std::size_t groups = width / 16;
+        std::vector<float> output(values.size());
+        for (std::size_t item = 0; item < block; ++item) {
+            for (std::size_t channel = 0; channel < width; ++channel) {
+                const std::size_t group = channel / 16;
+                float sum = 0.0F;
+                for (std::size_t tap = 0; tap < 2; ++tap) {
+                    if (item < tap) continue;
+                    const float coefficient = base[channel + width * tap + width * 2 * side]
+                        + dynamic[item * (groups * 4) + group + groups * tap + groups * 2 * side];
+                    sum = std::fma(coefficient, values[(item - tap) * width + channel], sum);
+                }
+                output[item * width + channel] = sum;
+            }
+        }
+        return output;
+    }
+
+    std::vector<float> noncausal_attention(int layer, const std::vector<float> &queries,
+                                            const std::vector<float> &keys,
+                                            const std::vector<float> &values) const {
+        constexpr std::size_t block = 8;
+        constexpr std::size_t heads = 32;
+        constexpr std::size_t kv_heads = 8;
+        constexpr std::size_t head_size = 128;
+        constexpr std::size_t kv_width = kv_heads * head_size;
+        const auto &cache = injected_.at(layer);
+        const std::size_t cached = cache.keys.size() / kv_width;
+        std::vector<float> output(block * heads * head_size);
+        std::vector<float> scores(cached + block);
+        for (std::size_t item = 0; item < block; ++item) {
+            for (std::size_t head = 0; head < heads; ++head) {
+                const std::size_t kv_head = head / (heads / kv_heads);
+                const float *query = queries.data() + (item * heads + head) * head_size;
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (std::size_t source = 0; source < cached + block; ++source) {
+                    const std::uint16_t *key = source < cached
+                        ? cache.keys.data() + source * kv_width + kv_head * head_size
+                        : nullptr;
+                    float dot = 0.0F;
+                    for (std::size_t dim = 0; dim < head_size; ++dim) {
+                        const float value = key ? fp16_to_float(key[dim])
+                            : keys[(source - cached) * kv_width + kv_head * head_size + dim];
+                        dot = std::fma(query[dim], value, dot);
+                    }
+                    scores[source] = dot * 0.08838834764831843F;
+                    maximum = std::max(maximum, scores[source]);
+                }
+                float denominator = 0.0F;
+                for (float &score : scores) {
+                    score = std::exp(score - maximum);
+                    denominator += score;
+                }
+                float *result = output.data() + (item * heads + head) * head_size;
+                for (std::size_t source = 0; source < cached + block; ++source) {
+                    const float probability = scores[source] / denominator;
+                    const std::uint16_t *value = source < cached
+                        ? cache.values.data() + source * kv_width + kv_head * head_size
+                        : nullptr;
+                    for (std::size_t dim = 0; dim < head_size; ++dim) {
+                        const float item_value = value ? fp16_to_float(value[dim])
+                            : values[(source - cached) * kv_width + kv_head * head_size + dim];
+                        result[dim] = std::fma(probability, item_value, result[dim]);
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    std::vector<float> dequantize_selector_row(const std::string &name, std::uint32_t token) const {
+        const auto &item = tensor(name);
+        if (item.type != 12 || item.dimensions.size() != 2 || item.dimensions[0] != 256 ||
+            token >= item.dimensions[1]) {
+            throw std::runtime_error("DFlash selector tensor is not Q4_K[256 x vocab]");
+        }
+        constexpr std::size_t row_bytes = 144;
+        return dequantize_q4k_row(static_cast<const char *>(tensor_data(mapping_, model_, item)) + token * row_bytes, 256);
+    }
+
+    std::array<std::uint32_t, 7> select(std::uint32_t anchor, const std::vector<float> &logits,
+                                        const std::vector<float> &selector_hidden) const {
+        constexpr std::size_t block = 8;
+        constexpr std::size_t top_k = 16;
+        const std::size_t vocabulary = logits.size() / block;
+        std::array<std::array<std::uint32_t, top_k>, 8> candidates{};
+        std::array<std::array<float, top_k>, 8> unary{};
+        std::vector<std::uint32_t> order(vocabulary);
+        std::iota(order.begin(), order.end(), 0U);
+        for (std::size_t pos = 1; pos < block; ++pos) {
+            std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                [&](std::uint32_t left, std::uint32_t right) {
+                    return logits[pos * vocabulary + left] > logits[pos * vocabulary + right];
+                });
+            for (std::size_t item = 0; item < top_k; ++item) {
+                candidates[pos][item] = order[item];
+                unary[pos][item] = logits[pos * vocabulary + order[item]];
+            }
+        }
+        std::array<std::uint32_t, 7> result{};
+        std::array<std::vector<float>, top_k> predecessors{};
+        predecessors[0] = dequantize_selector_row("selector_predecessor.weight", anchor);
+        std::size_t predecessor = 0;
+        for (std::size_t pos = 1; pos < block; ++pos) {
+            std::array<std::vector<float>, top_k> successors{};
+            for (std::size_t current = 0; current < top_k; ++current) {
+                successors[current] = dequantize_selector_row("selector_successor.weight", candidates[pos][current]);
+            }
+            const float *hidden = selector_hidden.data() + pos * 256;
+            std::array<float, top_k> scores{};
+            for (std::size_t current = 0; current < top_k; ++current) {
+                float score = unary[pos][current];
+                const auto &previous = predecessors[predecessor];
+                for (std::size_t rank = 0; rank < 256; ++rank) {
+                    score = std::fma(successors[current][rank], previous[rank] * hidden[rank], score);
+                }
+                scores[current] = score;
+            }
+            predecessor = static_cast<std::size_t>(std::distance(scores.begin(),
+                std::max_element(scores.begin(), scores.end())));
+            result[pos - 1] = candidates[pos][predecessor];
+            if (pos + 1 < block) {
+                for (std::size_t item = 0; item < top_k; ++item) {
+                    predecessors[item] = dequantize_selector_row("selector_predecessor.weight",
+                                                                  candidates[pos][item]);
+                }
+            }
+        }
+        return result;
+    }
+
+    qwen_native::GgufFile model_;
+    Mapping mapping_;
+    std::array<InjectedCache, 5> injected_;
 };
 
 void target_generate(const std::string &path, std::size_t context_capacity,
@@ -898,6 +1556,201 @@ void target_generate(const std::string &path, std::size_t context_capacity,
               << "  generation:       " << std::fixed << std::setprecision(3)
               << static_cast<double>(generated_tokens) / total_seconds << " tok/s\n"
               << "  measured time:    " << total_seconds << " s\n";
+}
+
+void target_verify_batch8(const std::string &path, std::size_t context_capacity,
+                          std::uint32_t first_token, int blocks,
+                          std::size_t resident_weight_budget) {
+    if (blocks <= 0) {
+        throw std::invalid_argument("block count must be positive");
+    }
+    NativeTargetSession session(path, context_capacity, resident_weight_budget);
+    std::array<std::uint32_t, 8> candidate{};
+    candidate[0] = first_token;
+    // A verifier deliberately accepts arbitrary candidate tokens.  These mask
+    // slots mirror DFlash2's block layout and exercise the real state update;
+    // they are not presented as a generation or acceptance-rate measurement.
+    candidate.fill(248070);
+    candidate[0] = first_token;
+    double total_seconds = 0.0;
+    std::cout << "native Qwen3.8 target batch-8 verifier\n"
+              << "  context capacity: " << context_capacity << " tokens\n"
+              << "  runtime:          native TheRock HIP; no llama.cpp/ggml runtime\n";
+    for (int block = 0; block < blocks; ++block) {
+        const auto result = session.step_batch8(candidate);
+        total_seconds += result.seconds;
+        std::cout << "  block " << block + 1 << ": first prediction " << result.next_tokens[0]
+                  << ", " << std::fixed << std::setprecision(3) << result.seconds << " s"
+                  << " (recurrent " << result.recurrent_seconds
+                  << ", attention " << result.attention_seconds
+                  << ", FFN " << result.ffn_seconds
+                  << ", head " << result.output_seconds << ")\n";
+        candidate = result.next_tokens;
+    }
+    const double verified_tokens = static_cast<double>(blocks) * candidate.size();
+    std::cout << "  active context:   " << session.active_tokens() << '/' << session.context_capacity() << "\n"
+              << "  resident weights: " << std::fixed << std::setprecision(2)
+              << static_cast<double>(session.resident_weight_stats().resident_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << '/' << static_cast<double>(session.resident_weight_stats().budget_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB (" << session.resident_weight_stats().matrix_count << " matrices)\n"
+              << "  verifier rate:    " << std::fixed << std::setprecision(3)
+              << verified_tokens / total_seconds << " candidate tok/s\n"
+              << "  measured time:    " << total_seconds << " s\n";
+}
+
+void dflash_encode(const std::string &target_path, const std::string &dflash_path,
+                   std::size_t context_capacity, std::uint32_t token,
+                   std::size_t resident_weight_budget) {
+    constexpr std::size_t target_cache_budget = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    NativeTargetSession target(target_path, context_capacity,
+                               std::min(target_cache_budget, resident_weight_budget));
+    NativeDflashEncoder dflash(dflash_path);
+    const auto target_result = target.step(token);
+    target.set_resident_weight_budget(resident_weight_budget);
+    dflash.preload_all_quantized();
+    target.freeze_target_weight_cache();
+    const auto started = std::chrono::steady_clock::now();
+    const auto injected = dflash.encode(target.dflash_features());
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    double squared = 0.0;
+    for (const float value : injected) {
+        squared += static_cast<double>(value) * value;
+    }
+    const auto stats = target.resident_weight_stats();
+    std::cout << "native DFlash2 feature encoder\n"
+              << "  target token:     " << token << " -> " << target_result.next_token << "\n"
+              << "  extracted inputs: [6, 20, 34, 48, 62] x 5120\n"
+              << "  fused output:     5120 values, RMS " << std::fixed << std::setprecision(6)
+              << std::sqrt(squared / injected.size()) << "\n"
+              << "  encode time:      " << std::setprecision(3) << elapsed << " s\n"
+              << "  resident weights: " << std::setprecision(2)
+              << static_cast<double>(stats.resident_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << '/' << static_cast<double>(stats.budget_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB (" << stats.matrix_count << " matrices)\n";
+}
+
+void dflash_propose(const std::string &target_path, const std::string &dflash_path,
+                    std::size_t context_capacity, std::uint32_t token,
+                    std::size_t resident_weight_budget) {
+    constexpr std::size_t target_cache_budget = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    NativeTargetSession target(target_path, context_capacity,
+                               std::min(target_cache_budget, resident_weight_budget));
+    NativeDflashEncoder dflash(dflash_path);
+    const auto target_result = target.step(token);
+    target.set_resident_weight_budget(resident_weight_budget);
+    dflash.preload_all_quantized();
+    target.freeze_target_weight_cache();
+    const auto started = std::chrono::steady_clock::now();
+    dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+    const auto proposals = dflash.propose(target, target_result.next_token, target.active_tokens());
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    const auto stats = target.resident_weight_stats();
+    std::cout << "native DFlash2 block proposal\n"
+              << "  anchor:           " << target_result.next_token << " (from target input " << token << ")\n"
+              << "  selector path:    ";
+    for (const auto proposed : proposals) {
+        std::cout << proposed << ' ';
+    }
+    std::cout << "\n"
+              << "  block time:       " << std::fixed << std::setprecision(3) << elapsed << " s\n"
+              << "  draft rate:       " << std::setprecision(3) << proposals.size() / elapsed << " proposal tok/s\n"
+              << "  status:           proposal-only; target acceptance is measured separately\n"
+              << "  resident weights: " << std::setprecision(2)
+              << static_cast<double>(stats.resident_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << '/' << static_cast<double>(stats.budget_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB (" << stats.matrix_count << " matrices)\n";
+}
+
+void dflash_verify(const std::string &target_path, const std::string &dflash_path,
+                   std::size_t context_capacity, std::uint32_t token,
+                   std::size_t resident_weight_budget) {
+    constexpr std::size_t target_cache_budget = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    NativeTargetSession target(target_path, context_capacity,
+                               std::min(target_cache_budget, resident_weight_budget));
+    NativeDflashEncoder dflash(dflash_path);
+    const auto initial_started = std::chrono::steady_clock::now();
+    const auto anchor_result = target.step(token);
+    const double initial_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - initial_started).count();
+    target.set_resident_weight_budget(resident_weight_budget);
+    dflash.preload_all_quantized();
+    target.freeze_target_weight_cache();
+    const auto draft_started = std::chrono::steady_clock::now();
+    dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+    const auto proposals = dflash.propose(target, anchor_result.next_token, target.active_tokens());
+    const double draft_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - draft_started).count();
+    std::array<std::uint32_t, 8> candidate{};
+    candidate[0] = anchor_result.next_token;
+    std::copy(proposals.begin(), proposals.end(), candidate.begin() + 1);
+    const auto verification = target.step_batch8(candidate);
+    std::size_t accepted = 0;
+    while (accepted < proposals.size() && verification.next_tokens[accepted] == proposals[accepted]) {
+        ++accepted;
+    }
+    const double total_seconds = initial_seconds + draft_seconds + verification.seconds;
+    const auto stats = target.resident_weight_stats();
+    std::cout << "native DFlash2 -> target verification block\n"
+              << "  anchor:           " << anchor_result.next_token << "\n"
+              << "  proposals:        ";
+    for (const auto proposed : proposals) std::cout << proposed << ' ';
+    std::cout << "\n"
+              << "  accepted prefix:  " << accepted << '/' << proposals.size() << "\n"
+              << "  timing:           initial " << std::fixed << std::setprecision(3) << initial_seconds
+              << " s, draft " << draft_seconds << " s, verifier " << verification.seconds << " s\n"
+              << "  accepted rate:    " << std::setprecision(3) << accepted / total_seconds
+              << " tok/s (one-block cold-start; not steady-state)\n"
+              << "  resident weights: " << std::setprecision(2)
+              << static_cast<double>(stats.resident_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << '/' << static_cast<double>(stats.budget_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB (" << stats.matrix_count << " matrices)\n";
+}
+
+std::vector<std::uint32_t> parse_token_list(const std::string &text) {
+    std::vector<std::uint32_t> tokens;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item.empty()) throw std::invalid_argument("token list contains an empty item");
+        tokens.push_back(static_cast<std::uint32_t>(std::stoul(item)));
+    }
+    if (tokens.empty()) throw std::invalid_argument("token list is empty");
+    return tokens;
+}
+
+void dflash_verify_prompt(const std::string &target_path, const std::string &dflash_path,
+                          std::size_t context_capacity, const std::vector<std::uint32_t> &prompt,
+                          std::size_t resident_weight_budget) {
+    constexpr std::size_t target_cache_budget = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    NativeTargetSession target(target_path, context_capacity,
+                               std::min(target_cache_budget, resident_weight_budget));
+    NativeDflashEncoder dflash(dflash_path);
+    target.set_resident_weight_budget(resident_weight_budget);
+    dflash.preload_all_quantized();
+    target.freeze_target_weight_cache();
+    const auto prefill_started = std::chrono::steady_clock::now();
+    NativeTargetSession::StepResult anchor_result;
+    for (const auto token : prompt) {
+        anchor_result = target.step(token);
+        dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+    }
+    const double prefill_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_started).count();
+    const auto draft_started = std::chrono::steady_clock::now();
+    const auto proposals = dflash.propose(target, anchor_result.next_token, target.active_tokens());
+    const double draft_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - draft_started).count();
+    std::array<std::uint32_t, 8> candidate{};
+    candidate[0] = anchor_result.next_token;
+    std::copy(proposals.begin(), proposals.end(), candidate.begin() + 1);
+    const auto verification = target.step_batch8(candidate);
+    std::size_t accepted = 0;
+    while (accepted < proposals.size() && verification.next_tokens[accepted] == proposals[accepted]) ++accepted;
+    const double steady_block_seconds = draft_seconds + verification.seconds;
+    std::cout << "native DFlash2 prompt verification\n"
+              << "  prompt tokens:    " << prompt.size() << " (DFlash injected per target token)\n"
+              << "  anchor:           " << anchor_result.next_token << "\n"
+              << "  accepted prefix:  " << accepted << '/' << proposals.size() << "\n"
+              << "  prefill time:     " << std::fixed << std::setprecision(3) << prefill_seconds << " s\n"
+              << "  block timing:     draft " << draft_seconds << " s, verifier " << verification.seconds << " s\n"
+              << "  accepted rate:    " << std::setprecision(3) << accepted / steady_block_seconds
+              << " tok/s (post-prefill single block)\n";
 }
 
 void bench_matvec(const std::string &path, const std::string &tensor_name, int iterations) {
@@ -1127,10 +1980,16 @@ void usage(const char *program) {
               << "  " << program << " inspect MODEL.gguf [--tensors]\n"
               << "  " << program << " metadata MODEL.gguf\n"
               << "  " << program << " show-token MODEL.gguf TOKEN_ID\n"
+              << "  " << program << " find-token MODEL.gguf TOKEN\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
               << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
               << "  " << program << " bench-gdn [ITERATIONS]\n"
               << "  " << program << " target-generate TARGET.gguf CONTEXT TOKEN_ID [TOKENS] [RESIDENT_GIB]\n"
+              << "  " << program << " target-verify-batch TARGET.gguf CONTEXT TOKEN_ID [BLOCKS] [RESIDENT_GIB]\n"
+              << "  " << program << " dflash-encode TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
+              << "  " << program << " dflash-propose TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
+              << "  " << program << " dflash-verify TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
+              << "  " << program << " dflash-verify-prompt TARGET.gguf DFLASH.gguf CONTEXT TOKENS_CSV [RESIDENT_GIB]\n"
               << "  " << program << " bench-kv4 [CONTEXT] [ITERATIONS] [PARTITIONS]\n"
               << "  " << program << " plan-128k TARGET.gguf DFLASH.gguf\n";
 }
@@ -1158,6 +2017,10 @@ int main(int argc, char **argv) {
         }
         if (argc == 4 && std::string(argv[1]) == "show-token") {
             show_token(argv[2], static_cast<std::size_t>(std::stoull(argv[3])));
+            return EXIT_SUCCESS;
+        }
+        if (argc == 4 && std::string(argv[1]) == "find-token") {
+            find_token(argv[2], argv[3]);
             return EXIT_SUCCESS;
         }
         if ((argc == 4 || argc == 5) && (std::string(argv[1]) == "bench-matvec" || std::string(argv[1]) == "bench-q4")) {
@@ -1190,6 +2053,59 @@ int main(int argc, char **argv) {
                             argc >= 6 ? std::stoi(argv[5]) : 1,
                             argc == 7 ? static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0)
                                       : default_resident_weight_budget);
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 5 || argc == 6 || argc == 7) && std::string(argv[1]) == "target-verify-batch") {
+            constexpr std::size_t default_resident_weight_budget = 6ULL * 1024ULL * 1024ULL * 1024ULL;
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 6.0;
+            if (requested_gib < 0.0 || requested_gib > 7.5) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7.5]");
+            }
+            target_verify_batch8(argv[2], static_cast<std::size_t>(std::stoull(argv[3])),
+                                 static_cast<std::uint32_t>(std::stoul(argv[4])),
+                                 argc >= 6 ? std::stoi(argv[5]) : 1,
+                                 argc == 7 ? static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0)
+                                           : default_resident_weight_budget);
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 6 || argc == 7) && std::string(argv[1]) == "dflash-encode") {
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 7.3;
+            if (requested_gib < 0.0 || requested_gib > 7.5) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7.5]");
+            }
+            dflash_encode(argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
+                          static_cast<std::uint32_t>(std::stoul(argv[5])),
+                          static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 6 || argc == 7) && std::string(argv[1]) == "dflash-propose") {
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 7.3;
+            if (requested_gib < 0.0 || requested_gib > 7.5) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7.5]");
+            }
+            dflash_propose(argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
+                           static_cast<std::uint32_t>(std::stoul(argv[5])),
+                           static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 6 || argc == 7) && std::string(argv[1]) == "dflash-verify") {
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 7.3;
+            if (requested_gib < 0.0 || requested_gib > 7.5) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7.5]");
+            }
+            dflash_verify(argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
+                          static_cast<std::uint32_t>(std::stoul(argv[5])),
+                          static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 6 || argc == 7) && std::string(argv[1]) == "dflash-verify-prompt") {
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 7.3;
+            if (requested_gib < 0.0 || requested_gib > 7.5) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7.5]");
+            }
+            dflash_verify_prompt(argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
+                                 parse_token_list(argv[5]),
+                                 static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
             return EXIT_SUCCESS;
         }
         if (argc >= 2 && argc <= 5 && std::string(argv[1]) == "bench-kv4") {

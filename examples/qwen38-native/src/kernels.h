@@ -73,5 +73,30 @@ void execute_k_matvec_cached(const void *weights, std::uint32_t weight_type,
 void execute_k_matvec_batch8(const void *weights, std::uint32_t weight_type,
                              const float *input, std::size_t input_size,
                              float *output, std::size_t output_size);
+// Shares the scalar executor's resident-weight cache.  The native verifier
+// therefore streams a cold matrix once per 8-token block, not once per token.
+void execute_k_matvec_cached_batch8(const void *weights, std::uint32_t weight_type,
+                                    const float *input, std::size_t input_size,
+                                    float *output, std::size_t output_size,
+                                    bool keep_resident);
+
+// Persistent FP16 gated-delta state for the 48 x 128 x 128 recurrent target
+// heads.  The scalar reference keeps an FP32 mirror; the batched verifier uses
+// this device state to avoid running hundreds of millions of recurrence FLOPs
+// on the CPU for every proposed block.
+void *create_gated_delta_state();
+void destroy_gated_delta_state(void *state);
+void upload_gated_delta_state(void *state, const float *host_state);
+void download_gated_delta_state(const void *state, float *host_state);
+void execute_gated_delta_step(const float *queries, const float *keys,
+                              const float *values, const float *decays,
+                              const float *betas, void *state, float *output);
+// N23Q4 is the draft-only, verification-safe RDNA2 layout: DFlash proposals
+// may be approximate because the target batch verifier accepts or rejects
+// every token.  Its Q8 activations unlock the gfx1032 DP4A path.
+void preload_n23q4_matrix(const void *weights, std::size_t input_size, std::size_t output_size);
+void execute_n23q4_batch8_cached(const void *weights, const float *input,
+                                  std::size_t input_size, std::size_t output_size,
+                                  float *output);
 
 } // namespace qwen_native

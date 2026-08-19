@@ -19,15 +19,23 @@ build/qwen38-native bench-matvec ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 build/qwen38-native bench-ffn ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
 build/qwen38-native bench-gdn
 build/qwen38-native show-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
+build/qwen38-native find-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf Hello
 build/qwen38-native target-generate ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 131072 0 6
+build/qwen38-native target-verify-batch ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 131072 0 3 6
+build/qwen38-native dflash-propose ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
+    ~/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf 131072 0 7.3
 ```
 
 `target-generate` intentionally accepts raw token IDs while the model executor
 is validated. `CONTEXT` is the enabled capacity and the command reports active
 cache entries separately. The optional final argument is the resident target
 weight cache in GiB (default `6`, `0` disables it). It is not a text/chat CLI
-yet, and DFlash2 proposal/acceptance scheduling is not yet connected to this
-reference decoder. The default 6 GiB weight mode and a 2.25 GiB device N23KV4
+yet. DFlash2 now has native feature capture, encoder injection, five-layer
+non-causal block decoding, selector-lattice greedy proposals, and a native
+batch-8 target verifier. `dflash-verify` and `dflash-verify-prompt` report an
+accepted prefix rather than inflating the draft rate into generated tok/s; the
+continuous accept/rollback scheduler is still being completed. The default 6
+GiB weight mode and a 2.25 GiB device N23KV4
 128K cache cannot coexist on an 8 GiB RX 6650 XT; this reference decoder keeps
 its growing FP16 cache in host memory for that reason. The N23KV4 device cache
 is validated by its own benchmark below, but has not yet been wired into this
@@ -53,10 +61,10 @@ the result: N23Q4 runs the 50.1 MB FFN projection in 0.520 ms instead of 0.992
 ms for direct Q4_K (1.91x), and the smaller projection in 0.171 ms instead of
 0.226 ms. The batch-8 output delta is about 0.45% relative RMSE.
 
-The model executor will therefore dispatch single-token large FFNs directly
-from Q4_K, use N23Q4 for smaller single-token projections, and use N23Q4 for
-the eight-token DFlash verification path. Thresholds will be retuned using
-whole-layer benchmarks.
+The target verifier stays on the original quantized target weights. N23Q4 is
+used only in the DFlash draft path, where target verification makes its small
+activation-quantization delta safe: a proposal is never accepted merely
+because the draft produced it.
 
 ## Target execution primitives
 
@@ -82,11 +90,10 @@ DP4A gate/up projections, SiLU multiplication, and the native Q6_K down
 projection. Its N23Q4 repack happens once when a verifier tensor is admitted
 to the GPU weight cache, never once per proposed block.
 
-The 48 recurrent target layers use a fused gated-delta state update. The
-`bench-gdn` command drives the exact 48 x 128 x 128 FP16-state topology and
-checks it against a CPU recurrence with identical FP16 state rounding. It
-measures 0.153 ms per recurrent layer on this device with maximum error
-`3.96e-6`.
+The 48 recurrent target layers use a fused gated-delta state update for the
+batch verifier. `bench-gdn` drives the 48 x 128 x 128 FP16-state topology; on
+this device it measures about 0.034 ms per recurrent layer. Its FP16 state is
+an optimization path and remains subject to end-to-end oracle validation.
 
 `target-generate` is the semantic target checkpoint. Each step fetches the
 real Q4_K embedding, executes all 64 live layers, updates all 48 gated-delta
@@ -98,6 +105,12 @@ fit; remaining target matrices stream through HIP. On this machine, a six-step
 `1.0 tok/s`). That is an end-to-end target number, not a component benchmark.
 It is bounded mainly by streaming the target's remaining weights over PCIe and
 does not meet a 10 tok/s target.
+
+`target-verify-batch` is an end-to-end, stateful target execution over eight
+candidate tokens: recurrent state advances in order, while each target matrix
+is transferred once per block. A recent warm run measures about 4.9 candidate
+tok/s. That is not a generated-tok/s claim; generation speed additionally
+depends on DFlash acceptance and rollback correctness.
 
 For 128K context, the target has only 16 full-attention layers; its other 48
 layers use fixed-size recurrent state. The `N23KV4` cache format stores the

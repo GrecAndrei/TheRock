@@ -199,6 +199,26 @@ ResidentWeightCache &resident_weight_cache() {
     return cache;
 }
 
+struct N23DraftCache {
+    struct Entry {
+        void *device = nullptr;
+        std::size_t input_size = 0;
+        std::size_t output_size = 0;
+    };
+    ~N23DraftCache() {
+        for (const auto &[host, entry] : entries) {
+            (void) host;
+            if (entry.device) (void) hipFree(entry.device);
+        }
+    }
+    std::unordered_map<const void *, Entry> entries;
+};
+
+N23DraftCache &n23_draft_cache() {
+    static N23DraftCache cache;
+    return cache;
+}
+
 __device__ __forceinline__ void scale_min(const std::uint8_t *packed, int index,
                                            std::uint8_t &scale, std::uint8_t &minimum) {
     if (index < 4) {
@@ -592,16 +612,16 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
     const int thread = static_cast<int>(threadIdx.x);
     const std::size_t vector_offset = static_cast<std::size_t>(head) * head_size;
     const std::size_t state_offset = vector_offset * head_size;
-    __shared__ float state_key[128];
     __shared__ float delta[128];
     if (thread < head_size) {
-        float sum = 0.0F;
-        for (int column = 0; column < head_size; ++column) {
-            sum = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(thread) * head_size + column]),
-                       keys[vector_offset + column], sum);
+        // State is [key, value].  Match the target reference exactly:
+        // predicted[value] = sum_key state[key, value] * key[key].
+        float predicted = 0.0F;
+        for (int row = 0; row < head_size; ++row) {
+            predicted = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+                             keys[vector_offset + row], predicted);
         }
-        state_key[thread] = sum;
-        delta[thread] = (values[vector_offset + thread] - sum) * betas[head];
+        delta[thread] = (values[vector_offset + thread] - predicted) * betas[head];
     }
     __syncthreads();
 
@@ -610,18 +630,18 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
         const int row = element / head_size;
         const int column = element % head_size;
         const float updated = decay * __half2float(states[state_offset + element])
-                            + delta[row] * keys[vector_offset + column];
+                            + keys[vector_offset + row] * delta[column];
         states[state_offset + element] = __float2half(updated);
     }
     __syncthreads();
 
     if (thread < head_size) {
         float sum = 0.0F;
-        for (int column = 0; column < head_size; ++column) {
-            sum = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(thread) * head_size + column]),
-                       queries[vector_offset + column], sum);
+        for (int row = 0; row < head_size; ++row) {
+            sum = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+                       queries[vector_offset + row], sum);
         }
-        output[vector_offset + thread] = sum;
+        output[vector_offset + thread] = sum * 0.08838834764831843F;
     }
 }
 
@@ -1725,6 +1745,215 @@ void execute_k_matvec_batch8(const void *weights, std::uint32_t weight_type,
                            input_size, output_size);
     hip_check(hipGetLastError(), "native batch8 matvec launch");
     hip_check(hipMemcpy(output, workspace.output, batch_size * output_size * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy native batch8 matvec output");
+}
+
+void execute_k_matvec_cached_batch8(const void *weights, std::uint32_t weight_type,
+                                    const float *input, std::size_t input_size,
+                                    float *output, std::size_t output_size,
+                                    bool keep_resident) {
+    constexpr std::size_t batch_size = 8;
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &workspace = matvec_workspace();
+    const void *device_weights = resident_weight_cache().find_or_add(weights, weight_bytes, keep_resident);
+    if (!device_weights) {
+        workspace.reserve_weights(weight_bytes);
+        hip_check(hipMemcpy(workspace.weights, weights, weight_bytes, hipMemcpyHostToDevice),
+                  "hipMemcpy native cached batch8 matvec weights");
+        device_weights = workspace.weights;
+    }
+    workspace.reserve_input(batch_size * input_size);
+    workspace.reserve_output(batch_size * output_size);
+    hip_check(hipMemcpy(workspace.input, input, batch_size * input_size * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy native cached batch8 matvec input");
+    launch_k_matvec_batch8(weight_type, device_weights, workspace.input, workspace.output,
+                           input_size, output_size);
+    hip_check(hipGetLastError(), "native cached batch8 matvec launch");
+    hip_check(hipMemcpy(output, workspace.output, batch_size * output_size * sizeof(float), hipMemcpyDeviceToHost),
+              "hipMemcpy native cached batch8 matvec output");
+}
+
+void *create_gated_delta_state() {
+    constexpr std::size_t state_values = 48ULL * 128ULL * 128ULL;
+    void *state = nullptr;
+    hip_check(hipMalloc(&state, state_values * sizeof(__half)), "hipMalloc gated-delta state");
+    hip_check(hipMemset(state, 0, state_values * sizeof(__half)), "hipMemset gated-delta state");
+    return state;
+}
+
+void destroy_gated_delta_state(void *state) {
+    if (state) {
+        (void) hipFree(state);
+    }
+}
+
+void upload_gated_delta_state(void *state, const float *host_state) {
+    if (!state || !host_state) {
+        throw std::invalid_argument("gated-delta upload requires state and host data");
+    }
+    constexpr std::size_t state_values = 48ULL * 128ULL * 128ULL;
+    std::vector<__half> packed(state_values);
+    for (std::size_t index = 0; index < state_values; ++index) {
+        packed[index] = __float2half(host_state[index]);
+    }
+    hip_check(hipMemcpy(state, packed.data(), packed.size() * sizeof(__half), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta state upload");
+}
+
+void download_gated_delta_state(const void *state, float *host_state) {
+    if (!state || !host_state) {
+        throw std::invalid_argument("gated-delta download requires state and host data");
+    }
+    constexpr std::size_t state_values = 48ULL * 128ULL * 128ULL;
+    std::vector<__half> packed(state_values);
+    hip_check(hipMemcpy(packed.data(), state, packed.size() * sizeof(__half), hipMemcpyDeviceToHost),
+              "hipMemcpy gated-delta state download");
+    for (std::size_t index = 0; index < state_values; ++index) {
+        host_state[index] = __half2float(packed[index]);
+    }
+}
+
+void execute_gated_delta_step(const float *queries, const float *keys,
+                              const float *values, const float *decays,
+                              const float *betas, void *state, float *output) {
+    if (!queries || !keys || !values || !decays || !betas || !state || !output) {
+        throw std::invalid_argument("gated-delta step requires non-null buffers");
+    }
+    constexpr std::size_t vector_values = 48ULL * 128ULL;
+    struct Workspace {
+        float *queries = nullptr;
+        float *keys = nullptr;
+        float *values = nullptr;
+        float *decays = nullptr;
+        float *betas = nullptr;
+        float *output = nullptr;
+        ~Workspace() {
+            if (output) (void) hipFree(output);
+            if (betas) (void) hipFree(betas);
+            if (decays) (void) hipFree(decays);
+            if (values) (void) hipFree(values);
+            if (keys) (void) hipFree(keys);
+            if (queries) (void) hipFree(queries);
+        }
+    };
+    static Workspace workspace;
+    if (!workspace.queries) {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.queries), vector_values * sizeof(float)),
+                  "hipMalloc gated-delta queries");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.keys), vector_values * sizeof(float)),
+                  "hipMalloc gated-delta keys");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.values), vector_values * sizeof(float)),
+                  "hipMalloc gated-delta values");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.decays), 48 * sizeof(float)),
+                  "hipMalloc gated-delta decays");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.betas), 48 * sizeof(float)),
+                  "hipMalloc gated-delta betas");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.output), vector_values * sizeof(float)),
+                  "hipMalloc gated-delta output");
+    }
+    hip_check(hipMemcpy(workspace.queries, queries, vector_values * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta queries");
+    hip_check(hipMemcpy(workspace.keys, keys, vector_values * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta keys");
+    hip_check(hipMemcpy(workspace.values, values, vector_values * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta values");
+    hip_check(hipMemcpy(workspace.decays, decays, 48 * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta decays");
+    hip_check(hipMemcpy(workspace.betas, betas, 48 * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta betas");
+    hipLaunchKernelGGL(gated_delta_step_kernel, dim3(48), dim3(256), 0, nullptr,
+                       workspace.queries, workspace.keys, workspace.values,
+                       workspace.decays, workspace.betas, static_cast<__half *>(state),
+                       workspace.output, 128);
+    hip_check(hipGetLastError(), "gated-delta step launch");
+    hip_check(hipMemcpy(output, workspace.output, vector_values * sizeof(float), hipMemcpyDeviceToHost),
+              "hipMemcpy gated-delta output");
+}
+
+void preload_n23q4_matrix(const void *weights, std::size_t input_size, std::size_t output_size) {
+    if (!weights || input_size == 0 || input_size % kQuantBlock != 0 || output_size == 0) {
+        throw std::invalid_argument("invalid N23Q4 preload matrix");
+    }
+    auto &cache = n23_draft_cache();
+    const auto found = cache.entries.find(weights);
+    if (found != cache.entries.end()) {
+        if (found->second.input_size != input_size || found->second.output_size != output_size) {
+            throw std::runtime_error("N23Q4 cache matrix dimensions are inconsistent");
+        }
+        return;
+    }
+    const auto packed = convert_to_n23q4(static_cast<const Q4KBlock *>(weights), input_size, output_size);
+    void *device = nullptr;
+    hip_check(hipMalloc(&device, packed.size() * sizeof(N23Q4TileGroup)), "hipMalloc N23Q4 draft matrix");
+    try {
+        hip_check(hipMemcpy(device, packed.data(), packed.size() * sizeof(N23Q4TileGroup), hipMemcpyHostToDevice),
+                  "hipMemcpy N23Q4 draft matrix");
+        cache.entries.emplace(weights, N23DraftCache::Entry{device, input_size, output_size});
+    } catch (...) {
+        (void) hipFree(device);
+        throw;
+    }
+}
+
+void execute_n23q4_batch8_cached(const void *weights, const float *input,
+                                  std::size_t input_size, std::size_t output_size,
+                                  float *output) {
+    constexpr std::size_t batch_size = 8;
+    if (!weights || !input || !output) {
+        throw std::invalid_argument("N23Q4 batch execution requires non-null buffers");
+    }
+    preload_n23q4_matrix(weights, input_size, output_size);
+    const auto &entry = n23_draft_cache().entries.at(weights);
+    struct Workspace {
+        float *input = nullptr;
+        std::int8_t *quantized = nullptr;
+        float *scales = nullptr;
+        int *sums = nullptr;
+        float *output = nullptr;
+        std::size_t input_values = 0;
+        std::size_t output_values = 0;
+        ~Workspace() {
+            if (output) (void) hipFree(output);
+            if (sums) (void) hipFree(sums);
+            if (scales) (void) hipFree(scales);
+            if (quantized) (void) hipFree(quantized);
+            if (input) (void) hipFree(input);
+        }
+        void reserve(std::size_t inputs, std::size_t outputs) {
+            if (inputs > input_values) {
+                if (output) (void) hipFree(output);
+                if (sums) (void) hipFree(sums);
+                if (scales) (void) hipFree(scales);
+                if (quantized) (void) hipFree(quantized);
+                if (input) (void) hipFree(input);
+                input = nullptr; quantized = nullptr; scales = nullptr; sums = nullptr; output = nullptr;
+                input_values = 0; output_values = 0;
+                hip_check(hipMalloc(reinterpret_cast<void **>(&input), inputs * sizeof(float)), "hipMalloc N23Q4 draft input");
+                hip_check(hipMalloc(reinterpret_cast<void **>(&quantized), inputs), "hipMalloc N23Q4 draft q8 input");
+                hip_check(hipMalloc(reinterpret_cast<void **>(&scales), (inputs / 32) * sizeof(float)), "hipMalloc N23Q4 draft scales");
+                hip_check(hipMalloc(reinterpret_cast<void **>(&sums), (inputs / 32) * sizeof(int)), "hipMalloc N23Q4 draft sums");
+                input_values = inputs;
+            }
+            if (outputs > output_values) {
+                if (output) (void) hipFree(output);
+                output = nullptr;
+                hip_check(hipMalloc(reinterpret_cast<void **>(&output), outputs * sizeof(float)), "hipMalloc N23Q4 draft output");
+                output_values = outputs;
+            }
+        }
+    };
+    static Workspace workspace;
+    workspace.reserve(batch_size * input_size, batch_size * output_size);
+    hip_check(hipMemcpy(workspace.input, input, batch_size * input_size * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy N23Q4 draft input");
+    const std::size_t groups = batch_size * input_size / 32;
+    hipLaunchKernelGGL(quantize_q8_groups_kernel, dim3(static_cast<unsigned int>(groups)), dim3(kWarpSize), 0, nullptr,
+                       workspace.input, workspace.quantized, workspace.scales, workspace.sums,
+                       static_cast<int>(input_size / 32));
+    launch_n23q4_matvec_batch8(static_cast<const N23Q4TileGroup *>(entry.device), workspace.quantized,
+                               workspace.scales, workspace.sums, workspace.output, input_size, output_size);
+    hip_check(hipGetLastError(), "N23Q4 draft batch launch");
+    hip_check(hipMemcpy(output, workspace.output, batch_size * output_size * sizeof(float), hipMemcpyDeviceToHost),
+              "hipMemcpy N23Q4 draft output");
 }
 
 FfnBenchmarkResult benchmark_ffn_batch8(const void *gate_weights, std::uint32_t gate_type,
