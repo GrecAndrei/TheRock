@@ -1610,6 +1610,23 @@ void execute_k_matvec(const void *weights, std::uint32_t weight_type,
     hip_check(hipMemcpy(output, workspace.output, output_size * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy native matvec output");
 }
 
+void execute_k_matvec_batch8(const void *weights, std::uint32_t weight_type,
+                             const float *input, std::size_t input_size,
+                             float *output, std::size_t output_size) {
+    constexpr std::size_t batch_size = 8;
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &workspace = matvec_workspace();
+    workspace.reserve_weights(weight_bytes);
+    workspace.reserve_input(batch_size * input_size);
+    workspace.reserve_output(batch_size * output_size);
+    hip_check(hipMemcpy(workspace.weights, weights, weight_bytes, hipMemcpyHostToDevice), "hipMemcpy native batch8 matvec weights");
+    hip_check(hipMemcpy(workspace.input, input, batch_size * input_size * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy native batch8 matvec input");
+    launch_k_matvec_batch8(weight_type, workspace.weights, workspace.input, workspace.output,
+                           input_size, output_size);
+    hip_check(hipGetLastError(), "native batch8 matvec launch");
+    hip_check(hipMemcpy(output, workspace.output, batch_size * output_size * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy native batch8 matvec output");
+}
+
 FfnBenchmarkResult benchmark_ffn_batch8(const void *gate_weights, std::uint32_t gate_type,
                                          const void *up_weights, std::uint32_t up_type,
                                          const void *down_weights, std::uint32_t down_type,
