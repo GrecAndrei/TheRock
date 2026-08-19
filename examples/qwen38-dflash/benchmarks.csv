@@ -1,0 +1,12 @@
+date,kind,target,draft,target_ngl,draft_ngl,threads,draft_max,generated,drafted,accepted,acceptance_pct,tokens_per_second,notes
+2026-08-19,end_to_end,Q4_K_M,Q4_K_M,20,99,16,7,132,192,104,54.167,7.927,"best clean run; Baloo stopped"
+2026-08-19,end_to_end,Q4_K_M,Q4_K_M,20,99,16,7,132,192,104,54.167,7.550,"prior stable baseline"
+2026-08-19,end_to_end,Q4_K_M,Q4_K_M,22,3,16,7,,,,,7.500,"draft mostly on CPU"
+2026-08-19,end_to_end,Q4_K_M,Q4_K_M,25,0,16,7,,,,,7.350,"draft on CPU"
+2026-08-19,end_to_end,Q3_K_S,Q4_K_M,28,99,15,7,129,211,98,46.445,6.289,"smaller target reduced acceptance"
+2026-08-19,end_to_end,UD-IQ2_XXS,Q4_K_M,38,99,16,7,,,,49.000,5.780,"RDNA2 low-bit kernels"
+2026-08-19,end_to_end,Q4_K_M,Q4_K_M,18,99,15,15,68,167,56,33.533,5.320,"experimental oversized block; rejected"
+2026-08-19,end_to_end,Q4_K_M,Q3_K_S_requant,22,99,15,7,132,206,102,49.515,5.041,"requantized draft; rejected"
+2026-08-19,target_pp8,Q4_K_M,,20,,15,7,,,,,15.350,"target-only verifier microbenchmark"
+2026-08-19,target_pp8,Q3_K_S,,40,,15,7,,,,,19.470,"target-only; did not translate to end-to-end speed"
+2026-08-19,target_pp8,UD-Q2_K_XL,,48,,15,7,,,,,13.140,"target-only; rejected"
