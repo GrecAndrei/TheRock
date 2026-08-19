@@ -5,16 +5,20 @@ standalone executable built with TheRock's HIP SDK. It does not link to or call
 llama.cpp, ggml, or another inference runtime.
 
 The implementation is being brought up in independently testable layers. It
-currently validates the TheRock runtime, parses GGUF v3 directly, and runs two
-validated quantized matrix-vector kernels against tensors mapped from the real
-16 GB target model.
+validates the TheRock runtime, parses GGUF v3 directly, maps real target
+tensors, and runs the hot native execution components without linking an
+inference runtime. The remaining work is model orchestration (tokenization,
+all target blocks, DFlash2 scheduling, and sampling), not a missing GEMV or
+recurrent-state primitive.
 
 ```bash
 ./build.sh
 build/qwen38-native device
 build/qwen38-native inspect ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf
-build/qwen38-native bench-q4 ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
+build/qwen38-native bench-matvec ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
     blk.0.ffn_gate.weight 100
+build/qwen38-native bench-ffn ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
+build/qwen38-native bench-gdn
 ```
 
 ## N23Q4
@@ -41,6 +45,36 @@ The model executor will therefore dispatch single-token large FFNs directly
 from Q4_K, use N23Q4 for smaller single-token projections, and use N23Q4 for
 the eight-token DFlash verification path. Thresholds will be retuned using
 whole-layer benchmarks.
+
+## Target execution primitives
+
+The direct native dispatcher now covers every K-quant format present in the
+two supplied models: Q4_K, Q5_K, and Q6_K. Each path has a CPU reference check
+against the mapped model tensor, including its eight-token form. For example,
+the RX 6650 XT measures the target's Q5_K `blk.0.ssm_out.weight` at 0.074 ms
+with a maximum error of `2.26e-6`, and its Q6_K
+`blk.0.attn_qkv.weight` at 0.176 ms with a maximum error of `5.96e-7`.
+
+`bench-ffn` is the first multi-projection target execution path: it performs
+both input projections, SiLU gating, and the down projection for eight real
+target states. It validates the final down-projection against the GPU hidden
+state. On target layer 0:
+
+| Eight-token FFN route | GPU pass | Proposed tokens/s | Down-projection check |
+|---|---:|---:|---:|
+| Direct Q4_K + Q4_K + Q6_K | 3.017 ms | 2,652 | `1.21e-6` |
+| N23Q4 gate/up + Q6_K down | 2.081 ms | 3,844 | `9.83e-7` |
+
+The latter route includes a GPU-side Q8 activation quantizer, N23Q4 wave32
+DP4A gate/up projections, SiLU multiplication, and the native Q6_K down
+projection. Its N23Q4 repack happens once when a verifier tensor is admitted
+to the GPU weight cache, never once per proposed block.
+
+The 48 recurrent target layers use a fused gated-delta state update. The
+`bench-gdn` command drives the exact 48 x 128 x 128 FP16-state topology and
+checks it against a CPU recurrence with identical FP16 state rounding. It
+measures 0.153 ms per recurrent layer on this device with maximum error
+`3.96e-6`.
 
 For 128K context, the target has only 16 full-attention layers; its other 48
 layers use fixed-size recurrent state. The `N23KV4` cache format stores the
