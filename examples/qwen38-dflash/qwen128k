@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+llama_cpp_dir=${LLAMA_CPP_DIR:-/home/alex/llama.cpp}
+therock_dir=${THEROCK_DIR:-/home/alex/TheRock}
+downloads_dir=${DOWNLOADS_DIR:-/home/alex/Downloads}
+
+runner=${LLAMA_RUNNER:-$llama_cpp_dir/build-dflash/bin/llama-speculative-simple}
+target_model=${TARGET_MODEL:-$downloads_dir/Qwen3.8-27B-Q4_K_M.gguf}
+draft_model=${DRAFT_MODEL:-$downloads_dir/Qwen3.8-27B-DFlash2-Q4_K_M.gguf}
+context_size=${CONTEXT_SIZE:-131072}
+predict_tokens=${N_PREDICT:-128}
+kv_type=${KV_TYPE:-q8_0}
+prompt=
+
+usage() {
+    printf '%s\n' \
+        'Usage: qwen128k [OPTIONS] [PROMPT]' \
+        '' \
+        'Options:' \
+        '  -n, --tokens N     generated-token budget (default: 128)' \
+        '  -p, --prompt TEXT  prompt text' \
+        '  -h, --help         show this help' \
+        '' \
+        'Environment: CONTEXT_SIZE, KV_TYPE, TARGET_MODEL, DRAFT_MODEL,' \
+        '             LLAMA_CPP_DIR, THEROCK_DIR, DOWNLOADS_DIR'
+}
+
+while (( $# > 0 )); do
+    case $1 in
+        -n|--tokens)
+            [[ $# -ge 2 ]] || { printf '%s\n' 'missing value for --tokens' >&2; exit 2; }
+            predict_tokens=$2
+            shift 2
+            ;;
+        -p|--prompt)
+            [[ $# -ge 2 ]] || { printf '%s\n' 'missing value for --prompt' >&2; exit 2; }
+            prompt=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            prompt=${*:-$prompt}
+            break
+            ;;
+        *)
+            if [[ -z $prompt ]]; then
+                prompt=$1
+            else
+                prompt+=" $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z $prompt ]]; then
+    if [[ -t 0 ]]; then
+        read -r -p 'Prompt> ' prompt
+    else
+        prompt='Explain one interesting idea clearly and concisely.'
+    fi
+fi
+
+for required_file in "$runner" "$target_model" "$draft_model"; do
+    if [[ ! -e $required_file ]]; then
+        printf 'missing required file: %s\n' "$required_file" >&2
+        exit 1
+    fi
+done
+
+if [[ -t 1 ]]; then
+    cyan=$'\033[1;36m'
+    green=$'\033[1;32m'
+    dim=$'\033[2m'
+    reset=$'\033[0m'
+else
+    cyan=
+    green=
+    dim=
+    reset=
+fi
+
+printf '\n%sQwen3.8-27B · DFlash2 · TheRock%s\n' "$cyan" "$reset"
+printf '%sContext: %d  KV: %s  GPU fit: auto  Threads: 16  Max output: %s%s\n\n' \
+    "$dim" "$context_size" "$kv_type" "$predict_tokens" "$reset"
+
+if pgrep -x baloo_file >/dev/null 2>&1; then
+    printf '%swarning:%s Baloo indexing is active and may reduce throughput.\n\n' "$cyan" "$reset" >&2
+fi
+
+export LD_LIBRARY_PATH="$llama_cpp_dir/build-dflash/bin:$therock_dir/build/dist/rocm/lib:$therock_dir/build/profiler/roctracer/dist/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+stats_log=$(mktemp /tmp/qwen128k-stats.XXXXXX)
+trap 'rm -f -- "$stats_log"' EXIT
+
+set +e
+"$runner" \
+    -m "$target_model" \
+    -md "$draft_model" \
+    --spec-type draft-dflash \
+    --spec-draft-n-max 7 \
+    -ngl auto \
+    -ngld auto \
+    --fit on \
+    -c "$context_size" \
+    -b 512 \
+    -ub 512 \
+    -ctk "$kv_type" \
+    -ctv "$kv_type" \
+    -ctkd "$kv_type" \
+    -ctvd "$kv_type" \
+    -t 16 \
+    -td 16 \
+    -fa on \
+    --perf \
+    --no-log-prefix \
+    --no-log-timestamps \
+    --color auto \
+    -n "$predict_tokens" \
+    --temp 0 \
+    --top-k 1 \
+    --seed 42 \
+    -p "$prompt" 2>&1 \
+    | sed -u '/model has unused tensor blk\.64\./d' \
+    | tee "$stats_log"
+runner_status=${PIPESTATUS[0]}
+set -e
+
+if (( runner_status != 0 )); then
+    printf '\nrun failed with status %d\n' "$runner_status" >&2
+    exit "$runner_status"
+fi
+
+printf '\n%s── Test summary ──%s\n' "$green" "$reset"
+sed -n -E \
+    -e 's/.*encoded +([0-9]+) tokens in +([0-9.]+) seconds, speed: +([0-9.]+) t\/s.*/Prompt:   \1 tokens · \2 s · \3 t\/s/p' \
+    -e 's/.*decoded +([0-9]+) tokens in +([0-9.]+) seconds, speed: +([0-9.]+) t\/s.*/Generated: \1 tokens · \2 s · \3 t\/s/p' \
+    -e 's/.*n_drafted *= *([0-9]+).*/Drafted:   \1 tokens/p' \
+    -e 's/.*n_accept  *= *([0-9]+).*/Accepted:  \1 tokens/p' \
+    -e 's/.*accept    *= *([0-9.]+%).*/Acceptance: \1/p' \
+    "$stats_log"
+printf 'Context:   %d tokens (%s KV)\n\n' "$context_size" "$kv_type"

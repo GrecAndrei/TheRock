@@ -12,6 +12,16 @@ The best deterministic 132-token run produced **7.93 real generated tokens/s** w
 
 The launcher defaults match the winning run: 20 target GPU layers, the complete draft model on GPU, 16 CPU threads, flash attention, seven draft tokens, and greedy sampling. Paths can be changed with `LLAMA_CPP_DIR`, `THEROCK_DIR`, `DOWNLOADS_DIR`, `TARGET_MODEL`, and `DRAFT_MODEL`.
 
+### Friendly 128K test CLI
+
+`qwen128k` enables a 131,072-token context, Q8 KV caches, automatic VRAM fitting, colored output, and a compact statistics card after every run:
+
+```bash
+./examples/qwen38-dflash/qwen128k --tokens 128 "Explain how a B-tree works"
+```
+
+Run it without a prompt for an interactive `Prompt>` field. Use `--help` for options. The 128K allocation leaves fewer GPU layers available, so short-prompt throughput is lower than the 1K-context speed configuration; the validated 64-token test reached 3.25 generated t/s.
+
 Required local assets:
 
 - `/home/alex/Downloads/Qwen3.8-27B-Q4_K_M.gguf`

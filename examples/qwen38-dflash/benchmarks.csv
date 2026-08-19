@@ -10,3 +10,4 @@ date,kind,target,draft,target_ngl,draft_ngl,threads,draft_max,generated,drafted,
 2026-08-19,target_pp8,Q4_K_M,,20,,15,7,,,,,15.350,"target-only verifier microbenchmark"
 2026-08-19,target_pp8,Q3_K_S,,40,,15,7,,,,,19.470,"target-only; did not translate to end-to-end speed"
 2026-08-19,target_pp8,UD-Q2_K_XL,,48,,15,7,,,,,13.140,"target-only; rejected"
+2026-08-19,end_to_end_128k,Q4_K_M,Q4_K_M,auto,auto,16,7,69,98,55,56.122,3.253,"131072 context; Q8_0 KV; automatic VRAM fit"
