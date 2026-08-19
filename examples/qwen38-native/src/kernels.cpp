@@ -428,6 +428,168 @@ __global__ void n23kv4_score_batch8_kernel(const N23KV4Group *__restrict__ keys,
     }
 }
 
+__global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys,
+                                            const N23KV4Group *__restrict__ values,
+                                            const std::int8_t *__restrict__ queries,
+                                            const float *__restrict__ query_scales,
+                                            float *__restrict__ partials,
+                                            int context_size, int partitions) {
+    constexpr int groups_per_head = 8;
+    constexpr int query_heads = 24;
+    constexpr int query_groups_per_kv = 6;
+    constexpr int partial_stride = 258;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int query_in_group = warp;
+    const int kv_head = static_cast<int>(blockIdx.y) / query_groups_per_kv;
+    const int local_query_group = static_cast<int>(blockIdx.y) % query_groups_per_kv;
+    const int local_query = local_query_group * 8 + query_in_group;
+    const int batch = local_query / 6;
+    const int query_head = kv_head * 6 + local_query % 6;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int end = min(context_size, begin + chunk);
+    const int lane_group = lane / 8;
+    const int lane_in_group = lane & 7;
+
+    __shared__ float tile_scores[8];
+    __shared__ float state_max[8];
+    __shared__ float state_sum[8];
+    __shared__ float rescale[8];
+    __shared__ float probabilities[8];
+    if (thread < 8) {
+        state_max[thread] = -INFINITY;
+        state_sum[thread] = 0.0F;
+    }
+    __syncthreads();
+
+    float accumulator[8] = {};
+    for (int token = begin; token < end; ++token) {
+        float score_partial = 0.0F;
+        const auto *token_keys = keys
+            + (static_cast<std::size_t>(kv_head) * context_size + token) * groups_per_head;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int group = half * 4 + lane_group;
+            const auto &key_group = token_keys[group];
+            const auto *nibbles = key_group.quants + 2 * lane_in_group;
+            const std::uint8_t low = nibbles[0];
+            const std::uint8_t high = nibbles[1];
+            const int w0 = ((static_cast<int>(low & 0x0F) ^ 8) - 8);
+            const int w1 = ((static_cast<int>(low >> 4) ^ 8) - 8);
+            const int w2 = ((static_cast<int>(high & 0x0F) ^ 8) - 8);
+            const int w3 = ((static_cast<int>(high >> 4) ^ 8) - 8);
+            const std::uint32_t key_word = static_cast<std::uint8_t>(w0)
+                | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w1)) << 8)
+                | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w2)) << 16)
+                | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w3)) << 24);
+            const std::size_t query_group = (static_cast<std::size_t>(batch) * query_heads
+                                             + query_head) * groups_per_head + group;
+            const auto *query_word = reinterpret_cast<const std::uint32_t *>(
+                queries + query_group * 32 + lane_in_group * 4);
+            const int dot = __builtin_amdgcn_sdot4(static_cast<int>(key_word),
+                                                    static_cast<int>(*query_word), 0, false);
+            const float key_scale = __half2float(
+                *reinterpret_cast<const __half *>(&key_group.scale));
+            score_partial += static_cast<float>(dot) * key_scale
+                           * query_scales[query_group] * 0.0625F;
+        }
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            const float other = __shfl_down(score_partial, offset, kWarpSize);
+            if (lane_in_group + offset < 8) {
+                score_partial += other;
+            }
+        }
+        const float score = __shfl(score_partial, 0, kWarpSize)
+                          + __shfl(score_partial, 8, kWarpSize)
+                          + __shfl(score_partial, 16, kWarpSize)
+                          + __shfl(score_partial, 24, kWarpSize);
+        if (lane == 0) {
+            tile_scores[query_in_group] = score;
+        }
+        __syncthreads();
+
+        if (thread < 8) {
+            const float old_max = state_max[thread];
+            const float new_max = fmaxf(old_max, tile_scores[thread]);
+            const float scale_old = isinf(old_max) ? 0.0F : expf(old_max - new_max);
+            const float probability = expf(tile_scores[thread] - new_max);
+            rescale[thread] = scale_old;
+            probabilities[thread] = probability;
+            state_sum[thread] = state_sum[thread] * scale_old + probability;
+            state_max[thread] = new_max;
+        }
+        __syncthreads();
+
+        const int value_group_index = thread / 32;
+        const int value_index = thread & 31;
+        const auto &value_group = values[(static_cast<std::size_t>(kv_head) * context_size + token)
+                                         * groups_per_head + value_group_index];
+        const auto value_byte = value_group.quants[value_index / 2];
+        const int value_nibble = (value_byte >> ((value_index & 1) * 4)) & 0x0F;
+        const float value = static_cast<float>(value_nibble >= 8 ? value_nibble - 16 : value_nibble)
+                          * __half2float(*reinterpret_cast<const __half *>(&value_group.scale));
+#pragma unroll
+        for (int query = 0; query < 8; ++query) {
+            accumulator[query] = accumulator[query] * rescale[query]
+                + probabilities[query] * value;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int query = 0; query < 8; ++query) {
+        const int local = local_query_group * 8 + query;
+        const int query_batch = local / 6;
+        const int query_head_out = kv_head * 6 + local % 6;
+        const int global_query_out = query_batch * query_heads + query_head_out;
+        float *destination = partials
+            + (static_cast<std::size_t>(global_query_out) * partitions + partition) * partial_stride;
+        destination[thread] = accumulator[query];
+        if (thread == 0) {
+            destination[256] = state_max[query];
+            destination[257] = state_sum[query];
+        }
+    }
+}
+
+__global__ void n23kv4_flash_reduce_kernel(const float *__restrict__ partials,
+                                           float *__restrict__ output,
+                                           int partitions) {
+    constexpr int partial_stride = 258;
+    const int query = static_cast<int>(blockIdx.x);
+    const int dimension = static_cast<int>(threadIdx.x);
+    __shared__ float global_max;
+    __shared__ float global_sum;
+    if (dimension == 0) {
+        float maximum = -INFINITY;
+        for (int partition = 0; partition < partitions; ++partition) {
+            maximum = fmaxf(maximum,
+                partials[(static_cast<std::size_t>(query) * partitions + partition)
+                         * partial_stride + 256]);
+        }
+        float sum = 0.0F;
+        for (int partition = 0; partition < partitions; ++partition) {
+            const auto *source = partials
+                + (static_cast<std::size_t>(query) * partitions + partition) * partial_stride;
+            sum += source[257] * expf(source[256] - maximum);
+        }
+        global_max = maximum;
+        global_sum = sum;
+    }
+    __syncthreads();
+    float value = 0.0F;
+    for (int partition = 0; partition < partitions; ++partition) {
+        const auto *source = partials
+            + (static_cast<std::size_t>(query) * partitions + partition) * partial_stride;
+        value += source[dimension] * expf(source[256] - global_max);
+    }
+    output[static_cast<std::size_t>(query) * 256 + dimension] = value / global_sum;
+}
+
 float fp16_to_float(std::uint16_t bits) {
     __half value;
     static_assert(sizeof(value) == sizeof(bits));
@@ -1180,6 +1342,164 @@ Q4KBenchmarkResult benchmark_n23kv4_batch8(std::size_t context_size, int iterati
         if (device_scores) (void) hipFree(device_scores);
         if (device_query_scales) (void) hipFree(device_query_scales);
         if (device_queries) (void) hipFree(device_queries);
+        (void) hipFree(device_keys);
+        throw;
+    }
+}
+
+Q4KBenchmarkResult benchmark_n23kv4_flash_batch8(std::size_t context_size,
+                                                  int partitions, int iterations) {
+    if (context_size == 0 || partitions <= 0 || iterations <= 0) {
+        throw std::invalid_argument("invalid N23KV4 flash benchmark parameters");
+    }
+    constexpr std::size_t batch_size = 8;
+    constexpr std::size_t head_size = 256;
+    constexpr std::size_t groups_per_head = head_size / 32;
+    constexpr std::size_t query_heads = 24;
+    constexpr std::size_t kv_heads = 4;
+    constexpr std::size_t query_groups_per_kv = 6;
+    constexpr std::size_t partial_stride = 258;
+    const std::size_t key_groups = context_size * kv_heads * groups_per_head;
+    std::vector<N23KV4Group> keys(key_groups);
+    std::vector<N23KV4Group> values(key_groups);
+    std::vector<std::int8_t> queries(batch_size * query_heads * head_size);
+    std::vector<float> query_scales(batch_size * query_heads * groups_per_head);
+    std::vector<float> output(batch_size * query_heads * head_size);
+    std::mt19937 generator(42);
+    std::uniform_int_distribution<int> q4_distribution(-8, 7);
+    std::uniform_int_distribution<int> q8_distribution(-127, 127);
+    std::uniform_real_distribution<float> scale_distribution(0.001F, 0.02F);
+    auto fill_kv = [&](std::vector<N23KV4Group> &cache) {
+        for (auto &group : cache) {
+            group.scale = float_to_fp16(scale_distribution(generator));
+            for (auto &byte : group.quants) {
+                const int first = q4_distribution(generator);
+                const int second = q4_distribution(generator);
+                byte = static_cast<std::uint8_t>((first & 0x0F) | ((second & 0x0F) << 4));
+            }
+        }
+    };
+    fill_kv(keys);
+    fill_kv(values);
+    for (auto &value : queries) {
+        value = static_cast<std::int8_t>(q8_distribution(generator));
+    }
+    for (auto &scale : query_scales) {
+        scale = scale_distribution(generator);
+    }
+
+    N23KV4Group *device_keys = nullptr;
+    N23KV4Group *device_values = nullptr;
+    std::int8_t *device_queries = nullptr;
+    float *device_query_scales = nullptr;
+    float *device_partials = nullptr;
+    float *device_output = nullptr;
+    hipEvent_t begin = nullptr;
+    hipEvent_t end = nullptr;
+    const std::size_t cache_bytes = keys.size() * sizeof(N23KV4Group);
+    const std::size_t partial_count = batch_size * query_heads
+                                    * static_cast<std::size_t>(partitions) * partial_stride;
+    hip_check(hipMalloc(reinterpret_cast<void **>(&device_keys), cache_bytes), "hipMalloc flash keys");
+    try {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_values), cache_bytes), "hipMalloc flash values");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_queries), queries.size()), "hipMalloc flash queries");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_query_scales), query_scales.size() * sizeof(float)), "hipMalloc flash query scales");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_partials), partial_count * sizeof(float)), "hipMalloc flash partials");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_output), output.size() * sizeof(float)), "hipMalloc flash output");
+        hip_check(hipMemcpy(device_keys, keys.data(), cache_bytes, hipMemcpyHostToDevice), "hipMemcpy flash keys");
+        hip_check(hipMemcpy(device_values, values.data(), cache_bytes, hipMemcpyHostToDevice), "hipMemcpy flash values");
+        hip_check(hipMemcpy(device_queries, queries.data(), queries.size(), hipMemcpyHostToDevice), "hipMemcpy flash queries");
+        hip_check(hipMemcpy(device_query_scales, query_scales.data(), query_scales.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy flash query scales");
+        hip_check(hipEventCreate(&begin), "hipEventCreate flash begin");
+        hip_check(hipEventCreate(&end), "hipEventCreate flash end");
+
+        const dim3 partial_grid(static_cast<unsigned int>(partitions), kv_heads * query_groups_per_kv);
+        const dim3 partial_block(256);
+        const dim3 reduce_grid(batch_size * query_heads);
+        const dim3 reduce_block(256);
+        auto launch = [&] {
+            hipLaunchKernelGGL(n23kv4_flash_partial_kernel, partial_grid, partial_block, 0, nullptr,
+                               device_keys, device_values, device_queries, device_query_scales,
+                               device_partials, static_cast<int>(context_size), partitions);
+            hipLaunchKernelGGL(n23kv4_flash_reduce_kernel, reduce_grid, reduce_block, 0, nullptr,
+                               device_partials, device_output, partitions);
+        };
+        for (int i = 0; i < 2; ++i) {
+            launch();
+        }
+        hip_check(hipDeviceSynchronize(), "N23KV4 flash warmup");
+        hip_check(hipEventRecord(begin), "hipEventRecord flash begin");
+        for (int i = 0; i < iterations; ++i) {
+            launch();
+        }
+        hip_check(hipEventRecord(end), "hipEventRecord flash end");
+        hip_check(hipEventSynchronize(end), "hipEventSynchronize flash");
+        float elapsed = 0.0F;
+        hip_check(hipEventElapsedTime(&elapsed, begin, end), "hipEventElapsedTime flash");
+        hip_check(hipMemcpy(output.data(), device_output, output.size() * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy flash output");
+
+        Q4KBenchmarkResult result;
+        result.milliseconds = elapsed / static_cast<float>(iterations);
+        const std::size_t effective_cache_bytes = 2 * cache_bytes * query_groups_per_kv;
+        result.bandwidth_gbps = static_cast<float>(effective_cache_bytes)
+                              / (result.milliseconds * 1.0e6F);
+
+        std::vector<float> scores(context_size);
+        float maximum = -std::numeric_limits<float>::infinity();
+        for (std::size_t token = 0; token < context_size; ++token) {
+            float score = 0.0F;
+            const auto *token_keys = keys.data() + token * groups_per_head;
+            for (std::size_t group = 0; group < groups_per_head; ++group) {
+                int dot = 0;
+                for (int i = 0; i < 32; ++i) {
+                    const auto byte = token_keys[group].quants[i / 2];
+                    const int nibble = (byte >> ((i & 1) * 4)) & 0x0F;
+                    const int key = nibble >= 8 ? nibble - 16 : nibble;
+                    dot += key * queries[group * 32 + i];
+                }
+                score += static_cast<float>(dot) * fp16_to_float(token_keys[group].scale)
+                       * query_scales[group] * 0.0625F;
+            }
+            scores[token] = score;
+            maximum = std::max(maximum, score);
+        }
+        double denominator = 0.0;
+        for (const float score : scores) {
+            denominator += std::exp(static_cast<double>(score - maximum));
+        }
+        for (int dimension = 0; dimension < 8; ++dimension) {
+            double expected = 0.0;
+            const int group = dimension / 32;
+            const int index = dimension & 31;
+            for (std::size_t token = 0; token < context_size; ++token) {
+                const auto &value_group = values[token * groups_per_head + group];
+                const auto byte = value_group.quants[index / 2];
+                const int nibble = (byte >> ((index & 1) * 4)) & 0x0F;
+                const int quant = nibble >= 8 ? nibble - 16 : nibble;
+                const float value = static_cast<float>(quant) * fp16_to_float(value_group.scale);
+                expected += std::exp(static_cast<double>(scores[token] - maximum)) * value;
+            }
+            expected /= denominator;
+            result.max_absolute_error = std::max(result.max_absolute_error,
+                std::abs(static_cast<float>(expected) - output[dimension]));
+        }
+        hip_check(hipEventDestroy(end), "hipEventDestroy flash end");
+        hip_check(hipEventDestroy(begin), "hipEventDestroy flash begin");
+        hip_check(hipFree(device_output), "hipFree flash output");
+        hip_check(hipFree(device_partials), "hipFree flash partials");
+        hip_check(hipFree(device_query_scales), "hipFree flash query scales");
+        hip_check(hipFree(device_queries), "hipFree flash queries");
+        hip_check(hipFree(device_values), "hipFree flash values");
+        hip_check(hipFree(device_keys), "hipFree flash keys");
+        return result;
+    } catch (...) {
+        if (end) (void) hipEventDestroy(end);
+        if (begin) (void) hipEventDestroy(begin);
+        if (device_output) (void) hipFree(device_output);
+        if (device_partials) (void) hipFree(device_partials);
+        if (device_query_scales) (void) hipFree(device_query_scales);
+        if (device_queries) (void) hipFree(device_queries);
+        if (device_values) (void) hipFree(device_values);
         (void) hipFree(device_keys);
         throw;
     }

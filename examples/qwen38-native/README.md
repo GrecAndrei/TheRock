@@ -43,7 +43,7 @@ the eight-token DFlash verification path. Thresholds will be retuned using
 whole-layer benchmarks.
 
 For 128K context, the target has only 16 full-attention layers; its other 48
-layers use fixed-size recurrent state. The planned `N23KV4` cache stores the
+layers use fixed-size recurrent state. The `N23KV4` cache format stores the
 full-attention K/V at 4 bits plus per-group scales, leaving substantially more
 VRAM for weights than Q8 K/V. The built-in `plan-128k` command measures the
 exact model metadata and reports 4.25 GiB for target Q8 KV versus 2.25 GiB for
@@ -52,9 +52,15 @@ N23KV4, reclaiming 2.00 GiB for target weights on this card.
 The real 131,072-token N23KV4 key-score benchmark reaches 212 GB/s and 2.14
 ms per full-attention layer for one query. Its eight-query verifier reads each
 cached key once and completes in 6.86 ms/layer, 2.50x faster than launching the
-single-query pass eight times. CPU-vs-GPU error is below `5e-7`. The production
-attention path will fuse online softmax and V accumulation so the 8 x 24 x
-128K score matrix is never written to VRAM.
+single-query pass eight times. CPU-vs-GPU error is below `5e-7`.
+
+The fused online-softmax and V path never writes the 8 x 24 x 128K score
+matrix to VRAM. With eight queries sharing each K/V read
+and 64 context partitions, a fully populated 128K cache takes 25.90 ms per
+full-attention layer (about 414 ms across all 16 layers), with CPU-vs-GPU error
+near `2e-9`. This is deliberately reported separately from “128K capacity with
+a short prompt”: allocated context capacity does not mean 128K cache entries
+are read during every short-prompt decode.
 
 The previous llama.cpp integration remains under `../qwen38-dflash` only as a
 correctness and throughput baseline while the native path is completed.

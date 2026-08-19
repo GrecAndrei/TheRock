@@ -261,7 +261,7 @@ void plan_128k(const std::string &target_path, const std::string &draft_path) {
               << "  reclaimed for weights: " << gib(native_weight_budget - q8_weight_budget) << " GiB\n";
 }
 
-void bench_kv4(std::size_t context_size, int iterations) {
+void bench_kv4(std::size_t context_size, int iterations, int partitions) {
     std::cout << "N23KV4 24Q/4KV-head score benchmark\n"
               << "  context: " << context_size << " tokens\n";
     const auto result = qwen_native::benchmark_n23kv4(context_size, iterations);
@@ -275,6 +275,13 @@ void bench_kv4(std::size_t context_size, int iterations) {
               << batch8.milliseconds << " ms per layer\n"
               << "    reused-key BW:" << std::setprecision(2) << ' ' << batch8.bandwidth_gbps << " GB/s\n"
               << "    max error:    " << std::scientific << batch8.max_absolute_error << '\n';
+    const auto flash = qwen_native::benchmark_n23kv4_flash_batch8(context_size, partitions, iterations);
+    std::cout << "  fused online-softmax + V verifier:\n"
+              << "    partitions:   " << partitions << '\n'
+              << "    latency:      " << std::fixed << std::setprecision(3)
+              << flash.milliseconds << " ms per layer\n"
+              << "    effective BW: " << std::setprecision(2) << flash.bandwidth_gbps << " GB/s\n"
+              << "    max error:    " << std::scientific << flash.max_absolute_error << '\n';
 }
 
 void usage(const char *program) {
@@ -282,7 +289,7 @@ void usage(const char *program) {
               << "  " << program << " device\n"
               << "  " << program << " inspect MODEL.gguf [--tensors]\n"
               << "  " << program << " bench-q4 MODEL.gguf TENSOR [ITERATIONS]\n"
-              << "  " << program << " bench-kv4 [CONTEXT] [ITERATIONS]\n"
+              << "  " << program << " bench-kv4 [CONTEXT] [ITERATIONS] [PARTITIONS]\n"
               << "  " << program << " plan-128k TARGET.gguf DFLASH.gguf\n";
 }
 
@@ -312,10 +319,11 @@ int main(int argc, char **argv) {
             plan_128k(argv[2], argv[3]);
             return EXIT_SUCCESS;
         }
-        if (argc >= 2 && argc <= 4 && std::string(argv[1]) == "bench-kv4") {
+        if (argc >= 2 && argc <= 5 && std::string(argv[1]) == "bench-kv4") {
             const auto context = argc >= 3 ? static_cast<std::size_t>(std::stoull(argv[2])) : 131072;
             const int iterations = argc >= 4 ? std::stoi(argv[3]) : 20;
-            bench_kv4(context, iterations);
+            const int partitions = argc >= 5 ? std::stoi(argv[4]) : 64;
+            bench_kv4(context, iterations, partitions);
             return EXIT_SUCCESS;
         }
         usage(argv[0]);
