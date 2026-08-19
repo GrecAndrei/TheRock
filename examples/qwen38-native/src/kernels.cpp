@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace qwen_native {
@@ -134,6 +135,68 @@ struct MatvecWorkspace {
 MatvecWorkspace &matvec_workspace() {
     static MatvecWorkspace workspace;
     return workspace;
+}
+
+// The 16 GiB target cannot reside entirely on this 8 GiB card, but a stable
+// subset can.  Holding the output head and FFN down projections avoids copying
+// their multi-gigabyte working set on every decoded token.  Cache entries are
+// keyed by the mapped GGUF address and deliberately live for the process.
+struct ResidentWeightCache {
+    struct Entry {
+        void *device = nullptr;
+        std::size_t bytes = 0;
+    };
+
+    ~ResidentWeightCache() {
+        for (const auto &[host, entry] : entries) {
+            (void) host;
+            if (entry.device) (void) hipFree(entry.device);
+        }
+    }
+
+    void set_budget(std::size_t bytes) {
+        if (bytes < resident_bytes) {
+            throw std::runtime_error("resident weight-cache budget cannot shrink after population");
+        }
+        budget_bytes = bytes;
+    }
+
+    const void *find_or_add(const void *host, std::size_t bytes, bool keep) {
+        const auto existing = entries.find(host);
+        if (existing != entries.end()) {
+            if (existing->second.bytes != bytes) {
+                throw std::runtime_error("resident weight-cache pointer has inconsistent size");
+            }
+            return existing->second.device;
+        }
+        if (!keep || bytes > budget_bytes - resident_bytes) {
+            return nullptr;
+        }
+        void *device = nullptr;
+        hip_check(hipMalloc(&device, bytes), "hipMalloc resident matrix");
+        try {
+            hip_check(hipMemcpy(device, host, bytes, hipMemcpyHostToDevice), "hipMemcpy resident matrix");
+            entries.emplace(host, Entry{device, bytes});
+            resident_bytes += bytes;
+            return device;
+        } catch (...) {
+            (void) hipFree(device);
+            throw;
+        }
+    }
+
+    ResidentWeightCacheStats stats() const {
+        return {budget_bytes, resident_bytes, entries.size()};
+    }
+
+    std::size_t budget_bytes = 0;
+    std::size_t resident_bytes = 0;
+    std::unordered_map<const void *, Entry> entries;
+};
+
+ResidentWeightCache &resident_weight_cache() {
+    static ResidentWeightCache cache;
+    return cache;
 }
 
 __device__ __forceinline__ void scale_min(const std::uint8_t *packed, int index,
@@ -1608,6 +1671,43 @@ void execute_k_matvec(const void *weights, std::uint32_t weight_type,
     launch_k_matvec(weight_type, workspace.weights, workspace.input, workspace.output, input_size, output_size);
     hip_check(hipGetLastError(), "native matvec launch");
     hip_check(hipMemcpy(output, workspace.output, output_size * sizeof(float), hipMemcpyDeviceToHost), "hipMemcpy native matvec output");
+}
+
+void set_resident_weight_cache_budget(std::size_t bytes) {
+    resident_weight_cache().set_budget(bytes);
+}
+
+ResidentWeightCacheStats resident_weight_cache_stats() {
+    return resident_weight_cache().stats();
+}
+
+bool preload_resident_k_matrix(const void *weights, std::uint32_t weight_type,
+                               std::size_t input_size, std::size_t output_size) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    return resident_weight_cache().find_or_add(weights, weight_bytes, true) != nullptr;
+}
+
+void execute_k_matvec_cached(const void *weights, std::uint32_t weight_type,
+                             const float *input, std::size_t input_size,
+                             float *output, std::size_t output_size,
+                             bool keep_resident) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &workspace = matvec_workspace();
+    const void *device_weights = resident_weight_cache().find_or_add(weights, weight_bytes, keep_resident);
+    if (!device_weights) {
+        workspace.reserve_weights(weight_bytes);
+        hip_check(hipMemcpy(workspace.weights, weights, weight_bytes, hipMemcpyHostToDevice),
+                  "hipMemcpy native cached matvec weights");
+        device_weights = workspace.weights;
+    }
+    workspace.reserve_input(input_size);
+    workspace.reserve_output(output_size);
+    hip_check(hipMemcpy(workspace.input, input, input_size * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy native cached matvec input");
+    launch_k_matvec(weight_type, device_weights, workspace.input, workspace.output, input_size, output_size);
+    hip_check(hipGetLastError(), "native cached matvec launch");
+    hip_check(hipMemcpy(output, workspace.output, output_size * sizeof(float), hipMemcpyDeviceToHost),
+              "hipMemcpy native cached matvec output");
 }
 
 void execute_k_matvec_batch8(const void *weights, std::uint32_t weight_type,

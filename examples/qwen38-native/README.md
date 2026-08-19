@@ -5,11 +5,10 @@ standalone executable built with TheRock's HIP SDK. It does not link to or call
 llama.cpp, ggml, or another inference runtime.
 
 The implementation is being brought up in independently testable layers. It
-validates the TheRock runtime, parses GGUF v3 directly, maps real target
-tensors, and runs the hot native execution components without linking an
-inference runtime. The remaining work is model orchestration (tokenization,
-all target blocks, DFlash2 scheduling, and sampling), not a missing GEMV or
-recurrent-state primitive.
+parses GGUF v3 directly, maps real target tensors, and has a native raw-token
+target decoder with persistent recurrent state, convolution history, causal
+attention cache, MRoPE, final logits, and greedy generation. It does not link
+to or call an inference runtime.
 
 ```bash
 ./build.sh
@@ -20,8 +19,19 @@ build/qwen38-native bench-matvec ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 build/qwen38-native bench-ffn ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
 build/qwen38-native bench-gdn
 build/qwen38-native show-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
-build/qwen38-native target-first-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
+build/qwen38-native target-generate ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 131072 0 6
 ```
+
+`target-generate` intentionally accepts raw token IDs while the model executor
+is validated. `CONTEXT` is the enabled capacity and the command reports active
+cache entries separately. The optional final argument is the resident target
+weight cache in GiB (default `6`, `0` disables it). It is not a text/chat CLI
+yet, and DFlash2 proposal/acceptance scheduling is not yet connected to this
+reference decoder. The default 6 GiB weight mode and a 2.25 GiB device N23KV4
+128K cache cannot coexist on an 8 GiB RX 6650 XT; this reference decoder keeps
+its growing FP16 cache in host memory for that reason. The N23KV4 device cache
+is validated by its own benchmark below, but has not yet been wired into this
+raw-token executor.
 
 ## N23Q4
 
@@ -78,16 +88,16 @@ checks it against a CPU recurrence with identical FP16 state rounding. It
 measures 0.153 ms per recurrent layer on this device with maximum error
 `3.96e-6`.
 
-`target-first-token` is the first semantic target-trunk checkpoint. It accepts
-a raw tokenizer ID, fetches the real Q4_K embedding, executes all 64 live
-layers, applies the final norm and Q6_K output head, then reports the top
-token. At position zero, causal attention is exactly the current V, so no
-attention cache read is needed; recurrent layers use their zero initial state.
-It is deliberately not advertised as a decoding benchmark: the command streams
-the target weights through a persistent HIP arena for correctness work, while
-the final verifier will retain its N23Q4 hot set and evaluate eight proposals
-per target pass. On this machine the semantic position-zero pass takes 2.34 s,
-down from 20.45 s before persistent staging removed per-projection allocations.
+`target-generate` is the semantic target checkpoint. Each step fetches the
+real Q4_K embedding, executes all 64 live layers, updates all 48 gated-delta
+states and all 16 causal attention caches, applies final norm plus the Q6_K
+head, and returns a greedy next token. The default 6 GiB resident cache holds
+the output head, all FFN-down matrices, and as many recurrent QKV matrices as
+fit; remaining target matrices stream through HIP. On this machine, a six-step
+128K-capacity run has measured roughly `0.99` s for a warm step (about
+`1.0 tok/s`). That is an end-to-end target number, not a component benchmark.
+It is bounded mainly by streaming the target's remaining weights over PCIe and
+does not meet a 10 tok/s target.
 
 For 128K context, the target has only 16 full-attention layers; its other 48
 layers use fixed-size recurrent state. The `N23KV4` cache format stores the
