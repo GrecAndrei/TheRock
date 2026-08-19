@@ -132,47 +132,107 @@ private:
     std::size_t size_ = 0;
 };
 
-void bench_q4(const std::string &path, const std::string &tensor_name, int iterations) {
+void bench_matvec(const std::string &path, const std::string &tensor_name, int iterations) {
     const qwen_native::GgufFile model(path);
     const auto *tensor = model.find_tensor(tensor_name);
     if (!tensor) {
         throw std::runtime_error("tensor not found: " + tensor_name);
     }
-    if (tensor->type != 12 || tensor->dimensions.size() != 2) {
-        throw std::runtime_error("benchmark requires a rank-2 Q4_K tensor");
+    if ((tensor->type != 12 && tensor->type != 13 && tensor->type != 14) || tensor->dimensions.size() != 2) {
+        throw std::runtime_error("benchmark requires a rank-2 Q4_K, Q5_K, or Q6_K tensor");
     }
     const Mapping mapping(path);
     const auto input_size = static_cast<std::size_t>(tensor->dimensions[0]);
     const auto output_size = static_cast<std::size_t>(tensor->dimensions[1]);
-    std::cout << "Q4_K real-weight benchmark: " << tensor_name << '\n'
+    std::cout << qwen_native::ggml_type_name(tensor->type) << " real-weight benchmark: " << tensor_name << '\n'
               << "  shape: " << input_size << " x " << output_size << '\n';
-    const auto result = qwen_native::benchmark_q4k(
-        mapping.at(model.data_offset() + tensor->offset), input_size, output_size, iterations);
-    std::cout << "  Q4_K native:\n"
+    const void *weights = mapping.at(model.data_offset() + tensor->offset);
+    qwen_native::Q4KBenchmarkResult result;
+    qwen_native::Q4KBenchmarkResult batch8;
+    if (tensor->type == 12) {
+        result = qwen_native::benchmark_q4k(weights, input_size, output_size, iterations);
+        batch8 = qwen_native::benchmark_q4k_batch8(weights, input_size, output_size, iterations);
+    } else if (tensor->type == 13) {
+        result = qwen_native::benchmark_q5k(weights, input_size, output_size, iterations);
+        batch8 = qwen_native::benchmark_q5k_batch8(weights, input_size, output_size, iterations);
+    } else {
+        result = qwen_native::benchmark_q6k(weights, input_size, output_size, iterations);
+        batch8 = qwen_native::benchmark_q6k_batch8(weights, input_size, output_size, iterations);
+    }
+    std::cout << "  native direct:\n"
               << "    latency:    " << std::fixed << std::setprecision(3) << result.milliseconds << " ms\n"
               << "    bandwidth:  " << std::setprecision(2) << result.bandwidth_gbps << " GB/s\n"
               << "    max error:  " << std::scientific << result.max_absolute_error << '\n';
-    const auto n23 = qwen_native::benchmark_n23q4_from_q4k(
-        mapping.at(model.data_offset() + tensor->offset), input_size, output_size, iterations);
-    std::cout << "  N23Q4 wave32 + DP4A:\n"
-              << "    latency:    " << std::fixed << std::setprecision(3) << n23.milliseconds << " ms\n"
-              << "    bandwidth:  " << std::setprecision(2) << n23.bandwidth_gbps << " GB/s\n"
-              << "    max delta:  " << std::scientific << n23.max_absolute_error << '\n'
-              << "    rel. RMSE:  " << n23.relative_rmse << '\n'
-              << "    kernel err: " << n23.kernel_max_absolute_error << '\n';
-    const auto batch8 = qwen_native::benchmark_q4k_batch8(
-        mapping.at(model.data_offset() + tensor->offset), input_size, output_size, iterations);
-    std::cout << "  Q4_K eight-token verifier:\n"
+    std::cout << "  eight-token verifier:\n"
               << "    latency:    " << std::fixed << std::setprecision(3) << batch8.milliseconds << " ms\n"
               << "    weight BW:  " << std::setprecision(2) << batch8.bandwidth_gbps << " GB/s\n"
               << "    max error:  " << std::scientific << batch8.max_absolute_error << '\n';
-    const auto n23_batch8 = qwen_native::benchmark_n23q4_batch8_from_q4k(
-        mapping.at(model.data_offset() + tensor->offset), input_size, output_size, iterations);
-    std::cout << "  N23Q4 eight-token verifier:\n"
-              << "    latency:    " << std::fixed << std::setprecision(3) << n23_batch8.milliseconds << " ms\n"
-              << "    weight BW:  " << std::setprecision(2) << n23_batch8.bandwidth_gbps << " GB/s\n"
-              << "    max delta:  " << std::scientific << n23_batch8.max_absolute_error << '\n'
-              << "    rel. RMSE:  " << n23_batch8.relative_rmse << '\n';
+    if (tensor->type == 12) {
+        const auto n23 = qwen_native::benchmark_n23q4_from_q4k(weights, input_size, output_size, iterations);
+        std::cout << "  N23Q4 wave32 + DP4A:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3) << n23.milliseconds << " ms\n"
+                  << "    bandwidth:  " << std::setprecision(2) << n23.bandwidth_gbps << " GB/s\n"
+                  << "    max delta:  " << std::scientific << n23.max_absolute_error << '\n'
+                  << "    rel. RMSE:  " << n23.relative_rmse << '\n'
+                  << "    kernel err: " << n23.kernel_max_absolute_error << '\n';
+        const auto n23_batch8 = qwen_native::benchmark_n23q4_batch8_from_q4k(weights, input_size, output_size, iterations);
+        std::cout << "  N23Q4 eight-token verifier:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3) << n23_batch8.milliseconds << " ms\n"
+                  << "    weight BW:  " << std::setprecision(2) << n23_batch8.bandwidth_gbps << " GB/s\n"
+                  << "    max delta:  " << std::scientific << n23_batch8.max_absolute_error << '\n'
+                  << "    rel. RMSE:  " << n23_batch8.relative_rmse << '\n';
+    }
+}
+
+void bench_ffn(const std::string &path, int layer, int iterations) {
+    if (layer < 0) {
+        throw std::invalid_argument("FFN layer index must be non-negative");
+    }
+    const qwen_native::GgufFile model(path);
+    const std::string prefix = "blk." + std::to_string(layer) + ".ffn_";
+    const auto *gate = model.find_tensor(prefix + "gate.weight");
+    const auto *up = model.find_tensor(prefix + "up.weight");
+    const auto *down = model.find_tensor(prefix + "down.weight");
+    if (!gate || !up || !down) {
+        throw std::runtime_error("layer " + std::to_string(layer) + " does not contain a complete FFN");
+    }
+    if (gate->dimensions.size() != 2 || up->dimensions.size() != 2 || down->dimensions.size() != 2 ||
+        gate->dimensions[0] != up->dimensions[0] || gate->dimensions[1] != up->dimensions[1] ||
+        down->dimensions[0] != gate->dimensions[1]) {
+        throw std::runtime_error("FFN tensor shapes are inconsistent in layer " + std::to_string(layer));
+    }
+    const Mapping mapping(path);
+    const auto result = qwen_native::benchmark_ffn_batch8(
+        mapping.at(model.data_offset() + gate->offset), gate->type,
+        mapping.at(model.data_offset() + up->offset), up->type,
+        mapping.at(model.data_offset() + down->offset), down->type,
+        static_cast<std::size_t>(gate->dimensions[0]),
+        static_cast<std::size_t>(gate->dimensions[1]),
+        static_cast<std::size_t>(down->dimensions[1]), iterations);
+    std::cout << "native eight-token FFN verifier · layer " << layer << '\n'
+              << "  projections: " << qwen_native::ggml_type_name(gate->type) << " gate, "
+              << qwen_native::ggml_type_name(up->type) << " up, "
+              << qwen_native::ggml_type_name(down->type) << " down\n"
+              << "  shape:       " << gate->dimensions[0] << " -> " << gate->dimensions[1]
+              << " -> " << down->dimensions[1] << '\n'
+              << "  GPU latency: " << std::fixed << std::setprecision(3) << result.milliseconds << " ms/pass\n"
+              << "  weight BW:   " << std::setprecision(2) << result.weight_bandwidth_gbps << " GB/s\n"
+              << "  verifier:    " << result.verifier_tokens_per_second << " proposed tok/s\n"
+              << "  max error:   " << std::scientific << result.max_absolute_error << '\n';
+    if (gate->type == 12 && up->type == 12) {
+        const auto n23 = qwen_native::benchmark_ffn_batch8_n23q4(
+            mapping.at(model.data_offset() + gate->offset),
+            mapping.at(model.data_offset() + up->offset),
+            mapping.at(model.data_offset() + down->offset), down->type,
+            static_cast<std::size_t>(gate->dimensions[0]),
+            static_cast<std::size_t>(gate->dimensions[1]),
+            static_cast<std::size_t>(down->dimensions[1]), iterations);
+        std::cout << "  N23Q4 gate/up:\n"
+                  << "    GPU latency: " << std::fixed << std::setprecision(3) << n23.milliseconds << " ms/pass\n"
+                  << "    weight BW:   " << std::setprecision(2) << n23.weight_bandwidth_gbps << " GB/s\n"
+                  << "    verifier:    " << n23.verifier_tokens_per_second << " proposed tok/s\n"
+                  << "    max error:   " << std::scientific << n23.max_absolute_error << '\n';
+    }
 }
 
 std::uint64_t metadata_u64(const qwen_native::GgufFile &file, const std::string &key) {
@@ -284,11 +344,22 @@ void bench_kv4(std::size_t context_size, int iterations, int partitions) {
               << "    max error:    " << std::scientific << flash.max_absolute_error << '\n';
 }
 
+void bench_gdn(int iterations) {
+    const auto result = qwen_native::benchmark_gated_delta_step(iterations);
+    std::cout << "native gated-delta recurrent step · 48 x 128x128 FP16 state\n"
+              << "  latency:      " << std::fixed << std::setprecision(3)
+              << result.milliseconds << " ms/layer\n"
+              << "  state BW:     " << std::setprecision(2) << result.bandwidth_gbps << " GB/s\n"
+              << "  max error:    " << std::scientific << result.max_absolute_error << '\n';
+}
+
 void usage(const char *program) {
     std::cout << "Usage:\n"
               << "  " << program << " device\n"
               << "  " << program << " inspect MODEL.gguf [--tensors]\n"
-              << "  " << program << " bench-q4 MODEL.gguf TENSOR [ITERATIONS]\n"
+              << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
+              << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
+              << "  " << program << " bench-gdn [ITERATIONS]\n"
               << "  " << program << " bench-kv4 [CONTEXT] [ITERATIONS] [PARTITIONS]\n"
               << "  " << program << " plan-128k TARGET.gguf DFLASH.gguf\n";
 }
@@ -310,13 +381,23 @@ int main(int argc, char **argv) {
             inspect(argv[2], list_tensors);
             return EXIT_SUCCESS;
         }
-        if ((argc == 4 || argc == 5) && std::string(argv[1]) == "bench-q4") {
+        if ((argc == 4 || argc == 5) && (std::string(argv[1]) == "bench-matvec" || std::string(argv[1]) == "bench-q4")) {
             const int iterations = argc == 5 ? std::stoi(argv[4]) : 100;
-            bench_q4(argv[2], argv[3], iterations);
+            bench_matvec(argv[2], argv[3], iterations);
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 4 || argc == 5) && std::string(argv[1]) == "bench-ffn") {
+            const int iterations = argc == 5 ? std::stoi(argv[4]) : 20;
+            bench_ffn(argv[2], std::stoi(argv[3]), iterations);
             return EXIT_SUCCESS;
         }
         if (argc == 4 && std::string(argv[1]) == "plan-128k") {
             plan_128k(argv[2], argv[3]);
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 2 || argc == 3) && std::string(argv[1]) == "bench-gdn") {
+            const int iterations = argc == 3 ? std::stoi(argv[2]) : 100;
+            bench_gdn(iterations);
             return EXIT_SUCCESS;
         }
         if (argc >= 2 && argc <= 5 && std::string(argv[1]) == "bench-kv4") {
