@@ -10,7 +10,10 @@
 namespace qwen_native {
 
 using MetadataValue = std::variant<std::string, std::uint64_t, std::int64_t,
-                                   double, bool, std::vector<std::string>>;
+                                   double, bool, std::vector<std::string>,
+                                   std::vector<std::uint64_t>,
+                                   std::vector<std::int64_t>,
+                                   std::vector<double>>;
 
 struct TensorInfo {
     std::string name;

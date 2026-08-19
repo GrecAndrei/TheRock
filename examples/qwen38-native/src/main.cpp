@@ -96,6 +96,14 @@ void inspect(const std::string &path, bool list_tensors) {
     }
 }
 
+void show_metadata(const std::string &path) {
+    const qwen_native::GgufFile model(path);
+    std::map<std::string, qwen_native::MetadataValue> sorted(model.metadata().begin(), model.metadata().end());
+    for (const auto &[key, value] : sorted) {
+        std::cout << key << ": " << qwen_native::metadata_to_string(value) << '\n';
+    }
+}
+
 void show_token(const std::string &path, std::size_t token) {
     const qwen_native::GgufFile model(path);
     const auto *metadata = model.find_metadata("tokenizer.ggml.tokens");
@@ -680,6 +688,7 @@ void usage(const char *program) {
     std::cout << "Usage:\n"
               << "  " << program << " device\n"
               << "  " << program << " inspect MODEL.gguf [--tensors]\n"
+              << "  " << program << " metadata MODEL.gguf\n"
               << "  " << program << " show-token MODEL.gguf TOKEN_ID\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
               << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
@@ -704,6 +713,10 @@ int main(int argc, char **argv) {
                 return EXIT_FAILURE;
             }
             inspect(argv[2], list_tensors);
+            return EXIT_SUCCESS;
+        }
+        if (argc == 3 && std::string(argv[1]) == "metadata") {
+            show_metadata(argv[2]);
             return EXIT_SUCCESS;
         }
         if (argc == 4 && std::string(argv[1]) == "show-token") {

@@ -87,22 +87,65 @@ MetadataValue read_array(std::ifstream &stream) {
     }
 
     switch (element_type) {
-    case ValueType::Uint8:   skip_scalars<std::uint8_t>(stream, count); break;
-    case ValueType::Int8:    skip_scalars<std::int8_t>(stream, count); break;
-    case ValueType::Uint16:  skip_scalars<std::uint16_t>(stream, count); break;
-    case ValueType::Int16:   skip_scalars<std::int16_t>(stream, count); break;
-    case ValueType::Uint32:  skip_scalars<std::uint32_t>(stream, count); break;
-    case ValueType::Int32:   skip_scalars<std::int32_t>(stream, count); break;
-    case ValueType::Float32: skip_scalars<float>(stream, count); break;
-    case ValueType::Bool:    skip_scalars<std::uint8_t>(stream, count); break;
-    case ValueType::Uint64:  skip_scalars<std::uint64_t>(stream, count); break;
-    case ValueType::Int64:   skip_scalars<std::int64_t>(stream, count); break;
-    case ValueType::Float64: skip_scalars<double>(stream, count); break;
+    case ValueType::Uint8: {
+        std::vector<std::uint64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::uint8_t>(stream);
+        return values;
+    }
+    case ValueType::Uint16: {
+        std::vector<std::uint64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::uint16_t>(stream);
+        return values;
+    }
+    case ValueType::Uint32: {
+        std::vector<std::uint64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::uint32_t>(stream);
+        return values;
+    }
+    case ValueType::Uint64: {
+        std::vector<std::uint64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::uint64_t>(stream);
+        return values;
+    }
+    case ValueType::Bool: {
+        std::vector<std::uint64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::uint8_t>(stream) != 0;
+        return values;
+    }
+    case ValueType::Int8: {
+        std::vector<std::int64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::int8_t>(stream);
+        return values;
+    }
+    case ValueType::Int16: {
+        std::vector<std::int64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::int16_t>(stream);
+        return values;
+    }
+    case ValueType::Int32: {
+        std::vector<std::int64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::int32_t>(stream);
+        return values;
+    }
+    case ValueType::Int64: {
+        std::vector<std::int64_t> values(count);
+        for (auto &value : values) value = read_scalar<std::int64_t>(stream);
+        return values;
+    }
+    case ValueType::Float32: {
+        std::vector<double> values(count);
+        for (auto &value : values) value = read_scalar<float>(stream);
+        return values;
+    }
+    case ValueType::Float64: {
+        std::vector<double> values(count);
+        for (auto &value : values) value = read_scalar<double>(stream);
+        return values;
+    }
     case ValueType::String:
     case ValueType::Array:
         throw std::runtime_error("nested or invalid GGUF array type");
     }
-    return std::string("<array:") + std::to_string(count) + ">";
 }
 
 MetadataValue read_value(std::ifstream &stream, ValueType type) {
@@ -212,6 +255,16 @@ std::string metadata_to_string(const MetadataValue &value) {
             return item ? "true" : "false";
         } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
             return "[" + std::to_string(item.size()) + " strings]";
+        } else if constexpr (std::is_same_v<T, std::vector<std::uint64_t>> ||
+                             std::is_same_v<T, std::vector<std::int64_t>> ||
+                             std::is_same_v<T, std::vector<double>>) {
+            std::ostringstream output;
+            output << '[';
+            for (std::size_t index = 0; index < item.size(); ++index) {
+                output << (index == 0 ? "" : ",") << item[index];
+            }
+            output << ']';
+            return output.str();
         } else {
             std::ostringstream output;
             output << item;
