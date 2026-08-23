@@ -939,6 +939,7 @@ public:
             }
             hidden = add_vectors(hidden, projection(prefix + "ffn_down.weight", gate));
         }
+        trunk_hidden_ = hidden;
         const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
                                            kEmbedding, epsilon_);
         const auto logits = projection("output.weight", final_hidden);
@@ -947,6 +948,8 @@ public:
         const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         return {static_cast<std::uint32_t>(std::distance(logits.begin(), best)), *best, elapsed};
     }
+
+    [[nodiscard]] const std::vector<float> &trunk_hidden() const { return trunk_hidden_; }
 
     std::vector<float> step_logits(std::uint32_t token) {
         if (token >= vocabulary_size_) {
@@ -993,6 +996,41 @@ public:
                                            kEmbedding, epsilon_);
         ++active_tokens_;
         return projection("output.weight", final_hidden);
+    }
+
+    std::uint32_t step_mtp(const std::vector<float> &trunk_hidden, std::uint32_t predicted_token) {
+        const auto token_emb = embedding(predicted_token);
+        const auto enorm = rms_norm(token_emb, f32_vector("blk.64.nextn.enorm.weight", kEmbedding),
+                                    kEmbedding, epsilon_);
+        const auto hnorm = rms_norm(trunk_hidden, f32_vector("blk.64.nextn.hnorm.weight", kEmbedding),
+                                    kEmbedding, epsilon_);
+        std::vector<float> concat(2 * kEmbedding);
+        std::copy(enorm.begin(), enorm.end(), concat.begin());
+        std::copy(hnorm.begin(), hnorm.end(), concat.begin() + kEmbedding);
+        auto hidden = projection("blk.64.nextn.eh_proj.weight", concat);
+
+        const std::string prefix = "blk.64.";
+        const auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", kEmbedding),
+                                              kEmbedding, epsilon_);
+        const auto q_and_gate = projection(prefix + "attn_q.weight", attention_input);
+        const auto keys = projection(prefix + "attn_k.weight", attention_input);
+        const auto values = projection(prefix + "attn_v.weight", attention_input);
+        const auto attention_output = full_attention_from_projected(
+            prefix, q_and_gate, keys, values, mtp_attention_cache_, active_tokens_ - 1);
+        hidden = add_vectors(hidden, attention_output);
+        const auto ffn_input = rms_norm(hidden, f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                                        kEmbedding, epsilon_);
+        auto gate = projection(prefix + "ffn_gate.weight", ffn_input);
+        const auto up = projection(prefix + "ffn_up.weight", ffn_input);
+        for (std::size_t index = 0; index < gate.size(); ++index) {
+            gate[index] = silu(gate[index]) * up[index];
+        }
+        hidden = add_vectors(hidden, projection(prefix + "ffn_down.weight", gate));
+        const auto final_hidden = rms_norm(hidden, f32_vector("blk.64.nextn.shared_head_norm.weight", kEmbedding),
+                                           kEmbedding, epsilon_);
+        const auto logits = projection("output.weight", final_hidden);
+        const auto best = std::max_element(logits.begin(), logits.end());
+        return static_cast<std::uint32_t>(std::distance(logits.begin(), best));
     }
 
     // This is the target side of speculative verification.  The recurrent
@@ -1928,6 +1966,8 @@ private:
     bool allow_dynamic_target_cache_ = true;
     std::vector<RecurrentState> recurrent_;
     std::vector<AttentionCache> attention_;
+    AttentionCache mtp_attention_cache_;
+    std::vector<float> trunk_hidden_;
     std::array<std::vector<float>, 5> dflash_features_;
     qwen_native::DevicePipeline *pipeline_ = nullptr;
     qwen_native::RecurrentDeviceState *recurrent_device_ = nullptr;
@@ -2303,6 +2343,34 @@ private:
     Mapping mapping_;
     std::array<InjectedCache, 5> injected_;
 };
+
+void mtp_test(const std::string &path, std::size_t context_capacity,
+              std::uint32_t first_token, int steps,
+              std::size_t resident_weight_budget) {
+    NativeTargetSession session(path, context_capacity, resident_weight_budget);
+    const qwen_native::GgufFile model(path);
+    Tokenizer tokenizer(model);
+    std::cout << "native Qwen3.8 MTP head test (blk.64 nextn_predict)\n"
+              << "  context capacity: " << context_capacity << " tokens\n"
+              << "  steps:            " << steps << "\n";
+    std::uint32_t input = first_token;
+    for (int i = 0; i < steps; ++i) {
+        const auto result = session.step(input);
+        const auto mtp_prediction = session.step_mtp(session.trunk_hidden(), result.next_token);
+        std::cout << "  step " << (i + 1) << ": input " << input
+                  << " -> main " << result.next_token
+                  << " (\"" << tokenizer.decode_token(result.next_token) << "\")"
+                  << " -> mtp " << mtp_prediction
+                  << " (\"" << tokenizer.decode_token(mtp_prediction) << "\")"
+                  << " [" << std::fixed << std::setprecision(3) << result.seconds << " s]\n";
+        input = result.next_token;
+    }
+    const auto stats = session.resident_weight_stats();
+    std::cout << "  resident weights: " << std::fixed << std::setprecision(2)
+              << static_cast<double>(stats.resident_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << '/' << static_cast<double>(stats.budget_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB (" << stats.matrix_count << " matrices)\n";
+}
 
 void target_generate(const std::string &path, std::size_t context_capacity,
                      std::uint32_t first_token, int generated_tokens,
@@ -3029,6 +3097,16 @@ int main(int argc, char **argv) {
         if ((argc == 2 || argc == 3) && std::string(argv[1]) == "bench-gdn") {
             const int iterations = argc == 3 ? std::stoi(argv[2]) : 100;
             bench_gdn(iterations);
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 5 || argc == 6 || argc == 7) && std::string(argv[1]) == "mtp-test") {
+            constexpr std::size_t default_resident_weight_budget = 6ULL * 1024ULL * 1024ULL * 1024ULL;
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 6.0;
+            mtp_test(argv[2], static_cast<std::size_t>(std::stoull(argv[3])),
+                     static_cast<std::uint32_t>(std::stoul(argv[4])),
+                     argc >= 6 ? std::stoi(argv[5]) : 3,
+                     argc == 7 ? static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0)
+                               : default_resident_weight_budget);
             return EXIT_SUCCESS;
         }
         if ((argc == 5 || argc == 6 || argc == 7) && std::string(argv[1]) == "target-generate") {
