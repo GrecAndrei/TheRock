@@ -865,6 +865,17 @@ public:
         qwen_native::set_resident_weight_cache_budget(bytes);
     }
     void freeze_target_weight_cache() { allow_dynamic_target_cache_ = false; }
+    void preload_mtp_weights() {
+        static const char *names[] = {
+            "blk.64.attn_k.weight", "blk.64.attn_v.weight",
+            "blk.64.attn_output.weight", "blk.64.nextn.eh_proj.weight",
+            "blk.64.attn_q.weight", "blk.64.ffn_down.weight",
+            "blk.64.ffn_gate.weight", "blk.64.ffn_up.weight",
+        };
+        for (const char *name : names) {
+            preload_projection(name);
+        }
+    }
     void simulate_full_attention_window() {
         qwen_native::attention_advance(attn_device_, 4096 - 8);
     }
@@ -1031,6 +1042,12 @@ public:
         const auto logits = projection("output.weight", final_hidden);
         const auto best = std::max_element(logits.begin(), logits.end());
         return static_cast<std::uint32_t>(std::distance(logits.begin(), best));
+    }
+
+    std::uint32_t step_mtp_from_batch(std::size_t batch_index, std::uint32_t predicted_token) {
+        std::vector<float> hidden_at(batch_trunk_hidden_.begin() + batch_index * kEmbedding,
+                                     batch_trunk_hidden_.begin() + (batch_index + 1) * kEmbedding);
+        return step_mtp(hidden_at, predicted_token);
     }
 
     // This is the target side of speculative verification.  The recurrent
@@ -1245,6 +1262,7 @@ public:
         }
 
         qwen_native::pipeline_download_hidden(pipeline_, hidden.data(), hidden_count);
+        batch_trunk_hidden_ = hidden;
         const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
                                            kEmbedding, epsilon_);
         const auto output_started = std::chrono::steady_clock::now();
@@ -1585,6 +1603,7 @@ private:
         }
         std::vector<float> output(static_cast<std::size_t>(item.dimensions[1]));
         const bool keep_resident = allow_dynamic_target_cache_ && (name == "output.weight" ||
+            (name.size() >= 6 && name.compare(0, 6, "blk.64") == 0) ||
             (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
                                    name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
         if (item.type == 21) {
@@ -1968,6 +1987,7 @@ private:
     std::vector<AttentionCache> attention_;
     AttentionCache mtp_attention_cache_;
     std::vector<float> trunk_hidden_;
+    std::vector<float> batch_trunk_hidden_;
     std::array<std::vector<float>, 5> dflash_features_;
     qwen_native::DevicePipeline *pipeline_ = nullptr;
     qwen_native::RecurrentDeviceState *recurrent_device_ = nullptr;
@@ -2795,11 +2815,8 @@ void plan_128k(const std::string &target_path, const std::string &draft_path) {
 
 void chat(const std::string &target_path, const std::string &dflash_path,
           std::size_t context_capacity, std::size_t resident_weight_budget) {
-    constexpr std::size_t target_cache_budget = 5ULL * 1024ULL * 1024ULL * 1024ULL;
-    NativeTargetSession target(target_path, context_capacity,
-                               std::min(target_cache_budget, resident_weight_budget));
+    NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
     NativeDflashEncoder dflash(dflash_path);
-    target.set_resident_weight_budget(resident_weight_budget);
     dflash.preload_all_quantized();
     target.freeze_target_weight_cache();
 
@@ -2841,9 +2858,7 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         }
         if (line == "/reset") {
             target.~NativeTargetSession();
-            new (&target) NativeTargetSession(target_path, context_capacity,
-                                              std::min(target_cache_budget, resident_weight_budget));
-            target.set_resident_weight_budget(resident_weight_budget);
+            new (&target) NativeTargetSession(target_path, context_capacity, resident_weight_budget);
             target.freeze_target_weight_cache();
             std::cerr << "  [context reset]\n\n";
             continue;
@@ -2883,7 +2898,6 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         std::uint32_t anchor = anchor_result.next_token;
 
         while (!done && generated < 8192) {
-            // Check if anchor itself is EOS
             if (anchor == tokenizer.im_end() || anchor == tokenizer.eos_token()) break;
 
             // DFlash proposes 7 continuation tokens
@@ -3075,7 +3089,7 @@ int main(int argc, char **argv) {
         }
         if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "chat") {
             const std::size_t context = argc >= 5 ? static_cast<std::size_t>(std::stoull(argv[4])) : 4096;
-            const double gib = argc >= 6 ? std::stod(argv[5]) : 6.39;
+            const double gib = argc >= 6 ? std::stod(argv[5]) : 5.5;
             chat(argv[2], argv[3], context,
                  static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0));
             return EXIT_SUCCESS;

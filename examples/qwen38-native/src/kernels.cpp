@@ -208,16 +208,16 @@ struct ResidentWeightCache {
             return nullptr;
         }
         void *device = nullptr;
-        hip_check(hipMalloc(&device, bytes), "hipMalloc resident matrix");
-        try {
-            hip_check(hipMemcpy(device, host, bytes, hipMemcpyHostToDevice), "hipMemcpy resident matrix");
-            entries.emplace(host, Entry{device, bytes});
-            resident_bytes += bytes;
-            return device;
-        } catch (...) {
-            (void) hipFree(device);
-            throw;
+        if (hipMalloc(&device, bytes) != hipSuccess) {
+            return nullptr;
         }
+        if (hipMemcpy(device, host, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+            (void) hipFree(device);
+            return nullptr;
+        }
+        entries.emplace(host, Entry{device, bytes});
+        resident_bytes += bytes;
+        return device;
     }
 
     ResidentWeightCacheStats stats() const {
@@ -2613,15 +2613,14 @@ void preload_n23q4_matrix(const void *weights, std::size_t input_size, std::size
     }
     const auto packed = convert_to_n23q4(static_cast<const Q4KBlock *>(weights), input_size, output_size);
     void *device = nullptr;
-    hip_check(hipMalloc(&device, packed.size() * sizeof(N23Q4TileGroup)), "hipMalloc N23Q4 draft matrix");
-    try {
-        hip_check(hipMemcpy(device, packed.data(), packed.size() * sizeof(N23Q4TileGroup), hipMemcpyHostToDevice),
-                  "hipMemcpy N23Q4 draft matrix");
-        cache.entries.emplace(weights, N23DraftCache::Entry{device, input_size, output_size});
-    } catch (...) {
-        (void) hipFree(device);
-        throw;
+    if (hipMalloc(&device, packed.size() * sizeof(N23Q4TileGroup)) != hipSuccess) {
+        return;
     }
+    if (hipMemcpy(device, packed.data(), packed.size() * sizeof(N23Q4TileGroup), hipMemcpyHostToDevice) != hipSuccess) {
+        (void) hipFree(device);
+        return;
+    }
+    cache.entries.emplace(weights, N23DraftCache::Entry{device, input_size, output_size});
 }
 
 void execute_n23q4_batch8_cached(const void *weights, const float *input,
