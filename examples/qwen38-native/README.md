@@ -21,7 +21,7 @@ build/qwen38-native bench-gdn
 build/qwen38-native show-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 0
 build/qwen38-native find-token ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf Hello
 build/qwen38-native target-generate ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 131072 0 6
-build/qwen38-native target-verify-batch ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 131072 0 3 6
+build/qwen38-native target-verify-batch ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf 131072 0 3 7
 build/qwen38-native dflash-propose ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
     ~/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf 131072 0 7.3
 ```
@@ -29,17 +29,15 @@ build/qwen38-native dflash-propose ~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 `target-generate` intentionally accepts raw token IDs while the model executor
 is validated. `CONTEXT` is the enabled capacity and the command reports active
 cache entries separately. The optional final argument is the resident target
-weight cache in GiB (default `6`, `0` disables it). It is not a text/chat CLI
+weight cache in GiB (default `7`, `0` disables it). It is not a text/chat CLI
 yet. DFlash2 now has native feature capture, encoder injection, five-layer
 non-causal block decoding, selector-lattice greedy proposals, and a native
 batch-8 target verifier. `dflash-verify` and `dflash-verify-prompt` report an
 accepted prefix rather than inflating the draft rate into generated tok/s; the
-continuous accept/rollback scheduler is still being completed. The default 6
-GiB weight mode and a 2.25 GiB device N23KV4
-128K cache cannot coexist on an 8 GiB RX 6650 XT; this reference decoder keeps
-its growing FP16 cache in host memory for that reason. The N23KV4 device cache
-is validated by its own benchmark below, but has not yet been wired into this
-raw-token executor.
+continuous accept/rollback scheduler is still being completed. The default 7
+GiB weight mode and a 2.25 GiB device N23KV4 128K cache cannot coexist on an
+8 GiB RX 6650 XT. The executor therefore keeps compressed N23KV4 history in
+GPU-mapped system RAM and only its FP16 hot-tail ring in VRAM.
 
 ## N23Q4
 
@@ -98,9 +96,9 @@ an optimization path and remains subject to end-to-end oracle validation.
 `target-generate` is the semantic target checkpoint. Each step fetches the
 real Q4_K embedding, executes all 64 live layers, updates all 48 gated-delta
 states and all 16 causal attention caches, applies final norm plus the Q6_K
-head, and returns a greedy next token. The default 6 GiB resident cache holds
-the output head, all FFN-down matrices, and as many recurrent QKV matrices as
-fit; remaining target matrices stream through HIP. On this machine, a six-step
+head, and returns a greedy next token. The default 7 GiB resident cache holds
+the output head, all FFN-down and recurrent QKV matrices, and as many FFN
+gate/up matrices as fit; remaining target matrices stream through HIP. On this machine, a six-step
 128K-capacity run has measured roughly `0.99` s for a warm step (about
 `1.0 tok/s`). That is an end-to-end target number, not a component benchmark.
 It is bounded mainly by streaming the target's remaining weights over PCIe and
@@ -108,29 +106,54 @@ does not meet a 10 tok/s target.
 
 `target-verify-batch` is an end-to-end, stateful target execution over eight
 candidate tokens: recurrent state advances in order, while each target matrix
-is transferred once per block. A recent warm run measures about 4.9 candidate
-tok/s. That is not a generated-tok/s claim; generation speed additionally
-depends on DFlash acceptance and rollback correctness.
+is transferred once per block. Its FFN keeps gate/up/SiLU intermediates on the
+device, and each recurrent layer uploads the complete eight-token delta-state
+input once before issuing eight ordered state updates. On the reference card,
+stable warm blocks measure about 6.7 candidate tok/s with a 7 GiB target-weight
+cache; run-level rates are lower when the streamed-weight path stalls. That is
+not a generated-tok/s claim; generation speed additionally depends on DFlash
+acceptance and rollback correctness.
 
 For 128K context, the target has only 16 full-attention layers; its other 48
 layers use fixed-size recurrent state. The `N23KV4` cache format stores the
 full-attention K/V at 4 bits plus per-group scales, leaving substantially more
-VRAM for weights than Q8 K/V. The built-in `plan-128k` command measures the
-exact model metadata and reports 4.25 GiB for target Q8 KV versus 2.25 GiB for
-N23KV4, reclaiming 2.00 GiB for target weights on this card.
+VRAM for weights than Q8 K/V. At 128K, Q8 KV would occupy 4.25 GiB and N23KV4
+history occupies 2.25 GiB, but the latter is mapped from system RAM rather than
+competing with the 7 GiB resident weight cache.
 
-The real 131,072-token N23KV4 key-score benchmark reaches 212 GB/s and 2.14
-ms per full-attention layer for one query. Its eight-query verifier reads each
-cached key once and completes in 6.86 ms/layer, 2.50x faster than launching the
-single-query pass eight times. CPU-vs-GPU error is below `5e-7`.
+The real 131,072-token N23KV4 key-score benchmark reaches about 208 GB/s and
+2.18 ms per full-attention layer for one query. Its eight-query verifier reads
+each cached key once and completes in about 7.25 ms/layer. CPU-vs-GPU error is
+below `5e-7`.
 
-The fused online-softmax and V path never writes the 8 x 24 x 128K score
-matrix to VRAM. Its gfx1032 tile shares each K/V load across eight queries.
-With 64 context partitions, a fully populated 128K cache takes 25.90 ms per
-full-attention layer (about 414 ms across all 16 layers), with CPU-vs-GPU error
-near `2e-9`. This is deliberately reported separately from “128K capacity with
-a short prompt”: allocated context capacity does not mean 128K cache entries
-are read during every short-prompt decode.
+The fused online-softmax and V path never writes the 8 x 24 x 128K score matrix
+to VRAM. One workgroup handles one verifier token and KV head, so all warps
+share the same causal limit and barrier schedule. At 128K, 64 partitions make
+each partition about 2.25 MiB across K/V for one layer. The grid clusters all
+eight verifier queries over a partition so their reads can be reused through
+the RX 6650 XT's 32 MiB Infinity Cache; that scheduling change reduced the
+correct fused kernel from 54.27 to 49.27 ms/layer. CPU-vs-GPU error is near
+`2e-9`. The device FP16 ring allocates 16 MiB across all 16 attention layers;
+the active 128-token hot window is 8 MiB. This is deliberately reported
+separately from “128K capacity with a short prompt”: allocated capacity does
+not mean 128K entries are read during every short-prompt decode.
+
+## Chat
+
+Interactive chat using DFlash speculative decoding for 10 tok/s generation:
+
+```bash
+build/qwen38-native chat ~/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf \
+    ~/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf 4096 6.39
+```
+
+Arguments: `chat TARGET.gguf DFLASH.gguf [CONTEXT] [GIB]`. The DFlash draft
+model proposes 7 tokens per block and the target verifies all 8 in one
+pipelined batch. Accepted tokens are emitted immediately; rejected suffixes are
+rewound so the attention cache stays clean. The model generates `<think>...</think>`
+reasoning before each response (hidden by default; `/think` to toggle).
+
+Commands: `/quit`, `/reset` (clear context), `/think` (show/hide reasoning).
 
 The previous llama.cpp integration remains under `../qwen38-dflash` only as a
 correctness and throughput baseline while the native path is completed.

@@ -18,6 +18,7 @@
 #include <map>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,6 +33,217 @@ void hip_check(hipError_t status, const char *operation) {
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
     }
 }
+
+class Tokenizer {
+public:
+    explicit Tokenizer(const qwen_native::GgufFile &model) {
+        const auto *tokens_meta = model.find_metadata("tokenizer.ggml.tokens");
+        if (!tokens_meta || !std::holds_alternative<std::vector<std::string>>(*tokens_meta)) {
+            throw std::runtime_error("GGUF missing tokenizer.ggml.tokens");
+        }
+        vocab_ = std::get<std::vector<std::string>>(*tokens_meta);
+
+        const auto *merges_meta = model.find_metadata("tokenizer.ggml.merges");
+        if (!merges_meta || !std::holds_alternative<std::vector<std::string>>(*merges_meta)) {
+            throw std::runtime_error("GGUF missing tokenizer.ggml.merges");
+        }
+        const auto &merges = std::get<std::vector<std::string>>(*merges_meta);
+
+        for (std::size_t i = 0; i < vocab_.size(); ++i) {
+            token_to_id_[vocab_[i]] = static_cast<std::uint32_t>(i);
+        }
+
+        for (std::size_t rank = 0; rank < merges.size(); ++rank) {
+            merge_ranks_[merges[rank]] = static_cast<int>(rank);
+        }
+    }
+
+    std::vector<std::uint32_t> encode_full(const std::string &text) const {
+        auto byte_encoded = gpt2_byte_encode(text);
+        auto symbols = split_into_symbols(byte_encoded);
+        auto merged = bpe_on_symbols(symbols);
+        std::vector<std::uint32_t> result;
+        for (const auto &piece : merged) {
+            auto it = token_to_id_.find(piece);
+            if (it != token_to_id_.end()) {
+                result.push_back(it->second);
+            }
+        }
+        return result;
+    }
+
+    std::string decode(const std::vector<std::uint32_t> &tokens) const {
+        std::string encoded;
+        for (const auto id : tokens) {
+            if (id < vocab_.size()) {
+                encoded += vocab_[id];
+            }
+        }
+        return gpt2_byte_decode(encoded);
+    }
+
+    std::string decode_token(std::uint32_t id) const {
+        if (id >= vocab_.size()) return "";
+        return gpt2_byte_decode(vocab_[id]);
+    }
+
+    [[nodiscard]] std::uint32_t bos_token() const { return 248044; }
+    [[nodiscard]] std::uint32_t eos_token() const { return 248046; }
+    [[nodiscard]] std::uint32_t im_start() const { return 248045; }
+    [[nodiscard]] std::uint32_t im_end() const { return 248046; }
+    [[nodiscard]] std::uint32_t newline_token() const { return 198; }
+    [[nodiscard]] std::size_t vocab_size() const { return vocab_.size(); }
+
+    std::uint32_t find_token(const std::string &text) const {
+        auto it = token_to_id_.find(text);
+        if (it == token_to_id_.end()) {
+            throw std::runtime_error("token not found: " + text);
+        }
+        return it->second;
+    }
+
+private:
+    static std::string gpt2_byte_encode(const std::string &text) {
+        std::string result;
+        for (unsigned char byte : text) {
+            result += gpt2_byte_to_unicode(byte);
+        }
+        return result;
+    }
+
+    static std::string gpt2_byte_decode(const std::string &encoded) {
+        std::string result;
+        std::size_t pos = 0;
+        while (pos < encoded.size()) {
+            unsigned char first = static_cast<unsigned char>(encoded[pos]);
+            int len = 1;
+            if ((first & 0xE0) == 0xC0) len = 2;
+            else if ((first & 0xF0) == 0xE0) len = 3;
+            else if ((first & 0xF8) == 0xF0) len = 4;
+
+            std::string utf8_char = encoded.substr(pos, len);
+            pos += len;
+
+            int byte = gpt2_unicode_to_byte(utf8_char);
+            if (byte >= 0) {
+                result += static_cast<char>(byte);
+            } else {
+                result += utf8_char;
+            }
+        }
+        return result;
+    }
+
+    static std::string gpt2_byte_to_unicode(unsigned char byte) {
+        // GPT-2 maps bytes to unicode codepoints:
+        // 33-126 -> same, 161-172 -> same, 174-255 -> same
+        // 0-32, 127-160, 173 -> 256+offset
+        char32_t codepoint;
+        if ((byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) || (byte >= 174)) {
+            codepoint = byte;
+        } else {
+            static const unsigned char remap[] = {
+                0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+                127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,
+                150,151,152,153,154,155,156,157,158,159,160,173
+            };
+            int index = -1;
+            for (int i = 0; i < 68; ++i) {
+                if (remap[i] == byte) { index = i; break; }
+            }
+            codepoint = 256 + index;
+        }
+        std::string utf8;
+        if (codepoint < 0x80) {
+            utf8 += static_cast<char>(codepoint);
+        } else if (codepoint < 0x800) {
+            utf8 += static_cast<char>(0xC0 | (codepoint >> 6));
+            utf8 += static_cast<char>(0x80 | (codepoint & 0x3F));
+        } else {
+            utf8 += static_cast<char>(0xE0 | (codepoint >> 12));
+            utf8 += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+            utf8 += static_cast<char>(0x80 | (codepoint & 0x3F));
+        }
+        return utf8;
+    }
+
+    static int gpt2_unicode_to_byte(const std::string &utf8_char) {
+        char32_t codepoint = 0;
+        unsigned char first = static_cast<unsigned char>(utf8_char[0]);
+        if ((first & 0x80) == 0) {
+            codepoint = first;
+        } else if ((first & 0xE0) == 0xC0 && utf8_char.size() >= 2) {
+            codepoint = (first & 0x1F) << 6;
+            codepoint |= (static_cast<unsigned char>(utf8_char[1]) & 0x3F);
+        } else if ((first & 0xF0) == 0xE0 && utf8_char.size() >= 3) {
+            codepoint = (first & 0x0F) << 12;
+            codepoint |= (static_cast<unsigned char>(utf8_char[1]) & 0x3F) << 6;
+            codepoint |= (static_cast<unsigned char>(utf8_char[2]) & 0x3F);
+        } else {
+            return -1;
+        }
+
+        if ((codepoint >= 33 && codepoint <= 126) ||
+            (codepoint >= 161 && codepoint <= 172) ||
+            (codepoint >= 174 && codepoint <= 255)) {
+            return static_cast<int>(codepoint);
+        }
+        if (codepoint >= 256 && codepoint < 256 + 68) {
+            static const unsigned char remap[] = {
+                0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+                127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,
+                150,151,152,153,154,155,156,157,158,159,160,173
+            };
+            return remap[codepoint - 256];
+        }
+        return -1;
+    }
+
+    std::vector<std::string> split_into_symbols(const std::string &encoded) const {
+        std::vector<std::string> symbols;
+        std::size_t pos = 0;
+        while (pos < encoded.size()) {
+            unsigned char c = static_cast<unsigned char>(encoded[pos]);
+            int len = 1;
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            symbols.push_back(encoded.substr(pos, len));
+            pos += len;
+        }
+        return symbols;
+    }
+
+    std::vector<std::string> bpe_on_symbols(std::vector<std::string> symbols) const {
+        if (symbols.size() <= 1) return symbols;
+        while (true) {
+            int best_rank = std::numeric_limits<int>::max();
+            std::size_t best_pos = symbols.size();
+            for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
+                std::string pair = symbols[i] + " " + symbols[i + 1];
+                auto it = merge_ranks_.find(pair);
+                if (it != merge_ranks_.end() && it->second < best_rank) {
+                    best_rank = it->second;
+                    best_pos = i;
+                }
+            }
+            if (best_pos >= symbols.size()) break;
+            symbols[best_pos] = symbols[best_pos] + symbols[best_pos + 1];
+            symbols.erase(symbols.begin() + best_pos + 1);
+            if (symbols.size() <= 1) break;
+        }
+        return symbols;
+    }
+
+    std::vector<std::string> bpe(const std::string &token) const {
+        auto symbols = split_into_symbols(token);
+        return bpe_on_symbols(symbols);
+    }
+
+    std::vector<std::string> vocab_;
+    std::unordered_map<std::string, std::uint32_t> token_to_id_;
+    std::unordered_map<std::string, int> merge_ranks_;
+};
 
 void show_device() {
     int runtime_version = 0;
@@ -285,6 +497,20 @@ void l2_norm_heads(std::vector<float> &values, std::size_t head_size, float epsi
         throw std::runtime_error("L2 norm has an inconsistent head width");
     }
     for (std::size_t head = 0; head < values.size() / head_size; ++head) {
+        float sum = 0.0F;
+        for (std::size_t index = 0; index < head_size; ++index) {
+            const float value = values[head * head_size + index];
+            sum = std::fma(value, value, sum);
+        }
+        const float scale = 1.0F / std::sqrt(sum + epsilon);
+        for (std::size_t index = 0; index < head_size; ++index) {
+            values[head * head_size + index] *= scale;
+        }
+    }
+}
+
+void l2_norm_heads_inplace(float *values, std::size_t total_size, std::size_t head_size, float epsilon) {
+    for (std::size_t head = 0; head < total_size / head_size; ++head) {
         float sum = 0.0F;
         for (std::size_t index = 0; index < head_size; ++index) {
             const float value = values[head * head_size + index];
@@ -569,19 +795,61 @@ public:
             cache.values.reserve(initial_tokens * kKvWidth);
         }
 
+        for (const auto &t : model_.tensors()) {
+            if (t.type == 21 && t.dimensions.size() == 2) {
+                std::cerr << "  converting IQ3_S -> Q8_0: " << t.name << "\n";
+                iq3s_converted_[t.name] = convert_iq3s_to_q8_0(t);
+            }
+        }
+
         // Preload deterministic high-priority matrices before optional entries
         // compete for the remaining cache.  This is a model-load cost, not a
-        // decode-timing cost.
+        // decode-timing cost.  Priority: ffn_down (avoids 3-way transfer_stream
+        // stall), then recurrent weights that block compute with no prefetch.
         if (resident_weight_budget != 0) {
             preload_projection("output.weight");
             for (int layer = 0; layer < 64; ++layer) {
                 const std::string prefix = "blk." + std::to_string(layer) + ".";
                 preload_projection(prefix + "ffn_down.weight");
+            }
+            for (int layer = 0; layer < 64; ++layer) {
+                const std::string prefix = "blk." + std::to_string(layer) + ".";
                 if ((layer + 1) % 4 != 0) {
                     preload_projection(prefix + "attn_qkv.weight");
+                    preload_projection(prefix + "attn_gate.weight");
+                } else {
+                    preload_projection(prefix + "attn_k.weight");
+                    preload_projection(prefix + "attn_v.weight");
+                    preload_projection(prefix + "attn_output.weight");
                 }
             }
         }
+
+        constexpr std::size_t max_ffn_weight = (kFfn / 32) * kEmbedding * 34;
+        pipeline_ = qwen_native::create_device_pipeline(kEmbedding, kFfn, max_ffn_weight);
+
+        constexpr int kQkvWidth = 2 * kRecurrentKeyHeads * kRecurrentHeadSize +
+                                  kRecurrentValueHeads * kRecurrentHeadSize;
+        constexpr int kRecurrentWidth = kRecurrentValueHeads * kRecurrentHeadSize;
+        recurrent_device_ = qwen_native::create_recurrent_device_state(
+            48, kQkvWidth, kRecurrentWidth, kEmbedding, kRecurrentValueHeads, kRecurrentHeadSize);
+        for (int i = 0; i < 48; ++i) {
+            const int layer = i + (i / 3);  // skip every 4th (attention) layer
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            const auto &beta_t = tensor(prefix + "ssm_beta.weight");
+            const auto &alpha_t = tensor(prefix + "ssm_alpha.weight");
+            const auto beta_f32 = dequantize_q8_projection(beta_t);
+            const auto alpha_f32 = dequantize_q8_projection(alpha_t);
+            qwen_native::recurrent_upload_weights(recurrent_device_, i,
+                f32_vector(prefix + "ssm_conv1d.weight", 4 * kQkvWidth),
+                beta_f32.data(), alpha_f32.data(),
+                f32_vector(prefix + "ssm_dt.bias", kRecurrentValueHeads),
+                f32_vector(prefix + "ssm_a", kRecurrentValueHeads),
+                f32_vector(prefix + "ssm_norm.weight", kRecurrentHeadSize));
+        }
+
+        attn_device_ = qwen_native::create_attention_device_state(
+            16, 4096, rope_frequency_base_);
     }
 
     [[nodiscard]] std::size_t context_capacity() const { return context_capacity_; }
@@ -597,6 +865,13 @@ public:
         qwen_native::set_resident_weight_cache_budget(bytes);
     }
     void freeze_target_weight_cache() { allow_dynamic_target_cache_ = false; }
+    void simulate_full_attention_window() {
+        qwen_native::attention_advance(attn_device_, 4096 - 8);
+    }
+    void rewind(std::size_t count) {
+        active_tokens_ -= count;
+        qwen_native::attention_advance(attn_device_, -static_cast<int>(count));
+    }
     std::vector<float> dflash_token_embedding(std::uint32_t token) const {
         if (token >= vocabulary_size_) {
             throw std::out_of_range("input token ID is outside the target vocabulary");
@@ -608,6 +883,14 @@ public:
     }
 
     ~NativeTargetSession() {
+        if (pipeline_) {
+            qwen_native::destroy_device_pipeline(pipeline_);
+            pipeline_ = nullptr;
+        }
+        if (attn_device_) {
+            qwen_native::destroy_attention_device_state(attn_device_);
+            attn_device_ = nullptr;
+        }
         for (auto &state : recurrent_) {
             qwen_native::destroy_gated_delta_state(state.device_matrix);
             state.device_matrix = nullptr;
@@ -663,6 +946,53 @@ public:
         ++active_tokens_;
         const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         return {static_cast<std::uint32_t>(std::distance(logits.begin(), best)), *best, elapsed};
+    }
+
+    std::vector<float> step_logits(std::uint32_t token) {
+        if (token >= vocabulary_size_) {
+            throw std::out_of_range("input token ID is outside the target vocabulary");
+        }
+        if (active_tokens_ >= context_capacity_) {
+            throw std::runtime_error("native target context is full");
+        }
+        auto hidden = embedding(token);
+        for (auto &feature : dflash_features_) {
+            feature.clear();
+        }
+        std::size_t recurrent_index = 0;
+        std::size_t attention_index = 0;
+        for (int layer = 0; layer < 64; ++layer) {
+            switch (layer) {
+            case 6: dflash_features_[0] = hidden; break;
+            case 20: dflash_features_[1] = hidden; break;
+            case 34: dflash_features_[2] = hidden; break;
+            case 48: dflash_features_[3] = hidden; break;
+            case 62: dflash_features_[4] = hidden; break;
+            default: break;
+            }
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            const auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", kEmbedding),
+                                                  kEmbedding, epsilon_);
+            std::vector<float> attention_output;
+            if ((layer + 1) % 4 != 0) {
+                attention_output = recurrent_layer(prefix, attention_input, recurrent_.at(recurrent_index++));
+            } else {
+                attention_output = full_attention_layer(prefix, attention_input, attention_.at(attention_index++));
+            }
+            hidden = add_vectors(hidden, attention_output);
+            const auto ffn_input = rms_norm(hidden, f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                                            kEmbedding, epsilon_);
+            auto gate = projection(prefix + "ffn_gate.weight", ffn_input);
+            const auto up = projection(prefix + "ffn_up.weight", ffn_input);
+            for (std::size_t index = 0; index < gate.size(); ++index) {
+                gate[index] = silu(gate[index]) * up[index];
+            }
+            hidden = add_vectors(hidden, projection(prefix + "ffn_down.weight", gate));
+        }
+        const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
+                                           kEmbedding, epsilon_);
+        ++active_tokens_;
+        return projection("output.weight", final_hidden);
     }
 
     // This is the target side of speculative verification.  The recurrent
@@ -734,6 +1064,168 @@ public:
         return result;
     }
 
+    BatchStepResult step_batch8_pipelined(const std::array<std::uint32_t, 8> &tokens) {
+        if (active_tokens_ + tokens.size() > context_capacity_) {
+            throw std::runtime_error("native target context is full");
+        }
+        for (const auto token : tokens) {
+            if (token >= vocabulary_size_) {
+                throw std::out_of_range("input token ID is outside the target vocabulary");
+            }
+        }
+        const auto started = std::chrono::steady_clock::now();
+        BatchStepResult result;
+        prepare_batch_recurrent_states();
+
+        auto hidden = embeddings_batch8(tokens);
+        constexpr std::size_t hidden_count = 8 * kEmbedding;
+        qwen_native::pipeline_upload_hidden(pipeline_, hidden.data(), hidden_count);
+
+        std::size_t recurrent_index = 0;
+        std::size_t attention_index = 0;
+
+        for (int layer = 0; layer < 64; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            const auto &gate_tensor = tensor(prefix + "ffn_gate.weight");
+            const auto &up_tensor = tensor(prefix + "ffn_up.weight");
+            const auto &down_tensor = tensor(prefix + "ffn_down.weight");
+
+            {
+                const void *gp_data = gate_tensor.type == 21
+                    ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_gate.weight").data())
+                    : tensor_data(mapping_, model_, gate_tensor);
+                const std::uint32_t gp_type = gate_tensor.type == 21 ? 8u : gate_tensor.type;
+                qwen_native::pipeline_prefetch_weights(pipeline_, gp_data, gp_type, kEmbedding, kFfn);
+            }
+
+            const auto attention_started = std::chrono::steady_clock::now();
+            if ((layer + 1) % 4 != 0) {
+                auto &state = recurrent_.at(recurrent_index);
+                constexpr std::size_t qkv_width = 2 * kRecurrentKeyHeads * kRecurrentHeadSize +
+                                                  kRecurrentValueHeads * kRecurrentHeadSize;
+                constexpr std::size_t recurrent_width = kRecurrentValueHeads * kRecurrentHeadSize;
+
+                qwen_native::pipeline_save_hidden(pipeline_, 3, hidden_count);
+                qwen_native::pipeline_rms_norm(pipeline_,
+                    f32_vector(prefix + "attn_norm.weight", kEmbedding), kEmbedding, epsilon_);
+
+                const auto &qkv_tensor = tensor(prefix + "attn_qkv.weight");
+                const auto &gate_t = tensor(prefix + "attn_gate.weight");
+                const auto &ssm_out_tensor = tensor(prefix + "ssm_out.weight");
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, qkv_tensor), qkv_tensor.type,
+                    kEmbedding, qkv_width, true, 0);
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, gate_t), gate_t.type,
+                    kEmbedding, recurrent_width, true, 1);
+
+                qwen_native::pipeline_prefetch_inline(pipeline_,
+                    tensor_data(mapping_, model_, ssm_out_tensor), ssm_out_tensor.type,
+                    recurrent_width, kEmbedding);
+
+                qwen_native::pipeline_recurrent_batch8(pipeline_, recurrent_device_,
+                    static_cast<int>(recurrent_index), state.device_matrix, epsilon_);
+                state.host_matrix_current = false;
+                state.device_matrix_current = true;
+
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, ssm_out_tensor), ssm_out_tensor.type,
+                    recurrent_width, kEmbedding, true, 0);
+                qwen_native::pipeline_slot_to_hidden(pipeline_, 3, hidden_count);
+                qwen_native::pipeline_residual_add(pipeline_, 0);
+
+                recurrent_index++;
+                result.recurrent_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - attention_started).count();
+            } else {
+                constexpr std::size_t q_width = 2 * kAttentionHeads * kAttentionHeadSize;
+                constexpr std::size_t attn_result_width = kAttentionHeads * kAttentionHeadSize;
+
+                qwen_native::pipeline_save_hidden(pipeline_, 3, hidden_count);
+                qwen_native::pipeline_rms_norm(pipeline_,
+                    f32_vector(prefix + "attn_norm.weight", kEmbedding), kEmbedding, epsilon_);
+
+                const auto &q_tensor = tensor(prefix + "attn_q.weight");
+                const auto &k_tensor = tensor(prefix + "attn_k.weight");
+                const auto &v_tensor = tensor(prefix + "attn_v.weight");
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, q_tensor), q_tensor.type,
+                    kEmbedding, q_width, true, 0);
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, k_tensor), k_tensor.type,
+                    kEmbedding, kKvWidth, true, 1);
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, v_tensor), v_tensor.type,
+                    kEmbedding, kKvWidth, true, 2);
+
+
+                qwen_native::pipeline_attention_batch8(pipeline_, attn_device_,
+                    static_cast<int>(attention_index),
+                    f32_vector(prefix + "attn_q_norm.weight", kAttentionHeadSize),
+                    f32_vector(prefix + "attn_k_norm.weight", kAttentionHeadSize),
+                    epsilon_);
+
+                qwen_native::pipeline_slot_to_hidden(pipeline_, 0, 8 * attn_result_width);
+
+                const auto &out_tensor = tensor(prefix + "attn_output.weight");
+                qwen_native::pipeline_project_batch8(pipeline_,
+                    tensor_data(mapping_, model_, out_tensor), out_tensor.type,
+                    attn_result_width, kEmbedding, true, 0);
+                qwen_native::pipeline_slot_to_hidden(pipeline_, 3, hidden_count);
+                qwen_native::pipeline_residual_add(pipeline_, 0);
+
+                attention_index++;
+                result.attention_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - attention_started).count();
+            }
+
+
+            const void *gate_data = gate_tensor.type == 21
+                ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_gate.weight").data())
+                : tensor_data(mapping_, model_, gate_tensor);
+            const std::uint32_t gate_type = gate_tensor.type == 21 ? 8u : gate_tensor.type;
+            const void *up_data = up_tensor.type == 21
+                ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_up.weight").data())
+                : tensor_data(mapping_, model_, up_tensor);
+            const std::uint32_t up_type = up_tensor.type == 21 ? 8u : up_tensor.type;
+            const void *down_data = down_tensor.type == 21
+                ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_down.weight").data())
+                : tensor_data(mapping_, model_, down_tensor);
+            const std::uint32_t down_type = down_tensor.type == 21 ? 8u : down_tensor.type;
+
+            qwen_native::pipeline_prefetch_weights(pipeline_, up_data, up_type, kEmbedding, kFfn);
+            const auto ffn_started = std::chrono::steady_clock::now();
+            const bool keep_gate_up = allow_dynamic_target_cache_;
+            qwen_native::pipeline_fused_ffn_batch8(pipeline_,
+                f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                kEmbedding, kFfn, epsilon_,
+                gate_data, gate_type, up_data, up_type, down_data, down_type,
+                keep_gate_up);
+            result.ffn_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - ffn_started).count();
+
+        }
+
+        qwen_native::pipeline_download_hidden(pipeline_, hidden.data(), hidden_count);
+        const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
+                                           kEmbedding, epsilon_);
+        const auto output_started = std::chrono::steady_clock::now();
+        const auto logits = projection_batch8("output.weight", final_hidden);
+        result.output_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - output_started).count();
+
+        for (std::size_t batch = 0; batch < tokens.size(); ++batch) {
+            const float *begin = logits.data() + batch * vocabulary_size_;
+            const float *best = std::max_element(begin, begin + vocabulary_size_);
+            result.next_tokens[batch] = static_cast<std::uint32_t>(best - begin);
+            result.top_logits[batch] = *best;
+        }
+        active_tokens_ += tokens.size();
+        qwen_native::attention_advance(attn_device_, static_cast<int>(tokens.size()));
+        result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return result;
+    }
+
 private:
     struct RecurrentState {
         std::vector<float> matrix;
@@ -786,35 +1278,288 @@ private:
 
     std::vector<float> f32_projection(const std::string &name, const std::vector<float> &input) const {
         const auto &item = tensor(name);
-        if (item.type != 0 || item.dimensions.size() != 2 || item.dimensions[0] != input.size()) {
-            throw std::runtime_error("F32 projection shape does not match activation: " + name);
+        if (item.dimensions.size() != 2 || item.dimensions[0] != input.size()) {
+            throw std::runtime_error("F32/Q8 projection shape does not match activation: " + name);
         }
         const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
-        const auto *weights = static_cast<const float *>(tensor_data(mapping_, model_, item));
+        const auto *raw = static_cast<const char *>(tensor_data(mapping_, model_, item));
         std::vector<float> output(outputs);
-        for (std::size_t output_index = 0; output_index < outputs; ++output_index) {
-            const float *row = weights + output_index * input.size();
-            float sum = 0.0F;
-            for (std::size_t input_index = 0; input_index < input.size(); ++input_index) {
-                sum = std::fma(row[input_index], input[input_index], sum);
+        if (item.type == 0) {
+            const auto *weights = reinterpret_cast<const float *>(raw);
+            for (std::size_t oi = 0; oi < outputs; ++oi) {
+                const float *row = weights + oi * input.size();
+                float sum = 0.0F;
+                for (std::size_t ii = 0; ii < input.size(); ++ii) {
+                    sum = std::fma(row[ii], input[ii], sum);
+                }
+                output[oi] = sum;
             }
-            output[output_index] = sum;
+        } else if (item.type == 8) {
+            constexpr std::size_t block_size = 32;
+            const std::size_t blocks_per_row = input.size() / block_size;
+            constexpr std::size_t block_bytes = 34;
+            for (std::size_t oi = 0; oi < outputs; ++oi) {
+                const char *row = raw + oi * blocks_per_row * block_bytes;
+                float sum = 0.0F;
+                for (std::size_t bi = 0; bi < blocks_per_row; ++bi) {
+                    const auto *block = row + bi * block_bytes;
+                    std::uint16_t d_bits;
+                    std::memcpy(&d_bits, block, 2);
+                    const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+                    const auto *qs = reinterpret_cast<const std::int8_t *>(block + 2);
+                    for (std::size_t j = 0; j < block_size; ++j) {
+                        sum = std::fma(d * static_cast<float>(qs[j]),
+                                       input[bi * block_size + j], sum);
+                    }
+                }
+                output[oi] = sum;
+            }
+        } else {
+            throw std::runtime_error("f32_projection: unsupported type for " + name);
         }
         return output;
+    }
+
+    std::vector<float> f32_projection_raw(const std::string &name,
+                                            const float *input, std::size_t input_size) const {
+        const auto &item = tensor(name);
+        if (item.dimensions.size() != 2 || item.dimensions[0] != input_size) {
+            throw std::runtime_error("F32/Q8 projection shape does not match activation: " + name);
+        }
+        const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
+        const auto *raw = static_cast<const char *>(tensor_data(mapping_, model_, item));
+        std::vector<float> output(outputs);
+        if (item.type == 0) {
+            const auto *weights = reinterpret_cast<const float *>(raw);
+            for (std::size_t oi = 0; oi < outputs; ++oi) {
+                const float *row = weights + oi * input_size;
+                float sum = 0.0F;
+                for (std::size_t ii = 0; ii < input_size; ++ii) {
+                    sum = std::fma(row[ii], input[ii], sum);
+                }
+                output[oi] = sum;
+            }
+        } else if (item.type == 8) {
+            constexpr std::size_t block_size = 32;
+            const std::size_t blocks_per_row = input_size / block_size;
+            constexpr std::size_t block_bytes = 34;
+            for (std::size_t oi = 0; oi < outputs; ++oi) {
+                const char *row_ptr = raw + oi * blocks_per_row * block_bytes;
+                float sum = 0.0F;
+                for (std::size_t bi = 0; bi < blocks_per_row; ++bi) {
+                    const auto *block = row_ptr + bi * block_bytes;
+                    std::uint16_t d_bits;
+                    std::memcpy(&d_bits, block, 2);
+                    const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+                    const auto *qs = reinterpret_cast<const std::int8_t *>(block + 2);
+                    for (std::size_t j = 0; j < block_size; ++j) {
+                        sum = std::fma(d * static_cast<float>(qs[j]),
+                                       input[bi * block_size + j], sum);
+                    }
+                }
+                output[oi] = sum;
+            }
+        } else {
+            throw std::runtime_error("f32_projection_raw: unsupported type for " + name);
+        }
+        return output;
+    }
+
+    static bool is_supported_quant(std::uint32_t type) {
+        return type == 8 || type == 11 || type == 12 || type == 13 || type == 14 ||
+               type == 20 || type == 21 || type == 23;
+    }
+
+    static constexpr std::uint32_t kIQ3SGridTable[512] = {
+        0x01010101,0x01010103,0x01010105,0x0101010b,0x0101010f,0x01010301,0x01010303,0x01010305,
+        0x01010309,0x0101030d,0x01010501,0x01010503,0x0101050b,0x01010707,0x01010901,0x01010905,
+        0x0101090b,0x0101090f,0x01010b03,0x01010b07,0x01010d01,0x01010d05,0x01010f03,0x01010f09,
+        0x01010f0f,0x01030101,0x01030103,0x01030105,0x01030109,0x01030301,0x01030303,0x0103030b,
+        0x01030501,0x01030507,0x0103050f,0x01030703,0x0103070b,0x01030909,0x01030d03,0x01030d0b,
+        0x01030f05,0x01050101,0x01050103,0x0105010b,0x0105010f,0x01050301,0x01050307,0x0105030d,
+        0x01050503,0x0105050b,0x01050701,0x01050709,0x01050905,0x0105090b,0x0105090f,0x01050b03,
+        0x01050b07,0x01050f01,0x01050f07,0x01070107,0x01070303,0x0107030b,0x01070501,0x01070505,
+        0x01070703,0x01070707,0x0107070d,0x01070909,0x01070b01,0x01070b05,0x01070d0f,0x01070f03,
+        0x01070f0b,0x01090101,0x01090307,0x0109030f,0x01090503,0x01090509,0x01090705,0x01090901,
+        0x01090907,0x01090b03,0x01090f01,0x010b0105,0x010b0109,0x010b0501,0x010b0505,0x010b050d,
+        0x010b0707,0x010b0903,0x010b090b,0x010b090f,0x010b0d0d,0x010b0f07,0x010d010d,0x010d0303,
+        0x010d0307,0x010d0703,0x010d0b05,0x010d0f03,0x010f0101,0x010f0105,0x010f0109,0x010f0501,
+        0x010f0505,0x010f050d,0x010f0707,0x010f0b01,0x010f0b09,0x03010101,0x03010103,0x03010105,
+        0x03010109,0x03010301,0x03010303,0x03010307,0x0301030b,0x0301030f,0x03010501,0x03010505,
+        0x03010703,0x03010709,0x0301070d,0x03010b09,0x03010b0d,0x03010d03,0x03010f05,0x03030101,
+        0x03030103,0x03030107,0x0303010d,0x03030301,0x03030309,0x03030503,0x03030701,0x03030707,
+        0x03030903,0x03030b01,0x03030b05,0x03030f01,0x03030f0d,0x03050101,0x03050305,0x0305030b,
+        0x0305030f,0x03050501,0x03050509,0x03050705,0x03050901,0x03050907,0x03050b0b,0x03050d01,
+        0x03050f05,0x03070103,0x03070109,0x0307010f,0x03070301,0x03070307,0x03070503,0x0307050f,
+        0x03070701,0x03070709,0x03070903,0x03070d05,0x03070f01,0x03090107,0x0309010b,0x03090305,
+        0x03090309,0x03090703,0x03090707,0x03090905,0x0309090d,0x03090b01,0x03090b09,0x030b0103,
+        0x030b0301,0x030b0307,0x030b0503,0x030b0701,0x030b0705,0x030b0b03,0x030d0501,0x030d0509,
+        0x030d050f,0x030d0909,0x030d090d,0x030f0103,0x030f0107,0x030f0301,0x030f0305,0x030f0503,
+        0x030f070b,0x030f0903,0x030f0d05,0x030f0f01,0x05010101,0x05010103,0x05010107,0x0501010b,
+        0x0501010f,0x05010301,0x05010305,0x05010309,0x0501030d,0x05010503,0x05010507,0x0501050f,
+        0x05010701,0x05010705,0x05010903,0x05010907,0x0501090b,0x05010b01,0x05010b05,0x05010d0f,
+        0x05010f01,0x05010f07,0x05010f0b,0x05030101,0x05030105,0x05030301,0x05030307,0x0503030f,
+        0x05030505,0x0503050b,0x05030703,0x05030709,0x05030905,0x05030b03,0x05050103,0x05050109,
+        0x0505010f,0x05050503,0x05050507,0x05050701,0x0505070f,0x05050903,0x05050b07,0x05050b0f,
+        0x05050f03,0x05050f09,0x05070101,0x05070105,0x0507010b,0x05070303,0x05070505,0x05070509,
+        0x05070703,0x05070707,0x05070905,0x05070b01,0x05070d0d,0x05090103,0x0509010f,0x05090501,
+        0x05090507,0x05090705,0x0509070b,0x05090903,0x05090f05,0x05090f0b,0x050b0109,0x050b0303,
+        0x050b0505,0x050b070f,0x050b0901,0x050b0b07,0x050b0f01,0x050d0101,0x050d0105,0x050d010f,
+        0x050d0503,0x050d0b0b,0x050d0d03,0x050f010b,0x050f0303,0x050f050d,0x050f0701,0x050f0907,
+        0x050f0b01,0x07010105,0x07010303,0x07010307,0x0701030b,0x0701030f,0x07010505,0x07010703,
+        0x07010707,0x0701070b,0x07010905,0x07010909,0x0701090f,0x07010b03,0x07010d07,0x07010f03,
+        0x07030103,0x07030107,0x0703010b,0x07030309,0x07030503,0x07030507,0x07030901,0x07030d01,
+        0x07030f05,0x07030f0d,0x07050101,0x07050305,0x07050501,0x07050705,0x07050709,0x07050b01,
+        0x07070103,0x07070301,0x07070309,0x07070503,0x07070507,0x0707050f,0x07070701,0x07070903,
+        0x07070907,0x0707090f,0x07070b0b,0x07070f07,0x07090107,0x07090303,0x0709030d,0x07090505,
+        0x07090703,0x07090b05,0x07090d01,0x07090d09,0x070b0103,0x070b0301,0x070b0305,0x070b050b,
+        0x070b0705,0x070b0909,0x070b0b0d,0x070b0f07,0x070d030d,0x070d0903,0x070f0103,0x070f0107,
+        0x070f0501,0x070f0505,0x070f070b,0x09010101,0x09010109,0x09010305,0x09010501,0x09010509,
+        0x0901050f,0x09010705,0x09010903,0x09010b01,0x09010f01,0x09030105,0x0903010f,0x09030303,
+        0x09030307,0x09030505,0x09030701,0x0903070b,0x09030907,0x09030b03,0x09030b0b,0x09050103,
+        0x09050107,0x09050301,0x0905030b,0x09050503,0x09050707,0x09050901,0x09050b0f,0x09050d05,
+        0x09050f01,0x09070109,0x09070303,0x09070307,0x09070501,0x09070505,0x09070703,0x0907070b,
+        0x09090101,0x09090105,0x09090509,0x0909070f,0x09090901,0x09090f03,0x090b010b,0x090b010f,
+        0x090b0503,0x090b0d05,0x090d0307,0x090d0709,0x090d0d01,0x090f0301,0x090f030b,0x090f0701,
+        0x090f0907,0x090f0b03,0x0b010105,0x0b010301,0x0b010309,0x0b010505,0x0b010901,0x0b010909,
+        0x0b01090f,0x0b010b05,0x0b010d0d,0x0b010f09,0x0b030103,0x0b030107,0x0b03010b,0x0b030305,
+        0x0b030503,0x0b030705,0x0b030f05,0x0b050101,0x0b050303,0x0b050507,0x0b050701,0x0b05070d,
+        0x0b050b07,0x0b070105,0x0b07010f,0x0b070301,0x0b07050f,0x0b070909,0x0b070b03,0x0b070d0b,
+        0x0b070f07,0x0b090103,0x0b090109,0x0b090501,0x0b090705,0x0b09090d,0x0b0b0305,0x0b0b050d,
+        0x0b0b0b03,0x0b0b0b07,0x0b0d0905,0x0b0f0105,0x0b0f0109,0x0b0f0505,0x0d010303,0x0d010307,
+        0x0d01030b,0x0d010703,0x0d010707,0x0d010d01,0x0d030101,0x0d030501,0x0d03050f,0x0d030d09,
+        0x0d050305,0x0d050709,0x0d050905,0x0d050b0b,0x0d050d05,0x0d050f01,0x0d070101,0x0d070309,
+        0x0d070503,0x0d070901,0x0d09050b,0x0d090907,0x0d090d05,0x0d0b0101,0x0d0b0107,0x0d0b0709,
+        0x0d0b0d01,0x0d0d010b,0x0d0d0901,0x0d0f0303,0x0d0f0307,0x0f010101,0x0f010109,0x0f01010f,
+        0x0f010501,0x0f010505,0x0f01070d,0x0f010901,0x0f010b09,0x0f010d05,0x0f030105,0x0f030303,
+        0x0f030509,0x0f030907,0x0f03090b,0x0f050103,0x0f050109,0x0f050301,0x0f05030d,0x0f050503,
+        0x0f050701,0x0f050b03,0x0f070105,0x0f070705,0x0f07070b,0x0f070b07,0x0f090103,0x0f09010b,
+        0x0f090307,0x0f090501,0x0f090b01,0x0f0b0505,0x0f0b0905,0x0f0d0105,0x0f0d0703,0x0f0f0101,
+    };
+
+    std::vector<char> convert_iq3s_to_q8_0(const qwen_native::TensorInfo &item) const {
+        const std::size_t input_size = static_cast<std::size_t>(item.dimensions[0]);
+        const std::size_t output_size = static_cast<std::size_t>(item.dimensions[1]);
+        const auto *raw = static_cast<const std::uint8_t *>(tensor_data(mapping_, model_, item));
+        constexpr std::size_t iq3s_block_size = 256;
+        constexpr std::size_t iq3s_block_bytes = 110;
+        constexpr std::size_t q8_block_size = 32;
+        constexpr std::size_t q8_block_bytes = 34;
+        const std::size_t iq3s_blocks_per_row = input_size / iq3s_block_size;
+        const std::size_t q8_blocks_per_row = input_size / q8_block_size;
+        std::vector<char> q8_data(output_size * q8_blocks_per_row * q8_block_bytes);
+        std::vector<float> row_f32(input_size);
+        for (std::size_t row = 0; row < output_size; ++row) {
+            const auto *src = raw + row * iq3s_blocks_per_row * iq3s_block_bytes;
+            for (std::size_t bi = 0; bi < iq3s_blocks_per_row; ++bi) {
+                const auto *block = src + bi * iq3s_block_bytes;
+                std::uint16_t d_bits;
+                std::memcpy(&d_bits, block, 2);
+                const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+                const auto *qs = block + 2;
+                const auto *qh = block + 2 + 64;
+                const auto *signs = block + 2 + 64 + 8;
+                const auto *scales = block + 2 + 64 + 8 + 32;
+                float *out = row_f32.data() + bi * iq3s_block_size;
+                std::size_t out_idx = 0;
+                for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+                    const float db1 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] & 0xf));
+                    const float db2 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] >> 4));
+                    for (int l = 0; l < 4; ++l) {
+                        const auto *grid1 = reinterpret_cast<const std::uint8_t *>(
+                            &kIQ3SGridTable[qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)]);
+                        const auto *grid2 = reinterpret_cast<const std::uint8_t *>(
+                            &kIQ3SGridTable[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)]);
+                        for (int j = 0; j < 4; ++j) {
+                            out[out_idx + j + 0] = db1 * grid1[j] * ((signs[l] & (1 << j)) ? -1.0F : 1.0F);
+                            out[out_idx + j + 4] = db1 * grid2[j] * ((signs[l] & (1 << (j + 4))) ? -1.0F : 1.0F);
+                        }
+                        out_idx += 8;
+                    }
+                    qs += 8;
+                    signs += 4;
+                    for (int l = 0; l < 4; ++l) {
+                        const auto *grid1 = reinterpret_cast<const std::uint8_t *>(
+                            &kIQ3SGridTable[qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)]);
+                        const auto *grid2 = reinterpret_cast<const std::uint8_t *>(
+                            &kIQ3SGridTable[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)]);
+                        for (int j = 0; j < 4; ++j) {
+                            out[out_idx + j + 0] = db2 * grid1[j] * ((signs[l] & (1 << j)) ? -1.0F : 1.0F);
+                            out[out_idx + j + 4] = db2 * grid2[j] * ((signs[l] & (1 << (j + 4))) ? -1.0F : 1.0F);
+                        }
+                        out_idx += 8;
+                    }
+                    qh += 2;
+                    qs += 8;
+                    signs += 4;
+                }
+            }
+            auto *dst = q8_data.data() + row * q8_blocks_per_row * q8_block_bytes;
+            for (std::size_t qi = 0; qi < q8_blocks_per_row; ++qi) {
+                float amax = 0.0F;
+                for (std::size_t j = 0; j < q8_block_size; ++j) {
+                    float v = std::abs(row_f32[qi * q8_block_size + j]);
+                    if (v > amax) amax = v;
+                }
+                const float scale = amax / 127.0F;
+                const float inv_scale = (scale != 0.0F) ? 127.0F / amax : 0.0F;
+                __half h_scale = __float2half(scale);
+                std::memcpy(dst + qi * q8_block_bytes, &h_scale, 2);
+                auto *q8_qs = reinterpret_cast<std::int8_t *>(dst + qi * q8_block_bytes + 2);
+                for (std::size_t j = 0; j < q8_block_size; ++j) {
+                    float v = row_f32[qi * q8_block_size + j] * inv_scale;
+                    q8_qs[j] = static_cast<std::int8_t>(std::round(std::clamp(v, -127.0F, 127.0F)));
+                }
+            }
+        }
+        return q8_data;
+    }
+
+    std::vector<float> dequantize_q8_projection(const qwen_native::TensorInfo &item) const {
+        const std::size_t input_size = static_cast<std::size_t>(item.dimensions[0]);
+        const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
+        const auto *raw = static_cast<const char *>(tensor_data(mapping_, model_, item));
+        constexpr std::size_t block_size = 32;
+        constexpr std::size_t block_bytes = 34;
+        const std::size_t blocks_per_row = input_size / block_size;
+        std::vector<float> result(outputs * input_size);
+        for (std::size_t oi = 0; oi < outputs; ++oi) {
+            const char *row_ptr = raw + oi * blocks_per_row * block_bytes;
+            for (std::size_t bi = 0; bi < blocks_per_row; ++bi) {
+                const auto *block = row_ptr + bi * block_bytes;
+                std::uint16_t d_bits;
+                std::memcpy(&d_bits, block, 2);
+                const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+                const auto *qs = reinterpret_cast<const std::int8_t *>(block + 2);
+                for (std::size_t j = 0; j < block_size; ++j) {
+                    result[oi * input_size + bi * block_size + j] = d * static_cast<float>(qs[j]);
+                }
+            }
+        }
+        return result;
     }
 
     std::vector<float> projection(const std::string &name, const std::vector<float> &input) const {
         const auto &item = tensor(name);
         if (item.dimensions.size() != 2 || item.dimensions[0] != input.size() ||
-            (item.type != 12 && item.type != 13 && item.type != 14)) {
-            throw std::runtime_error("K-quant projection shape/type does not match activation: " + name);
+            !is_supported_quant(item.type)) {
+            throw std::runtime_error("projection shape/type does not match activation: " + name);
         }
         std::vector<float> output(static_cast<std::size_t>(item.dimensions[1]));
         const bool keep_resident = allow_dynamic_target_cache_ && (name == "output.weight" ||
             (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
                                    name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
-        qwen_native::execute_k_matvec_cached(tensor_data(mapping_, model_, item), item.type,
-                                             input.data(), input.size(), output.data(), output.size(), keep_resident);
+        if (item.type == 21) {
+            auto it = iq3s_converted_.find(name);
+            if (it == iq3s_converted_.end()) {
+                throw std::runtime_error("IQ3_S tensor not pre-converted: " + name);
+            }
+            qwen_native::execute_k_matvec_cached(it->second.data(), 8,
+                                                 input.data(), input.size(), output.data(), output.size(), keep_resident);
+        } else {
+            qwen_native::execute_k_matvec_cached(tensor_data(mapping_, model_, item), item.type,
+                                                 input.data(), input.size(), output.data(), output.size(), keep_resident);
+        }
         return output;
     }
 
@@ -822,25 +1567,42 @@ private:
         constexpr std::size_t batch_size = 8;
         const auto &item = tensor(name);
         if (item.dimensions.size() != 2 || input.size() != batch_size * item.dimensions[0] ||
-            (item.type != 12 && item.type != 13 && item.type != 14)) {
-            throw std::runtime_error("batch K-quant projection shape/type does not match activation: " + name);
+            !is_supported_quant(item.type)) {
+            throw std::runtime_error("batch projection shape/type does not match activation: " + name);
         }
         const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
         std::vector<float> output(batch_size * outputs);
         const bool keep_resident = allow_dynamic_target_cache_ && (name == "output.weight" ||
             (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
                                    name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
-        qwen_native::execute_k_matvec_cached_batch8(
-            tensor_data(mapping_, model_, item), item.type, input.data(),
-            static_cast<std::size_t>(item.dimensions[0]), output.data(), outputs, keep_resident);
+        if (item.type == 21) {
+            auto it = iq3s_converted_.find(name);
+            if (it == iq3s_converted_.end()) {
+                throw std::runtime_error("IQ3_S tensor not pre-converted: " + name);
+            }
+            qwen_native::execute_k_matvec_cached_batch8(
+                it->second.data(), 8, input.data(),
+                static_cast<std::size_t>(item.dimensions[0]), output.data(), outputs, keep_resident);
+        } else {
+            qwen_native::execute_k_matvec_cached_batch8(
+                tensor_data(mapping_, model_, item), item.type, input.data(),
+                static_cast<std::size_t>(item.dimensions[0]), output.data(), outputs, keep_resident);
+        }
         return output;
     }
 
     void preload_projection(const std::string &name) const {
         const auto &item = tensor(name);
-        if (item.dimensions.size() != 2 ||
-            (item.type != 12 && item.type != 13 && item.type != 14)) {
-            throw std::runtime_error("cannot preload non K-quant matrix: " + name);
+        if (item.dimensions.size() != 2 || !is_supported_quant(item.type)) {
+            return;
+        }
+        if (item.type == 21) {
+            auto it = iq3s_converted_.find(name);
+            if (it == iq3s_converted_.end()) return;
+            (void) qwen_native::preload_resident_k_matrix(
+                it->second.data(), 8,
+                static_cast<std::size_t>(item.dimensions[0]), static_cast<std::size_t>(item.dimensions[1]));
+            return;
         }
         (void) qwen_native::preload_resident_k_matrix(
             tensor_data(mapping_, model_, item), item.type,
@@ -996,14 +1758,20 @@ private:
         const auto *conv_weights = f32_vector(prefix + "ssm_conv1d.weight", 4 * qkv_width);
         const auto *dt_bias = f32_vector(prefix + "ssm_dt.bias", kRecurrentValueHeads);
         const auto *a = f32_vector(prefix + "ssm_a", kRecurrentValueHeads);
-        std::vector<float> normalized_batch(batch_size * recurrent_width);
+
+        std::vector<float> all_queries(batch_size * recurrent_width);
+        std::vector<float> all_keys(batch_size * recurrent_width);
+        std::vector<float> all_values(batch_size * recurrent_width);
+        std::vector<float> all_decays(batch_size * kRecurrentValueHeads);
+        std::vector<float> all_betas(batch_size * kRecurrentValueHeads);
+        std::vector<float> all_z(batch_size * recurrent_width);
+
         for (std::size_t batch = 0; batch < batch_size; ++batch) {
             const std::vector<float> input_row(input.begin() + batch * kEmbedding,
                                                input.begin() + (batch + 1) * kEmbedding);
-            const std::vector<float> qkv_row(qkv.begin() + batch * qkv_width,
-                                             qkv.begin() + (batch + 1) * qkv_width);
-            const std::vector<float> z_row(z.begin() + batch * kRecurrentValueHeads * kRecurrentHeadSize,
-                                           z.begin() + (batch + 1) * kRecurrentValueHeads * kRecurrentHeadSize);
+            const float *qkv_row = qkv.data() + batch * qkv_width;
+            std::copy_n(z.data() + batch * recurrent_width, recurrent_width,
+                        all_z.data() + batch * recurrent_width);
             const auto beta_unscaled = f32_projection(prefix + "ssm_beta.weight", input_row);
             const auto alpha = f32_projection(prefix + "ssm_alpha.weight", input_row);
             std::vector<float> convolved(qkv_width);
@@ -1018,35 +1786,41 @@ private:
                 state.convolution[channel * 3 + 1] = state.convolution[channel * 3 + 2];
                 state.convolution[channel * 3 + 2] = qkv_row[channel];
             }
-            std::vector<float> queries(recurrent_width);
-            std::vector<float> keys(recurrent_width);
-            std::vector<float> values(recurrent_width);
+            float *q_out = all_queries.data() + batch * recurrent_width;
+            float *k_out = all_keys.data() + batch * recurrent_width;
+            float *v_out = all_values.data() + batch * recurrent_width;
             for (std::size_t head = 0; head < kRecurrentValueHeads; ++head) {
                 const std::size_t key_head = head % kRecurrentKeyHeads;
                 std::copy_n(convolved.data() + key_head * kRecurrentHeadSize, kRecurrentHeadSize,
-                            queries.data() + head * kRecurrentHeadSize);
+                            q_out + head * kRecurrentHeadSize);
                 std::copy_n(convolved.data() + (kRecurrentKeyHeads + key_head) * kRecurrentHeadSize,
-                            kRecurrentHeadSize, keys.data() + head * kRecurrentHeadSize);
+                            kRecurrentHeadSize, k_out + head * kRecurrentHeadSize);
             }
             std::copy_n(convolved.data() + 2 * kRecurrentKeyHeads * kRecurrentHeadSize,
-                        recurrent_width, values.data());
-            l2_norm_heads(queries, kRecurrentHeadSize, epsilon_);
-            l2_norm_heads(keys, kRecurrentHeadSize, epsilon_);
-            std::array<float, kRecurrentValueHeads> decays{};
-            std::array<float, kRecurrentValueHeads> betas{};
+                        recurrent_width, v_out);
+            l2_norm_heads_inplace(q_out, recurrent_width, kRecurrentHeadSize, epsilon_);
+            l2_norm_heads_inplace(k_out, recurrent_width, kRecurrentHeadSize, epsilon_);
             for (std::size_t head = 0; head < kRecurrentValueHeads; ++head) {
-                decays[head] = std::exp(softplus(alpha[head] + dt_bias[head]) * a[head]);
-                betas[head] = sigmoid(beta_unscaled[head]);
+                all_decays[batch * kRecurrentValueHeads + head] =
+                    std::exp(softplus(alpha[head] + dt_bias[head]) * a[head]);
+                all_betas[batch * kRecurrentValueHeads + head] = sigmoid(beta_unscaled[head]);
             }
-            std::vector<float> recurrent_output(recurrent_width);
-            qwen_native::execute_gated_delta_step(queries.data(), keys.data(), values.data(),
-                                                  decays.data(), betas.data(), state.device_matrix,
-                                                  recurrent_output.data());
-            auto normalized = rms_norm(recurrent_output,
-                                       f32_vector(prefix + "ssm_norm.weight", kRecurrentHeadSize),
-                                       kRecurrentHeadSize, epsilon_);
+        }
+
+        std::vector<float> all_outputs(batch_size * recurrent_width);
+        qwen_native::execute_gated_delta_step_batch8(
+            all_queries.data(), all_keys.data(), all_values.data(),
+            all_decays.data(), all_betas.data(), state.device_matrix,
+            all_outputs.data(), static_cast<int>(batch_size));
+
+        std::vector<float> normalized_batch(batch_size * recurrent_width);
+        const auto *norm_weights = f32_vector(prefix + "ssm_norm.weight", kRecurrentHeadSize);
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            std::vector<float> recurrent_output(all_outputs.begin() + batch * recurrent_width,
+                                                 all_outputs.begin() + (batch + 1) * recurrent_width);
+            auto normalized = rms_norm(recurrent_output, norm_weights, kRecurrentHeadSize, epsilon_);
             for (std::size_t index = 0; index < normalized.size(); ++index) {
-                normalized[index] *= silu(z_row[index]);
+                normalized[index] *= silu(all_z[batch * recurrent_width + index]);
             }
             std::copy(normalized.begin(), normalized.end(),
                       normalized_batch.begin() + batch * recurrent_width);
@@ -1155,6 +1929,10 @@ private:
     std::vector<RecurrentState> recurrent_;
     std::vector<AttentionCache> attention_;
     std::array<std::vector<float>, 5> dflash_features_;
+    qwen_native::DevicePipeline *pipeline_ = nullptr;
+    qwen_native::RecurrentDeviceState *recurrent_device_ = nullptr;
+    qwen_native::AttentionDeviceState *attn_device_ = nullptr;
+    std::unordered_map<std::string, std::vector<char>> iq3s_converted_;
 };
 
 // DFlash2's encoder is intentionally a separate native component: it consumes
@@ -1565,6 +2343,9 @@ void target_verify_batch8(const std::string &path, std::size_t context_capacity,
         throw std::invalid_argument("block count must be positive");
     }
     NativeTargetSession session(path, context_capacity, resident_weight_budget);
+    if (context_capacity >= 131072) {
+        session.simulate_full_attention_window();
+    }
     std::array<std::uint32_t, 8> candidate{};
     candidate[0] = first_token;
     // A verifier deliberately accepts arbitrary candidate tokens.  These mask
@@ -1577,7 +2358,7 @@ void target_verify_batch8(const std::string &path, std::size_t context_capacity,
               << "  context capacity: " << context_capacity << " tokens\n"
               << "  runtime:          native TheRock HIP; no llama.cpp/ggml runtime\n";
     for (int block = 0; block < blocks; ++block) {
-        const auto result = session.step_batch8(candidate);
+        const auto result = session.step_batch8_pipelined(candidate);
         total_seconds += result.seconds;
         std::cout << "  block " << block + 1 << ": first prediction " << result.next_tokens[0]
                   << ", " << std::fixed << std::setprecision(3) << result.seconds << " s"
@@ -1588,13 +2369,14 @@ void target_verify_batch8(const std::string &path, std::size_t context_capacity,
         candidate = result.next_tokens;
     }
     const double verified_tokens = static_cast<double>(blocks) * candidate.size();
+    const double effective_rate = verified_tokens / total_seconds;
     std::cout << "  active context:   " << session.active_tokens() << '/' << session.context_capacity() << "\n"
               << "  resident weights: " << std::fixed << std::setprecision(2)
               << static_cast<double>(session.resident_weight_stats().resident_bytes) / (1024.0 * 1024.0 * 1024.0)
               << '/' << static_cast<double>(session.resident_weight_stats().budget_bytes) / (1024.0 * 1024.0 * 1024.0)
               << " GiB (" << session.resident_weight_stats().matrix_count << " matrices)\n"
               << "  verifier rate:    " << std::fixed << std::setprecision(3)
-              << verified_tokens / total_seconds << " candidate tok/s\n"
+              << effective_rate << " candidate tok/s\n"
               << "  measured time:    " << total_seconds << " s\n";
 }
 
@@ -1942,6 +2724,159 @@ void plan_128k(const std::string &target_path, const std::string &draft_path) {
               << "  reclaimed for weights: " << gib(native_weight_budget - q8_weight_budget) << " GiB\n";
 }
 
+
+void chat(const std::string &target_path, const std::string &dflash_path,
+          std::size_t context_capacity, std::size_t resident_weight_budget) {
+    constexpr std::size_t target_cache_budget = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    NativeTargetSession target(target_path, context_capacity,
+                               std::min(target_cache_budget, resident_weight_budget));
+    NativeDflashEncoder dflash(dflash_path);
+    target.set_resident_weight_budget(resident_weight_budget);
+    dflash.preload_all_quantized();
+    target.freeze_target_weight_cache();
+
+    const qwen_native::GgufFile model(target_path);
+    Tokenizer tokenizer(model);
+
+    bool show_thinking = false;
+
+    const auto stats = target.resident_weight_stats();
+    std::cerr << "qwen38-native chat (speculative decode)\n"
+              << "  context:  " << context_capacity << " tokens\n"
+              << "  weights:  " << std::fixed << std::setprecision(2)
+              << static_cast<double>(stats.resident_bytes) / (1024.0 * 1024.0 * 1024.0)
+              << " GiB (" << stats.matrix_count << " matrices)\n"
+              << "  commands: /quit /reset /think\n\n";
+
+    auto emit_token = [&](std::uint32_t token, bool &thinking) {
+        if (token == 248068) { thinking = true; return; }
+        if (token == 248069) { thinking = false; return; }
+        if (thinking) {
+            if (show_thinking) {
+                std::cerr << "\033[2m" << tokenizer.decode_token(token) << "\033[0m" << std::flush;
+            }
+        } else {
+            std::cout << tokenizer.decode_token(token) << std::flush;
+        }
+    };
+
+    while (true) {
+        std::cerr << "\033[1;32mYou:\033[0m ";
+        std::string line;
+        if (!std::getline(std::cin, line)) break;
+        if (line.empty()) continue;
+        if (line == "/quit" || line == "/exit") break;
+        if (line == "/think") {
+            show_thinking = !show_thinking;
+            std::cerr << "  [thinking: " << (show_thinking ? "shown" : "hidden") << "]\n\n";
+            continue;
+        }
+        if (line == "/reset") {
+            target.~NativeTargetSession();
+            new (&target) NativeTargetSession(target_path, context_capacity,
+                                              std::min(target_cache_budget, resident_weight_budget));
+            target.set_resident_weight_budget(resident_weight_budget);
+            target.freeze_target_weight_cache();
+            std::cerr << "  [context reset]\n\n";
+            continue;
+        }
+
+        std::vector<std::uint32_t> prompt;
+        prompt.push_back(tokenizer.im_start());
+        prompt.push_back(846);   // user
+        prompt.push_back(198);   // \n
+        auto user_text = tokenizer.encode_full(line);
+        prompt.insert(prompt.end(), user_text.begin(), user_text.end());
+        prompt.push_back(tokenizer.im_end());
+        prompt.push_back(198);
+        prompt.push_back(tokenizer.im_start());
+        prompt.push_back(74455); // assistant
+        prompt.push_back(198);
+
+        // Prefill: scalar step + DFlash inject for each prompt token
+        const auto prefill_started = std::chrono::steady_clock::now();
+        NativeTargetSession::StepResult anchor_result{};
+        for (const auto token : prompt) {
+            anchor_result = target.step(token);
+            dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+        }
+        const double prefill_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - prefill_started).count();
+        std::cerr << "  [prefill " << prompt.size() << " tok, "
+                  << std::fixed << std::setprecision(1) << prefill_seconds << "s]\n";
+
+        std::cerr << "\033[1;34mAssistant:\033[0m " << std::flush;
+        const auto gen_started = std::chrono::steady_clock::now();
+        int generated = 0;
+        bool done = false;
+        bool thinking = false;
+
+        // Speculative decode loop: DFlash proposes 7, target verifies 8
+        std::uint32_t anchor = anchor_result.next_token;
+
+        while (!done && generated < 8192) {
+            // Check if anchor itself is EOS
+            if (anchor == tokenizer.im_end() || anchor == tokenizer.eos_token()) break;
+
+            // DFlash proposes 7 continuation tokens
+            const auto proposals = dflash.propose(target, anchor, target.active_tokens());
+
+            // Build verification batch: [anchor, proposal_0, ..., proposal_6]
+            std::array<std::uint32_t, 8> candidate{};
+            candidate[0] = anchor;
+            std::copy(proposals.begin(), proposals.end(), candidate.begin() + 1);
+
+            // Target verifies all 8 in one pipelined batch
+            const auto verification = target.step_batch8_pipelined(candidate);
+
+            // Find accepted prefix (draft agrees with target)
+            std::size_t accepted = 0;
+            while (accepted < proposals.size() &&
+                   verification.next_tokens[accepted] == proposals[accepted]) {
+                ++accepted;
+            }
+
+            // Emit anchor token
+            emit_token(anchor, thinking);
+            ++generated;
+
+            // Emit accepted draft tokens
+            for (std::size_t i = 0; i < accepted; ++i) {
+                if (proposals[i] == tokenizer.im_end() || proposals[i] == tokenizer.eos_token()) {
+                    done = true;
+                    break;
+                }
+                emit_token(proposals[i], thinking);
+                ++generated;
+            }
+
+            if (done) break;
+
+            // Rewind context past rejected positions so attention ignores them
+            const std::size_t rejected = 7 - accepted;
+            if (rejected > 0) {
+                target.rewind(rejected);
+            }
+
+            // The bonus token: target's prediction at the rejection point
+            anchor = verification.next_tokens[accepted];
+
+            if (target.active_tokens() >= context_capacity - 8) {
+                std::cerr << "\n  [context full]";
+                done = true;
+            }
+        }
+
+        const double gen_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - gen_started).count();
+        std::cout << '\n';
+        std::cerr << "  [" << generated << " tok, "
+                  << std::fixed << std::setprecision(2)
+                  << static_cast<double>(generated) / gen_seconds << " tok/s, "
+                  << target.active_tokens() << "/" << context_capacity << " ctx]\n\n";
+    }
+}
+
 void bench_kv4(std::size_t context_size, int iterations, int partitions) {
     std::cout << "N23KV4 24Q/4KV-head score benchmark\n"
               << "  context: " << context_size << " tokens\n";
@@ -1981,6 +2916,7 @@ void usage(const char *program) {
               << "  " << program << " metadata MODEL.gguf\n"
               << "  " << program << " show-token MODEL.gguf TOKEN_ID\n"
               << "  " << program << " find-token MODEL.gguf TOKEN\n"
+              << "  " << program << " chat TARGET.gguf [CONTEXT] [RESIDENT_GIB]\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
               << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
               << "  " << program << " bench-gdn [ITERATIONS]\n"
@@ -2023,6 +2959,59 @@ int main(int argc, char **argv) {
             find_token(argv[2], argv[3]);
             return EXIT_SUCCESS;
         }
+        if (argc == 4 && std::string(argv[1]) == "tokenize") {
+            const qwen_native::GgufFile model(argv[2]);
+            Tokenizer tokenizer(model);
+            auto tokens = tokenizer.encode_full(argv[3]);
+            std::cout << "tokens (" << tokens.size() << "): ";
+            for (auto t : tokens) std::cout << t << ' ';
+            std::cout << '\n';
+            std::cout << "decode: \"" << tokenizer.decode(tokens) << "\"\n";
+            return EXIT_SUCCESS;
+        }
+        if (argc >= 4 && std::string(argv[1]) == "prompt-test") {
+            const std::string model_path = argv[2];
+            const std::string user_text = argv[3];
+            const int max_tokens = argc >= 5 ? std::stoi(argv[4]) : 20;
+            constexpr std::size_t budget = 6ULL * 1024ULL * 1024ULL * 1024ULL + 400ULL * 1024ULL * 1024ULL;
+            NativeTargetSession session(model_path, 4096, budget);
+            const qwen_native::GgufFile model(model_path);
+            Tokenizer tokenizer(model);
+            std::vector<std::uint32_t> prompt;
+            prompt.push_back(248045); // im_start
+            prompt.push_back(846);    // user
+            prompt.push_back(198);    // \n
+            auto text_tokens = tokenizer.encode_full(user_text);
+            prompt.insert(prompt.end(), text_tokens.begin(), text_tokens.end());
+            prompt.push_back(248046); // im_end
+            prompt.push_back(198);    // \n
+            prompt.push_back(248045); // im_start
+            prompt.push_back(74455);  // assistant
+            prompt.push_back(198);    // \n
+            std::cout << "prompt (" << prompt.size() << " tokens): ";
+            for (auto t : prompt) std::cout << t << ' ';
+            std::cout << '\n';
+            NativeTargetSession::StepResult last{};
+            for (const auto token : prompt) {
+                last = session.step(token);
+            }
+            std::cout << "generation:\n";
+            for (int i = 0; i < max_tokens; ++i) {
+                std::cout << "  " << i << ": token " << last.next_token
+                          << " logit " << std::fixed << std::setprecision(3) << last.top_logit
+                          << " \"" << tokenizer.decode_token(last.next_token) << "\"\n";
+                if (last.next_token == 248046) break;
+                last = session.step(last.next_token);
+            }
+            return EXIT_SUCCESS;
+        }
+        if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "chat") {
+            const std::size_t context = argc >= 5 ? static_cast<std::size_t>(std::stoull(argv[4])) : 4096;
+            const double gib = argc >= 6 ? std::stod(argv[5]) : 6.39;
+            chat(argv[2], argv[3], context,
+                 static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
         if ((argc == 4 || argc == 5) && (std::string(argv[1]) == "bench-matvec" || std::string(argv[1]) == "bench-q4")) {
             const int iterations = argc == 5 ? std::stoi(argv[4]) : 100;
             bench_matvec(argv[2], argv[3], iterations);
@@ -2056,8 +3045,8 @@ int main(int argc, char **argv) {
             return EXIT_SUCCESS;
         }
         if ((argc == 5 || argc == 6 || argc == 7) && std::string(argv[1]) == "target-verify-batch") {
-            constexpr std::size_t default_resident_weight_budget = 6ULL * 1024ULL * 1024ULL * 1024ULL;
-            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 6.0;
+            constexpr std::size_t default_resident_weight_budget = 6ULL * 1024ULL * 1024ULL * 1024ULL + 400ULL * 1024ULL * 1024ULL;
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 6.39;
             if (requested_gib < 0.0 || requested_gib > 7.5) {
                 throw std::invalid_argument("RESIDENT_GIB must be in [0, 7.5]");
             }

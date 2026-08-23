@@ -68,6 +68,41 @@ struct N23KV4Group {
 };
 static_assert(sizeof(N23KV4Group) == 18);
 
+struct Q8_0Block {
+    std::uint16_t d;
+    std::int8_t qs[32];
+};
+static_assert(sizeof(Q8_0Block) == 34);
+
+struct IQ4XSBlock {
+    std::uint16_t d;
+    std::uint16_t scales_h;
+    std::uint8_t scales_l[4];
+    std::uint8_t qs[128];
+};
+static_assert(sizeof(IQ4XSBlock) == 136);
+
+struct IQ4NLBlock {
+    std::uint16_t d;
+    std::uint8_t qs[16];
+};
+static_assert(sizeof(IQ4NLBlock) == 18);
+
+struct Q3KBlock {
+    std::uint8_t hmask[32];
+    std::uint8_t qs[64];
+    std::uint8_t scales[12];
+    std::uint16_t d;
+};
+static_assert(sizeof(Q3KBlock) == 110);
+
+constexpr int kQ8Block = 32;
+constexpr int kIQ4NLBlock = 32;
+
+__device__ constexpr int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
 void hip_check(hipError_t status, const char *operation) {
     if (status != hipSuccess) {
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
@@ -595,6 +630,325 @@ __global__ void quantize_q8_groups_kernel(const float *__restrict__ input,
     }
 }
 
+__global__ void q8_0_matvec_batch8_kernel(const Q8_0Block *__restrict__ weights,
+                                          const float *__restrict__ input,
+                                          float *__restrict__ output,
+                                          int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sums[8] = {};
+    const Q8_0Block *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const Q8_0Block &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        const float weight = d * static_cast<float>(block.qs[lane]);
+        const int idx = bi * kQ8Block + lane;
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] = fmaf(weight, input[static_cast<std::size_t>(batch) * input_size + idx], sums[batch]);
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
+__global__ void iq4xs_matvec_batch8_kernel(const IQ4XSBlock *__restrict__ weights,
+                                           const float *__restrict__ input,
+                                           float *__restrict__ output,
+                                           int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sums[8] = {};
+    const IQ4XSBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const IQ4XSBlock &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+#pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((block.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf)
+                         | (((block.scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * static_cast<float>(ls - 32);
+            int nibble;
+            if (lane < 16) {
+                nibble = block.qs[ib * 16 + lane] & 0xf;
+            } else {
+                nibble = block.qs[ib * 16 + lane - 16] >> 4;
+            }
+            const float weight = dl * static_cast<float>(kvalues_iq4nl[nibble]);
+            const int idx = bi * kQuantBlock + ib * 32 + lane;
+#pragma unroll
+            for (int batch = 0; batch < 8; ++batch) {
+                sums[batch] = fmaf(weight, input[static_cast<std::size_t>(batch) * input_size + idx], sums[batch]);
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
+__global__ void iq4nl_matvec_batch8_kernel(const IQ4NLBlock *__restrict__ weights,
+                                           const float *__restrict__ input,
+                                           float *__restrict__ output,
+                                           int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sums[8] = {};
+    const IQ4NLBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const IQ4NLBlock &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        int nibble;
+        if (lane < 16) {
+            nibble = block.qs[lane] & 0xf;
+        } else {
+            nibble = block.qs[lane - 16] >> 4;
+        }
+        const float weight = d * static_cast<float>(kvalues_iq4nl[nibble]);
+        const int idx = bi * kIQ4NLBlock + lane;
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] = fmaf(weight, input[static_cast<std::size_t>(batch) * input_size + idx], sums[batch]);
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
+__device__ int q3k_decode_scale(const std::uint8_t *scales, int sb) {
+    int low4, high2;
+    const int j = sb & 3;
+    if (sb < 4) {
+        low4 = scales[j] & 0xf;
+        high2 = (scales[8 + j] >> 0) & 3;
+    } else if (sb < 8) {
+        low4 = scales[j] >> 4;
+        high2 = (scales[8 + j] >> 2) & 3;
+    } else if (sb < 12) {
+        low4 = scales[4 + j] & 0xf;
+        high2 = (scales[8 + j] >> 4) & 3;
+    } else {
+        low4 = scales[4 + j] >> 4;
+        high2 = (scales[8 + j] >> 6) & 3;
+    }
+    return (low4 | (high2 << 4)) - 32;
+}
+
+__global__ void q3k_matvec_batch8_kernel(const Q3KBlock *__restrict__ weights,
+                                         const float *__restrict__ input,
+                                         float *__restrict__ output,
+                                         int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sums[8] = {};
+    const Q3KBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const Q3KBlock &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+#pragma unroll
+        for (int iter = 0; iter < 8; ++iter) {
+            const int p = iter * 32 + lane;
+            const int sb = p / 16;
+            const int pos_in_sub = p % 16;
+            const int q_group = sb / 4;
+            const int shift = (sb % 4) * 2;
+            const int low2 = (block.qs[q_group * 16 + pos_in_sub] >> shift) & 3;
+            const int high1 = (block.hmask[p / 8] >> (p % 8)) & 1;
+            const int q3 = low2 | (high1 << 2);
+            const float dl = d * static_cast<float>(q3k_decode_scale(block.scales, sb));
+            const float weight = dl * static_cast<float>(q3 - 4);
+            const int idx = bi * kQuantBlock + p;
+#pragma unroll
+            for (int batch = 0; batch < 8; ++batch) {
+                sums[batch] = fmaf(weight, input[static_cast<std::size_t>(batch) * input_size + idx], sums[batch]);
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
+__global__ void q8_0_matvec_kernel(const Q8_0Block *__restrict__ weights,
+                                   const float *__restrict__ input,
+                                   float *__restrict__ output,
+                                   int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sum = 0.0F;
+    const Q8_0Block *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const Q8_0Block &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        const float weight = d * static_cast<float>(block.qs[lane]);
+        sum = fmaf(weight, input[bi * kQ8Block + lane], sum);
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down(sum, offset, kWarpSize);
+    }
+    if (lane == 0) {
+        output[row] = sum;
+    }
+}
+
+__global__ void iq4xs_matvec_kernel(const IQ4XSBlock *__restrict__ weights,
+                                    const float *__restrict__ input,
+                                    float *__restrict__ output,
+                                    int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sum = 0.0F;
+    const IQ4XSBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const IQ4XSBlock &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+#pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((block.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf)
+                         | (((block.scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * static_cast<float>(ls - 32);
+            int nibble;
+            if (lane < 16) {
+                nibble = block.qs[ib * 16 + lane] & 0xf;
+            } else {
+                nibble = block.qs[ib * 16 + lane - 16] >> 4;
+            }
+            const float weight = dl * static_cast<float>(kvalues_iq4nl[nibble]);
+            sum = fmaf(weight, input[bi * kQuantBlock + ib * 32 + lane], sum);
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down(sum, offset, kWarpSize);
+    }
+    if (lane == 0) {
+        output[row] = sum;
+    }
+}
+
+__global__ void iq4nl_matvec_kernel(const IQ4NLBlock *__restrict__ weights,
+                                    const float *__restrict__ input,
+                                    float *__restrict__ output,
+                                    int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sum = 0.0F;
+    const IQ4NLBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const IQ4NLBlock &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        int nibble;
+        if (lane < 16) {
+            nibble = block.qs[lane] & 0xf;
+        } else {
+            nibble = block.qs[lane - 16] >> 4;
+        }
+        const float weight = d * static_cast<float>(kvalues_iq4nl[nibble]);
+        sum = fmaf(weight, input[bi * kIQ4NLBlock + lane], sum);
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down(sum, offset, kWarpSize);
+    }
+    if (lane == 0) {
+        output[row] = sum;
+    }
+}
+
+__global__ void q3k_matvec_kernel(const Q3KBlock *__restrict__ weights,
+                                  const float *__restrict__ input,
+                                  float *__restrict__ output,
+                                  int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+
+    float sum = 0.0F;
+    const Q3KBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const Q3KBlock &block = row_weights[bi];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+#pragma unroll
+        for (int iter = 0; iter < 8; ++iter) {
+            const int p = iter * 32 + lane;
+            const int sb = p / 16;
+            const int pos_in_sub = p % 16;
+            const int q_group = sb / 4;
+            const int shift = (sb % 4) * 2;
+            const int low2 = (block.qs[q_group * 16 + pos_in_sub] >> shift) & 3;
+            const int high1 = (block.hmask[p / 8] >> (p % 8)) & 1;
+            const int q3 = low2 | (high1 << 2);
+            const float dl = d * static_cast<float>(q3k_decode_scale(block.scales, sb));
+            const float weight = dl * static_cast<float>(q3 - 4);
+            sum = fmaf(weight, input[bi * kQuantBlock + p], sum);
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down(sum, offset, kWarpSize);
+    }
+    if (lane == 0) {
+        output[row] = sum;
+    }
+}
+
 // Autoregressive gated-delta recurrence for one target recurrent layer.  A
 // block owns one 128x128 value-head state, updates it in FP16, and produces
 // the 128-element state@q result in the same launch.  The target has 48 value
@@ -613,19 +967,17 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
     const std::size_t vector_offset = static_cast<std::size_t>(head) * head_size;
     const std::size_t state_offset = vector_offset * head_size;
     __shared__ float delta[128];
+    const float decay = decays[head];
     if (thread < head_size) {
-        // State is [key, value].  Match the target reference exactly:
-        // predicted[value] = sum_key state[key, value] * key[key].
         float predicted = 0.0F;
         for (int row = 0; row < head_size; ++row) {
             predicted = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
                              keys[vector_offset + row], predicted);
         }
-        delta[thread] = (values[vector_offset + thread] - predicted) * betas[head];
+        delta[thread] = (values[vector_offset + thread] - decay * predicted) * betas[head];
     }
     __syncthreads();
 
-    const float decay = decays[head];
     for (int element = thread; element < head_size * head_size; element += static_cast<int>(blockDim.x)) {
         const int row = element / head_size;
         const int column = element % head_size;
@@ -642,6 +994,250 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
                        queries[vector_offset + row], sum);
         }
         output[vector_offset + thread] = sum * 0.08838834764831843F;
+    }
+}
+
+__global__ void gated_delta_step_batch8_kernel(const float *__restrict__ queries,
+                                               const float *__restrict__ keys,
+                                               const float *__restrict__ values,
+                                               const float *__restrict__ decays,
+                                               const float *__restrict__ betas,
+                                               __half *__restrict__ states,
+                                               float *__restrict__ output,
+                                               int head_size, int batch_count) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int thread = static_cast<int>(threadIdx.x);
+    const std::size_t vector_offset = static_cast<std::size_t>(head) * head_size;
+    const std::size_t state_offset = vector_offset * head_size;
+    const std::size_t vectors_per_batch = 48ULL * head_size;
+    __shared__ float delta[128];
+
+    for (int token = 0; token < batch_count; ++token) {
+        const float *t_keys = keys + token * vectors_per_batch;
+        const float *t_values = values + token * vectors_per_batch;
+        const float *t_queries = queries + token * vectors_per_batch;
+        const float t_decay = decays[token * 48 + head];
+        const float t_beta = betas[token * 48 + head];
+
+        if (thread < head_size) {
+            float predicted = 0.0F;
+            for (int row = 0; row < head_size; ++row) {
+                predicted = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+                                 t_keys[vector_offset + row], predicted);
+            }
+            delta[thread] = (t_values[vector_offset + thread] - t_decay * predicted) * t_beta;
+        }
+        __syncthreads();
+
+        for (int element = thread; element < head_size * head_size; element += static_cast<int>(blockDim.x)) {
+            const int row = element / head_size;
+            const int column = element % head_size;
+            const float updated = t_decay * __half2float(states[state_offset + element])
+                                + t_keys[vector_offset + row] * delta[column];
+            states[state_offset + element] = __float2half(updated);
+        }
+        __syncthreads();
+
+        if (thread < head_size) {
+            float sum = 0.0F;
+            for (int row = 0; row < head_size; ++row) {
+                sum = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+                           t_queries[vector_offset + row], sum);
+            }
+            output[token * vectors_per_batch + vector_offset + thread] = sum * 0.08838834764831843F;
+        }
+        __syncthreads();
+    }
+}
+
+// GPU-native recurrent: conv1d + SiLU + split QKV + L2 norm.
+// One block per channel group, iterates over 8 tokens sequentially (state is serial).
+// qkv_width = 2*key_heads*head_size + value_heads*head_size = 7680 for this model.
+// Output: queries[8*recurrent_width], keys[8*recurrent_width], values[8*recurrent_width]
+// where recurrent_width = value_heads * head_size = 6144.
+__global__ void recurrent_conv1d_batch8_kernel(
+        const float *__restrict__ qkv_input,   // slot[0]: 8 × qkv_width
+        float *__restrict__ conv_state,         // 3 × qkv_width (persistent per layer)
+        const float *__restrict__ conv_weights, // 4 × qkv_width
+        float *__restrict__ queries,            // 8 × recurrent_width output
+        float *__restrict__ keys,               // 8 × recurrent_width output
+        float *__restrict__ values,             // 8 × recurrent_width output
+        int qkv_width, int key_heads, int value_heads, int head_size) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= qkv_width) return;
+
+    const int recurrent_width = value_heads * head_size;
+    const float w0 = conv_weights[channel * 4 + 0];
+    const float w1 = conv_weights[channel * 4 + 1];
+    const float w2 = conv_weights[channel * 4 + 2];
+    const float w3 = conv_weights[channel * 4 + 3];
+
+    float s0 = conv_state[channel * 3 + 0];
+    float s1 = conv_state[channel * 3 + 1];
+    float s2 = conv_state[channel * 3 + 2];
+
+    for (int token = 0; token < 8; ++token) {
+        const float input_val = qkv_input[token * qkv_width + channel];
+        float sum = fmaf(s0, w0, fmaf(s1, w1, fmaf(s2, w2, input_val * w3)));
+        float activated = sum / (1.0f + expf(-sum)); // SiLU
+
+        s0 = s1;
+        s1 = s2;
+        s2 = input_val;
+
+        // Split into Q/K/V based on channel position
+        const int key_region = key_heads * head_size;
+        if (channel < key_region) {
+            // Q region: replicate each key head to value_heads/key_heads copies
+            const int key_head = channel / head_size;
+            const int dim = channel % head_size;
+            const int heads_per_key = value_heads / key_heads;
+            for (int rep = 0; rep < heads_per_key; ++rep) {
+                const int out_head = key_head * heads_per_key + rep;
+                queries[token * recurrent_width + out_head * head_size + dim] = activated;
+            }
+        } else if (channel < 2 * key_region) {
+            // K region: replicate each key head to value_heads/key_heads copies
+            const int key_head = (channel - key_region) / head_size;
+            const int dim = (channel - key_region) % head_size;
+            const int heads_per_key = value_heads / key_heads;
+            for (int rep = 0; rep < heads_per_key; ++rep) {
+                const int out_head = key_head * heads_per_key + rep;
+                keys[token * recurrent_width + out_head * head_size + dim] = activated;
+            }
+        } else {
+            // V region: direct mapping
+            const int v_offset = channel - 2 * key_region;
+            values[token * recurrent_width + v_offset] = activated;
+        }
+    }
+
+    conv_state[channel * 3 + 0] = s0;
+    conv_state[channel * 3 + 1] = s1;
+    conv_state[channel * 3 + 2] = s2;
+}
+
+// L2 normalize queries and keys per head (in-place).
+// Grid: value_heads blocks, 128 threads (= head_size).
+__global__ void recurrent_l2_norm_batch8_kernel(
+        float *__restrict__ queries,  // 8 × recurrent_width
+        float *__restrict__ keys,     // 8 × recurrent_width
+        int recurrent_width, int head_size, float epsilon) {
+    const int head = blockIdx.x;
+    const int dim = threadIdx.x;
+    if (dim >= head_size) return;
+
+    for (int token = 0; token < 8; ++token) {
+        const int base = token * recurrent_width + head * head_size;
+
+        // L2 norm queries
+        __shared__ float q_sum_sq[128];
+        q_sum_sq[dim] = queries[base + dim] * queries[base + dim];
+        __syncthreads();
+        for (int stride = 64; stride > 0; stride >>= 1) {
+            if (dim < stride) q_sum_sq[dim] += q_sum_sq[dim + stride];
+            __syncthreads();
+        }
+        float q_scale = rsqrtf(q_sum_sq[0] / head_size + epsilon);
+        queries[base + dim] *= q_scale;
+
+        // L2 norm keys
+        __shared__ float k_sum_sq[128];
+        k_sum_sq[dim] = keys[base + dim] * keys[base + dim];
+        __syncthreads();
+        for (int stride = 64; stride > 0; stride >>= 1) {
+            if (dim < stride) k_sum_sq[dim] += k_sum_sq[dim + stride];
+            __syncthreads();
+        }
+        float k_scale = rsqrtf(k_sum_sq[0] / head_size + epsilon);
+        keys[base + dim] *= k_scale;
+        __syncthreads();
+    }
+}
+
+// Compute decay and beta from hidden state via F32 matmul (5120→48).
+// Grid: value_heads(48) blocks × 1, 256 threads per block.
+// Each block computes beta[head] and alpha[head] for all 8 tokens.
+__global__ void recurrent_decay_beta_batch8_kernel(
+        const float *__restrict__ hidden,        // 8 × embedding_size (pipeline hidden)
+        const float *__restrict__ beta_weights,  // 48 × embedding_size (row-major)
+        const float *__restrict__ alpha_weights, // 48 × embedding_size (row-major)
+        const float *__restrict__ dt_bias,       // 48
+        const float *__restrict__ a_weights,     // 48
+        float *__restrict__ decays,              // 8 × 48 output
+        float *__restrict__ betas,               // 8 × 48 output
+        int embedding_size) {
+    const int head = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float partial_beta[256];
+    __shared__ float partial_alpha[256];
+
+    const float *beta_row = beta_weights + head * embedding_size;
+    const float *alpha_row = alpha_weights + head * embedding_size;
+    const float bias = dt_bias[head];
+    const float a_val = a_weights[head];
+
+    for (int token = 0; token < 8; ++token) {
+        const float *input = hidden + token * embedding_size;
+        float sum_beta = 0.0f;
+        float sum_alpha = 0.0f;
+        for (int i = tid; i < embedding_size; i += 256) {
+            sum_beta = fmaf(beta_row[i], input[i], sum_beta);
+            sum_alpha = fmaf(alpha_row[i], input[i], sum_alpha);
+        }
+        partial_beta[tid] = sum_beta;
+        partial_alpha[tid] = sum_alpha;
+        __syncthreads();
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                partial_beta[tid] += partial_beta[tid + stride];
+                partial_alpha[tid] += partial_alpha[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float alpha_val = partial_alpha[0];
+            float sp = logf(1.0f + expf(alpha_val + bias)); // softplus
+            decays[token * 48 + head] = expf(sp * a_val);
+            betas[token * 48 + head] = 1.0f / (1.0f + expf(-partial_beta[0])); // sigmoid
+        }
+        __syncthreads();
+    }
+}
+
+// SSM norm + SiLU gate multiply.
+// Input: gdn_output (8 × recurrent_width), gate (slot[1], 8 × recurrent_width)
+// norm_weights: head_size floats (applied per head)
+// Output: written to pipeline hidden buffer (8 × recurrent_width)
+__global__ void recurrent_ssm_norm_gate_batch8_kernel(
+        const float *__restrict__ gdn_output,  // 8 × recurrent_width
+        const float *__restrict__ gate,        // slot[1]: 8 × recurrent_width
+        const float *__restrict__ norm_weights,// head_size
+        float *__restrict__ output,            // 8 × recurrent_width → pipeline hidden
+        int recurrent_width, int /*value_heads*/, int head_size, float epsilon) {
+    const int head = blockIdx.x;
+    const int dim = threadIdx.x;
+    if (dim >= head_size) return;
+
+    __shared__ float sum_sq_shared[128];
+
+    for (int token = 0; token < 8; ++token) {
+        const int base = token * recurrent_width + head * head_size;
+        float val = gdn_output[base + dim];
+
+        sum_sq_shared[dim] = val * val;
+        __syncthreads();
+        for (int stride = 64; stride > 0; stride >>= 1) {
+            if (dim < stride) sum_sq_shared[dim] += sum_sq_shared[dim + stride];
+            __syncthreads();
+        }
+        float scale = rsqrtf(sum_sq_shared[0] / head_size + epsilon);
+
+        float normed = val * scale * norm_weights[dim];
+        float g = gate[base + dim];
+        float silu_g = g / (1.0f + expf(-g));
+        output[base + dim] = normed * silu_g;
+        __syncthreads();
     }
 }
 
@@ -1300,15 +1896,19 @@ std::vector<float> n23q4_reference(const std::vector<N23Q4TileGroup> &weights,
 
 std::size_t k_quant_weight_bytes(std::uint32_t type, std::size_t input_size,
                                  std::size_t output_size) {
-    if (input_size == 0 || input_size % kQuantBlock != 0 || output_size == 0) {
-        throw std::invalid_argument("K-quant matrix dimensions must be non-zero multiples of 256");
+    if (input_size == 0 || output_size == 0) {
+        throw std::invalid_argument("matrix dimensions must be non-zero");
     }
-    const std::size_t blocks = input_size / kQuantBlock;
     switch (type) {
-    case 12: return blocks * output_size * sizeof(Q4KBlock);
-    case 13: return blocks * output_size * sizeof(Q5KBlock);
-    case 14: return blocks * output_size * sizeof(Q6KBlock);
-    default: throw std::invalid_argument("matrix is not a supported K-quant type");
+    case 8:  return (input_size / kQ8Block) * output_size * sizeof(Q8_0Block);
+    case 11: return (input_size / kQuantBlock) * output_size * sizeof(Q3KBlock);
+    case 12: return (input_size / kQuantBlock) * output_size * sizeof(Q4KBlock);
+    case 13: return (input_size / kQuantBlock) * output_size * sizeof(Q5KBlock);
+    case 14: return (input_size / kQuantBlock) * output_size * sizeof(Q6KBlock);
+    case 20: return (input_size / kIQ4NLBlock) * output_size * sizeof(IQ4NLBlock);
+    case 21: return (input_size / kQuantBlock) * output_size * sizeof(Q3KBlock);
+    case 23: return (input_size / kQuantBlock) * output_size * sizeof(IQ4XSBlock);
+    default: throw std::invalid_argument("matrix is not a supported quant type");
     }
 }
 
@@ -1316,28 +1916,65 @@ void launch_k_matvec_batch8(std::uint32_t type, const void *weights, const float
                             float *output, std::size_t input_size, std::size_t output_size) {
     const dim3 grid(static_cast<unsigned int>(output_size));
     const dim3 block(kWarpSize);
-    const int blocks_per_row = static_cast<int>(input_size / kQuantBlock);
     switch (type) {
+    case 8:
+        hipLaunchKernelGGL(q8_0_matvec_batch8_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q8_0Block *>(weights), input, output,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQ8Block),
+                           static_cast<int>(output_size));
+        return;
+    case 11:
+        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q3KBlock *>(weights), input, output,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        return;
     case 12:
         hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid, block, 0, nullptr,
                            static_cast<const Q4KBlock *>(weights), input, output,
-                           static_cast<int>(input_size), blocks_per_row,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
     case 13:
         hipLaunchKernelGGL(q5k_matvec_batch8_kernel, grid, block, 0, nullptr,
                            static_cast<const Q5KBlock *>(weights), input, output,
-                           static_cast<int>(input_size), blocks_per_row,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
     case 14:
         hipLaunchKernelGGL(q6k_matvec_batch8_kernel, grid, block, 0, nullptr,
                            static_cast<const Q6KBlock *>(weights), input, output,
-                           static_cast<int>(input_size), blocks_per_row,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 20:
+        hipLaunchKernelGGL(iq4nl_matvec_batch8_kernel, grid, block, 0, nullptr,
+                           static_cast<const IQ4NLBlock *>(weights), input, output,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kIQ4NLBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 21:
+        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q3KBlock *>(weights), input, output,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 23:
+        hipLaunchKernelGGL(iq4xs_matvec_batch8_kernel, grid, block, 0, nullptr,
+                           static_cast<const IQ4XSBlock *>(weights), input, output,
+                           static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
     default:
-        throw std::invalid_argument("matrix is not a supported K-quant type");
+        throw std::invalid_argument("matrix is not a supported quant type");
     }
 }
 
@@ -1345,25 +1982,52 @@ void launch_k_matvec(std::uint32_t type, const void *weights, const float *input
                      float *output, std::size_t input_size, std::size_t output_size) {
     const dim3 grid(static_cast<unsigned int>(output_size));
     const dim3 block(kWarpSize);
-    const int blocks_per_row = static_cast<int>(input_size / kQuantBlock);
     switch (type) {
     case 12:
         hipLaunchKernelGGL(q4k_matvec_kernel, grid, block, 0, nullptr,
                            static_cast<const Q4KBlock *>(weights), input, output,
-                           blocks_per_row, static_cast<int>(output_size));
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
         return;
     case 13:
         hipLaunchKernelGGL(q5k_matvec_kernel, grid, block, 0, nullptr,
                            static_cast<const Q5KBlock *>(weights), input, output,
-                           blocks_per_row, static_cast<int>(output_size));
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
         return;
     case 14:
         hipLaunchKernelGGL(q6k_matvec_kernel, grid, block, 0, nullptr,
                            static_cast<const Q6KBlock *>(weights), input, output,
-                           blocks_per_row, static_cast<int>(output_size));
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 8:
+        hipLaunchKernelGGL(q8_0_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q8_0Block *>(weights), input, output,
+                           static_cast<int>(input_size / kQ8Block),
+                           static_cast<int>(output_size));
+        return;
+    case 11:
+    case 21:
+        hipLaunchKernelGGL(q3k_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const Q3KBlock *>(weights), input, output,
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 20:
+        hipLaunchKernelGGL(iq4nl_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const IQ4NLBlock *>(weights), input, output,
+                           static_cast<int>(input_size / kIQ4NLBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 23:
+        hipLaunchKernelGGL(iq4xs_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const IQ4XSBlock *>(weights), input, output,
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
         return;
     default:
-        throw std::invalid_argument("matrix is not a supported K-quant type");
+        throw std::invalid_argument("matrix is not a supported quant type");
     }
 }
 
@@ -1867,6 +2531,72 @@ void execute_gated_delta_step(const float *queries, const float *keys,
     hip_check(hipGetLastError(), "gated-delta step launch");
     hip_check(hipMemcpy(output, workspace.output, vector_values * sizeof(float), hipMemcpyDeviceToHost),
               "hipMemcpy gated-delta output");
+}
+
+void execute_gated_delta_step_batch8(const float *queries, const float *keys,
+                                     const float *values, const float *decays,
+                                     const float *betas, void *state, float *output,
+                                     int batch_count) {
+    constexpr std::size_t vector_values = 48ULL * 128ULL;
+    const std::size_t total_vectors = static_cast<std::size_t>(batch_count) * vector_values;
+    struct Workspace {
+        float *queries = nullptr;
+        float *keys = nullptr;
+        float *values = nullptr;
+        float *decays = nullptr;
+        float *betas = nullptr;
+        float *output = nullptr;
+        std::size_t capacity = 0;
+        ~Workspace() {
+            if (output) (void) hipFree(output);
+            if (betas) (void) hipFree(betas);
+            if (decays) (void) hipFree(decays);
+            if (values) (void) hipFree(values);
+            if (keys) (void) hipFree(keys);
+            if (queries) (void) hipFree(queries);
+        }
+    };
+    static Workspace workspace;
+    if (workspace.capacity < total_vectors) {
+        if (workspace.queries) {
+            (void) hipFree(workspace.queries);
+            (void) hipFree(workspace.keys);
+            (void) hipFree(workspace.values);
+            (void) hipFree(workspace.decays);
+            (void) hipFree(workspace.betas);
+            (void) hipFree(workspace.output);
+        }
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.queries), total_vectors * sizeof(float)),
+                  "hipMalloc gated-delta-b8 queries");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.keys), total_vectors * sizeof(float)),
+                  "hipMalloc gated-delta-b8 keys");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.values), total_vectors * sizeof(float)),
+                  "hipMalloc gated-delta-b8 values");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.decays), static_cast<std::size_t>(batch_count) * 48 * sizeof(float)),
+                  "hipMalloc gated-delta-b8 decays");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.betas), static_cast<std::size_t>(batch_count) * 48 * sizeof(float)),
+                  "hipMalloc gated-delta-b8 betas");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&workspace.output), total_vectors * sizeof(float)),
+                  "hipMalloc gated-delta-b8 output");
+        workspace.capacity = total_vectors;
+    }
+    hip_check(hipMemcpy(workspace.queries, queries, total_vectors * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta-b8 queries");
+    hip_check(hipMemcpy(workspace.keys, keys, total_vectors * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta-b8 keys");
+    hip_check(hipMemcpy(workspace.values, values, total_vectors * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta-b8 values");
+    hip_check(hipMemcpy(workspace.decays, decays, static_cast<std::size_t>(batch_count) * 48 * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta-b8 decays");
+    hip_check(hipMemcpy(workspace.betas, betas, static_cast<std::size_t>(batch_count) * 48 * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy gated-delta-b8 betas");
+    hipLaunchKernelGGL(gated_delta_step_batch8_kernel, dim3(48), dim3(256), 0, nullptr,
+                       workspace.queries, workspace.keys, workspace.values,
+                       workspace.decays, workspace.betas, static_cast<__half *>(state),
+                       workspace.output, 128, batch_count);
+    hip_check(hipGetLastError(), "gated-delta-b8 step launch");
+    hip_check(hipMemcpy(output, workspace.output, total_vectors * sizeof(float), hipMemcpyDeviceToHost),
+              "hipMemcpy gated-delta-b8 output");
 }
 
 void preload_n23q4_matrix(const void *weights, std::size_t input_size, std::size_t output_size) {
@@ -2947,6 +3677,962 @@ Q4KBenchmarkResult benchmark_n23kv4_flash_batch8(std::size_t context_size,
         (void) hipFree(device_keys);
         throw;
     }
+}
+
+// ─── Device-resident pipelined executor ───────────────────────────────────────
+
+__global__ void rms_norm_batch8_kernel(float *__restrict__ data,
+                                       const float *__restrict__ weights,
+                                       int width, float epsilon) {
+    const int batch = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    extern __shared__ float shared[];
+
+    float *row = data + static_cast<std::size_t>(batch) * width;
+    float local_sum = 0.0F;
+    for (int i = tid; i < width; i += static_cast<int>(blockDim.x)) {
+        const float v = row[i];
+        local_sum = fmaf(v, v, local_sum);
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared[tid] += shared[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(shared[0] / static_cast<float>(width) + epsilon);
+    for (int i = tid; i < width; i += static_cast<int>(blockDim.x)) {
+        row[i] *= scale * weights[i];
+    }
+}
+
+__global__ void vector_add_batch8_kernel(float *__restrict__ dest,
+                                         const float *__restrict__ source,
+                                         int count) {
+    const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                  + static_cast<int>(threadIdx.x);
+    if (idx < count) {
+        dest[idx] += source[idx];
+    }
+}
+
+__global__ void vector_copy_kernel(float *__restrict__ dest,
+                                   const float *__restrict__ source, int count) {
+    const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                  + static_cast<int>(threadIdx.x);
+    if (idx < count) {
+        dest[idx] = source[idx];
+    }
+}
+
+__global__ void silu_multiply_batch8_kernel(float *__restrict__ gate,
+                                            const float *__restrict__ up, int count) {
+    const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                  + static_cast<int>(threadIdx.x);
+    if (idx < count) {
+        const float v = gate[idx];
+        gate[idx] = (v / (1.0F + expf(-v))) * up[idx];
+    }
+}
+
+struct DevicePipeline {
+    hipStream_t compute_stream = nullptr;
+    hipStream_t transfer_stream = nullptr;
+
+    float *hidden = nullptr;
+    float *slots[4] = {};
+    float *norm_weights_device = nullptr;
+
+    void *weight_buf[2] = {};
+    std::size_t weight_buf_capacity = 0;
+    int active_weight_buf = 0;
+    const void *prefetched_host_ptr[2] = {};
+    std::size_t prefetched_bytes[2] = {};
+    hipEvent_t weight_consumed[2] = {};
+    bool weight_consumed_valid[2] = {};
+    hipEvent_t transfer_done[2] = {};
+    bool transfer_done_valid[2] = {};
+
+    void *inline_buf = nullptr;
+    std::size_t inline_buf_capacity = 0;
+    const void *inline_prefetched_ptr = nullptr;
+    std::size_t inline_prefetched_bytes = 0;
+    hipEvent_t inline_done = nullptr;
+    bool inline_done_valid = false;
+
+    std::size_t embedding_size = 0;
+    std::size_t ffn_size = 0;
+    std::size_t max_weight_bytes = 0;
+
+    ~DevicePipeline() {
+        if (hidden) (void)hipFree(hidden);
+        for (auto &s : slots) if (s) (void)hipFree(s);
+        if (norm_weights_device) (void)hipFree(norm_weights_device);
+        for (auto &w : weight_buf) if (w) (void)hipFree(w);
+        for (auto &e : weight_consumed) if (e) (void)hipEventDestroy(e);
+        for (auto &e : transfer_done) if (e) (void)hipEventDestroy(e);
+        if (inline_buf) (void)hipFree(inline_buf);
+        if (inline_done) (void)hipEventDestroy(inline_done);
+        if (compute_stream) (void)hipStreamDestroy(compute_stream);
+        if (transfer_stream) (void)hipStreamDestroy(transfer_stream);
+    }
+};
+
+DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t ffn_size,
+                                       std::size_t max_weight_bytes) {
+    auto *p = new DevicePipeline();
+    p->embedding_size = embedding_size;
+    p->ffn_size = ffn_size;
+    p->max_weight_bytes = max_weight_bytes;
+
+    hip_check(hipStreamCreate(&p->compute_stream), "pipeline compute stream");
+    hip_check(hipStreamCreate(&p->transfer_stream), "pipeline transfer stream");
+
+    const std::size_t hidden_bytes = 8 * std::max(embedding_size, ffn_size) * sizeof(float);
+    const std::size_t ffn_bytes = 8 * ffn_size * sizeof(float);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&p->hidden), hidden_bytes), "pipeline hidden");
+    for (auto &s : p->slots) {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s), ffn_bytes), "pipeline slot");
+    }
+    const std::size_t norm_bytes = std::max(embedding_size, ffn_size) * sizeof(float);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&p->norm_weights_device), norm_bytes), "pipeline norm");
+
+    p->weight_buf_capacity = max_weight_bytes;
+    for (auto &w : p->weight_buf) {
+        hip_check(hipMalloc(&w, max_weight_bytes), "pipeline weight buf");
+    }
+    for (auto &e : p->weight_consumed) {
+        hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline weight event");
+    }
+    for (auto &e : p->transfer_done) {
+        hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline transfer done event");
+    }
+    const std::size_t inline_capacity = 36ULL * 1024 * 1024;
+    hip_check(hipMalloc(&p->inline_buf, inline_capacity), "pipeline inline buf");
+    p->inline_buf_capacity = inline_capacity;
+    hip_check(hipEventCreateWithFlags(&p->inline_done, hipEventDisableTiming), "pipeline inline event");
+    return p;
+}
+
+void destroy_device_pipeline(DevicePipeline *pipeline) {
+    delete pipeline;
+}
+
+void pipeline_upload_hidden(DevicePipeline *pipeline, const float *host, std::size_t count) {
+    hip_check(hipMemcpyAsync(pipeline->hidden, host, count * sizeof(float),
+                             hipMemcpyHostToDevice, pipeline->compute_stream),
+              "pipeline upload hidden");
+}
+
+void pipeline_download_hidden(DevicePipeline *pipeline, float *host, std::size_t count) {
+    hip_check(hipStreamSynchronize(pipeline->compute_stream), "pipeline sync before download");
+    hip_check(hipMemcpy(host, pipeline->hidden, count * sizeof(float), hipMemcpyDeviceToHost),
+              "pipeline download hidden");
+}
+
+void pipeline_rms_norm(DevicePipeline *pipeline, const float *norm_weights,
+                       std::size_t width, float epsilon) {
+    hip_check(hipMemcpyAsync(pipeline->norm_weights_device, norm_weights,
+                             width * sizeof(float), hipMemcpyHostToDevice,
+                             pipeline->compute_stream),
+              "pipeline upload norm weights");
+    constexpr int threads = 256;
+    const std::size_t shared = threads * sizeof(float);
+    hipLaunchKernelGGL(rms_norm_batch8_kernel, dim3(8), dim3(threads), shared,
+                       pipeline->compute_stream,
+                       pipeline->hidden, pipeline->norm_weights_device,
+                       static_cast<int>(width), epsilon);
+}
+
+void pipeline_residual_add(DevicePipeline *pipeline, int source_slot) {
+    const int count = static_cast<int>(8 * pipeline->embedding_size);
+    constexpr int threads = 256;
+    const int blocks = (count + threads - 1) / threads;
+    hipLaunchKernelGGL(vector_add_batch8_kernel, dim3(blocks), dim3(threads), 0,
+                       pipeline->compute_stream,
+                       pipeline->hidden, pipeline->slots[source_slot], count);
+}
+
+void pipeline_save_hidden(DevicePipeline *pipeline, int slot, std::size_t count) {
+    hip_check(hipMemcpyAsync(pipeline->slots[slot], pipeline->hidden,
+                             count * sizeof(float), hipMemcpyDeviceToDevice,
+                             pipeline->compute_stream),
+              "pipeline save hidden");
+}
+
+void pipeline_slot_to_hidden(DevicePipeline *pipeline, int slot, std::size_t count) {
+    hip_check(hipMemcpyAsync(pipeline->hidden, pipeline->slots[slot],
+                             count * sizeof(float), hipMemcpyDeviceToDevice,
+                             pipeline->compute_stream),
+              "pipeline slot to hidden");
+}
+
+void pipeline_download_slot(DevicePipeline *pipeline, int slot, float *host, std::size_t count) {
+    hip_check(hipStreamSynchronize(pipeline->compute_stream), "pipeline sync before slot download");
+    hip_check(hipMemcpy(host, pipeline->slots[slot], count * sizeof(float), hipMemcpyDeviceToHost),
+              "pipeline download slot");
+}
+
+void pipeline_download_slots3(DevicePipeline *pipeline,
+                              int slot0, float *host0, std::size_t count0,
+                              int slot1, float *host1, std::size_t count1,
+                              int slot2, float *host2, std::size_t count2) {
+    hip_check(hipStreamSynchronize(pipeline->compute_stream), "pipeline sync before multi-slot download");
+    hip_check(hipMemcpy(host0, pipeline->slots[slot0], count0 * sizeof(float), hipMemcpyDeviceToHost),
+              "pipeline download slot0");
+    hip_check(hipMemcpy(host1, pipeline->slots[slot1], count1 * sizeof(float), hipMemcpyDeviceToHost),
+              "pipeline download slot1");
+    hip_check(hipMemcpy(host2, pipeline->slots[slot2], count2 * sizeof(float), hipMemcpyDeviceToHost),
+              "pipeline download slot2");
+}
+
+void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
+                             std::uint32_t type, std::size_t input_size,
+                             std::size_t output_size, bool keep_resident, int output_slot) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
+    auto &cache = resident_weight_cache();
+    const void *device_weights = cache.find_or_add(weights, weight_bytes, keep_resident);
+    int used_buf = -1;
+
+    if (!device_weights) {
+        int found_buf = -1;
+        for (int b = 0; b < 2; ++b) {
+            if (pipeline->prefetched_host_ptr[b] == weights &&
+                pipeline->prefetched_bytes[b] == weight_bytes) {
+                found_buf = b;
+                break;
+            }
+        }
+        if (found_buf >= 0) {
+            if (pipeline->transfer_done_valid[found_buf]) {
+                hip_check(hipEventSynchronize(pipeline->transfer_done[found_buf]),
+                          "pipeline wait prefetch buf");
+                pipeline->transfer_done_valid[found_buf] = false;
+            }
+            device_weights = pipeline->weight_buf[found_buf];
+            pipeline->prefetched_host_ptr[found_buf] = nullptr;
+            used_buf = found_buf;
+        } else if (pipeline->inline_prefetched_ptr == weights &&
+                   pipeline->inline_prefetched_bytes == weight_bytes) {
+            if (pipeline->inline_done_valid) {
+                hip_check(hipEventSynchronize(pipeline->inline_done),
+                          "pipeline wait inline prefetch");
+                pipeline->inline_done_valid = false;
+            }
+            device_weights = pipeline->inline_buf;
+            pipeline->inline_prefetched_ptr = nullptr;
+        } else {
+            int buf = -1;
+            for (int b = 0; b < 2; ++b) {
+                if (pipeline->prefetched_host_ptr[b] == nullptr) {
+                    buf = b;
+                    break;
+                }
+            }
+            if (buf < 0) {
+                hip_check(hipStreamSynchronize(pipeline->transfer_stream), "pipeline wait all prefetch");
+                pipeline->prefetched_host_ptr[0] = nullptr;
+                pipeline->prefetched_host_ptr[1] = nullptr;
+                buf = 0;
+            }
+            if (pipeline->weight_consumed_valid[buf]) {
+                hip_check(hipEventSynchronize(pipeline->weight_consumed[buf]),
+                          "pipeline sync event before upload");
+            }
+            hip_check(hipMemcpyAsync(pipeline->weight_buf[buf], weights, weight_bytes,
+                                     hipMemcpyHostToDevice, pipeline->compute_stream),
+                      "pipeline weight upload");
+            device_weights = pipeline->weight_buf[buf];
+            used_buf = buf;
+        }
+    }
+
+    float *out = pipeline->slots[output_slot];
+    const dim3 grid(static_cast<unsigned>(output_size));
+    const dim3 block(kWarpSize);
+    switch (type) {
+    case 8:
+        hipLaunchKernelGGL(q8_0_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const Q8_0Block *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQ8Block),
+                           static_cast<int>(output_size));
+        break;
+    case 11:
+        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const Q3KBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        break;
+    case 12:
+        hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const Q4KBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        break;
+    case 13:
+        hipLaunchKernelGGL(q5k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const Q5KBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        break;
+    case 14:
+        hipLaunchKernelGGL(q6k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const Q6KBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        break;
+    case 20:
+        hipLaunchKernelGGL(iq4nl_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const IQ4NLBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kIQ4NLBlock),
+                           static_cast<int>(output_size));
+        break;
+    case 21:
+        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const Q3KBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        break;
+    case 23:
+        hipLaunchKernelGGL(iq4xs_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const IQ4XSBlock *>(device_weights), pipeline->hidden,
+                           out, static_cast<int>(input_size),
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        break;
+    default:
+        throw std::invalid_argument("pipeline projection: unsupported type");
+    }
+    if (used_buf >= 0) {
+        hip_check(hipEventRecord(pipeline->weight_consumed[used_buf], pipeline->compute_stream),
+                  "pipeline record weight consumed");
+        pipeline->weight_consumed_valid[used_buf] = true;
+    }
+}
+
+void pipeline_silu_multiply(DevicePipeline *pipeline, int gate_slot, int up_slot,
+                            std::size_t count) {
+    constexpr int threads = 256;
+    const int blocks = (static_cast<int>(count) + threads - 1) / threads;
+    hipLaunchKernelGGL(silu_multiply_batch8_kernel, dim3(blocks), dim3(threads), 0,
+                       pipeline->compute_stream,
+                       pipeline->slots[gate_slot], pipeline->slots[up_slot],
+                       static_cast<int>(count));
+}
+
+void pipeline_sync(DevicePipeline *pipeline) {
+    hip_check(hipStreamSynchronize(pipeline->compute_stream), "pipeline sync compute");
+    hip_check(hipStreamSynchronize(pipeline->transfer_stream), "pipeline sync transfer");
+}
+
+void pipeline_prefetch_weights(DevicePipeline *pipeline, const void *weights,
+                               std::uint32_t type, std::size_t input_size,
+                               std::size_t output_size) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
+    if (resident_weight_cache().find_or_add(weights, weight_bytes, false) != nullptr) {
+        return;
+    }
+    if (weight_bytes > pipeline->weight_buf_capacity) {
+        return;
+    }
+    int buf = pipeline->active_weight_buf;
+    pipeline->active_weight_buf = 1 - buf;
+    if (pipeline->weight_consumed_valid[buf]) {
+        hip_check(hipStreamWaitEvent(pipeline->transfer_stream, pipeline->weight_consumed[buf], 0),
+                  "pipeline prefetch wait event");
+    }
+    hip_check(hipMemcpyAsync(pipeline->weight_buf[buf], weights,
+                             weight_bytes, hipMemcpyHostToDevice, pipeline->transfer_stream),
+              "pipeline prefetch weights");
+    hip_check(hipEventRecord(pipeline->transfer_done[buf], pipeline->transfer_stream),
+              "pipeline prefetch record done");
+    pipeline->transfer_done_valid[buf] = true;
+    pipeline->prefetched_host_ptr[buf] = weights;
+    pipeline->prefetched_bytes[buf] = weight_bytes;
+}
+
+void pipeline_prefetch_inline(DevicePipeline *pipeline, const void *weights,
+                              std::uint32_t type, std::size_t input_size,
+                              std::size_t output_size) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
+    if (resident_weight_cache().find_or_add(weights, weight_bytes, false) != nullptr) {
+        return;
+    }
+    if (weight_bytes > pipeline->inline_buf_capacity) {
+        return;
+    }
+    hip_check(hipMemcpyAsync(pipeline->inline_buf, weights,
+                             weight_bytes, hipMemcpyHostToDevice, pipeline->transfer_stream),
+              "pipeline inline prefetch");
+    hip_check(hipEventRecord(pipeline->inline_done, pipeline->transfer_stream),
+              "pipeline inline record done");
+    pipeline->inline_done_valid = true;
+    pipeline->inline_prefetched_ptr = weights;
+    pipeline->inline_prefetched_bytes = weight_bytes;
+}
+
+void pipeline_fused_ffn_batch8(DevicePipeline *pipeline, const float *norm_weights,
+                               std::size_t embedding_size, std::size_t ffn_size, float epsilon,
+                               const void *gate_weights, std::uint32_t gate_type,
+                               const void *up_weights, std::uint32_t up_type,
+                               const void *down_weights, std::uint32_t down_type,
+                               bool keep_gate_up_resident) {
+    // Prefetch down weight early (overlaps with save/norm/gate compute)
+    pipeline_prefetch_weights(pipeline, down_weights, down_type, ffn_size, embedding_size);
+
+    // Save pre-FFN hidden for residual
+    pipeline_save_hidden(pipeline, 3, 8 * embedding_size);
+
+    // RMS norm in-place on hidden
+    pipeline_rms_norm(pipeline, norm_weights, embedding_size, epsilon);
+
+    // Gate projection: hidden → slot[0]
+    pipeline_project_batch8(pipeline, gate_weights, gate_type, embedding_size, ffn_size,
+                            keep_gate_up_resident, 0);
+
+    // Up projection: hidden → slot[1]
+    pipeline_project_batch8(pipeline, up_weights, up_type, embedding_size, ffn_size,
+                            keep_gate_up_resident, 1);
+
+    // SiLU gate * up → slot[0] (in-place on gate)
+    pipeline_silu_multiply(pipeline, 0, 1, 8 * ffn_size);
+
+    // Move gate result to hidden buffer for down projection
+    // (down reads from hidden, writes to slot[2])
+    hip_check(hipMemcpyAsync(pipeline->hidden, pipeline->slots[0],
+                             8 * ffn_size * sizeof(float), hipMemcpyDeviceToDevice,
+                             pipeline->compute_stream),
+              "pipeline ffn move to hidden");
+    pipeline_project_batch8(pipeline, down_weights, down_type, ffn_size, embedding_size,
+                            false, 2);
+
+    // Restore pre-FFN hidden and add down output
+    hip_check(hipMemcpyAsync(pipeline->hidden, pipeline->slots[3],
+                             8 * embedding_size * sizeof(float), hipMemcpyDeviceToDevice,
+                             pipeline->compute_stream),
+              "pipeline ffn restore hidden");
+    pipeline_residual_add(pipeline, 2);
+}
+
+// ============================================================================
+// GPU attention for the batch-8 target verifier (short-context GQA)
+// ============================================================================
+
+struct AttentionDeviceState {
+    static constexpr int kHeads = 24;
+    static constexpr int kKvHeads = 4;
+    static constexpr int kHeadSize = 256;
+    static constexpr int kKvWidth = kKvHeads * kHeadSize;
+    static constexpr int kRotaryDims = 64;
+
+    int max_context = 0;
+    int active_tokens = 0;
+    int global_position = 0;
+
+    __half *kv_cache = nullptr;
+    float *q_norm_weights = nullptr;
+    float *k_norm_weights = nullptr;
+    float *attn_output = nullptr;
+    float *rope_cos = nullptr;
+
+    ~AttentionDeviceState() {
+        if (kv_cache) (void)hipFree(kv_cache);
+        if (q_norm_weights) (void)hipFree(q_norm_weights);
+        if (k_norm_weights) (void)hipFree(k_norm_weights);
+        if (attn_output) (void)hipFree(attn_output);
+        if (rope_cos) (void)hipFree(rope_cos);
+    }
+};
+
+__global__ void attn_prep_kernel(const float *__restrict__ q_slot,
+                                  const float *__restrict__ k_slot,
+                                  const float *__restrict__ v_slot,
+                                  const float *__restrict__ q_norm_w,
+                                  const float *__restrict__ k_norm_w,
+                                  const float *__restrict__ rope_freqs,
+                                  __half *__restrict__ kv_cache,
+                                  float *__restrict__ q_out,
+                                  float *__restrict__ gate_out,
+                                  int max_context, int write_offset,
+                                  int rope_base_position, float epsilon) {
+    constexpr int kHeads = 24;
+    constexpr int kKvHeads = 4;
+    constexpr int kHeadSize = 256;
+    constexpr int kRotaryPairs = 32;
+    constexpr int kQWidth = 2 * kHeads * kHeadSize;
+    constexpr int kKvWidth = kKvHeads * kHeadSize;
+
+    const int batch = static_cast<int>(blockIdx.x);
+    const int position = rope_base_position + batch;
+
+    const float *q_row = q_slot + static_cast<std::size_t>(batch) * kQWidth;
+    const float *k_row = k_slot + static_cast<std::size_t>(batch) * kKvWidth;
+    const float *v_row = v_slot + static_cast<std::size_t>(batch) * kKvWidth;
+
+    const int tid = static_cast<int>(threadIdx.x);
+
+    __shared__ float rope_cos[kRotaryPairs];
+    __shared__ float rope_sin[kRotaryPairs];
+    if (tid < kRotaryPairs) {
+        float theta = static_cast<float>(position) * rope_freqs[tid];
+        rope_cos[tid] = cosf(theta);
+        rope_sin[tid] = sinf(theta);
+    }
+    __syncthreads();
+
+    for (int qh = 0; qh < kHeads; ++qh) {
+        const float *q_head = q_row + qh * 2 * kHeadSize;
+        float *out_q = q_out + (static_cast<std::size_t>(batch) * kHeads + qh) * kHeadSize;
+        float *out_gate = gate_out + (static_cast<std::size_t>(batch) * kHeads + qh) * kHeadSize;
+
+        float sum_sq = 0.0F;
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            float val = q_head[d];
+            sum_sq += val * val;
+        }
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down(sum_sq, offset, kWarpSize);
+        sum_sq = __shfl(sum_sq, 0, kWarpSize);
+        const float q_rms = rsqrtf(sum_sq / static_cast<float>(kHeadSize) + epsilon);
+
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            float normed = q_head[d] * q_rms * q_norm_w[d];
+            if (d < kRotaryPairs) {
+                float right = q_head[d + kRotaryPairs] * q_rms * q_norm_w[d + kRotaryPairs];
+                out_q[d] = normed * rope_cos[d] - right * rope_sin[d];
+                out_q[d + kRotaryPairs] = normed * rope_sin[d] + right * rope_cos[d];
+            } else if (d >= 2 * kRotaryPairs) {
+                out_q[d] = normed;
+            }
+            out_gate[d] = q_head[kHeadSize + d];
+        }
+    }
+
+    const int slot = write_offset + batch;
+    for (int kvh = 0; kvh < kKvHeads; ++kvh) {
+        const float *k_head = k_row + kvh * kHeadSize;
+        const std::size_t cache_offset = (static_cast<std::size_t>(kvh) * max_context + slot) * kHeadSize;
+
+        float sum_sq = 0.0F;
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            float val = k_head[d];
+            sum_sq += val * val;
+        }
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down(sum_sq, offset, kWarpSize);
+        sum_sq = __shfl(sum_sq, 0, kWarpSize);
+        const float k_rms = rsqrtf(sum_sq / static_cast<float>(kHeadSize) + epsilon);
+
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            float normed = k_head[d] * k_rms * k_norm_w[d];
+            if (d < kRotaryPairs) {
+                float right = k_head[d + kRotaryPairs] * k_rms * k_norm_w[d + kRotaryPairs];
+                kv_cache[cache_offset + d] = __float2half(normed * rope_cos[d] - right * rope_sin[d]);
+                kv_cache[cache_offset + d + kRotaryPairs] = __float2half(normed * rope_sin[d] + right * rope_cos[d]);
+            } else if (d >= 2 * kRotaryPairs) {
+                kv_cache[cache_offset + d] = __float2half(normed);
+            }
+        }
+
+        const float *v_head = v_row + kvh * kHeadSize;
+        const std::size_t v_offset = (static_cast<std::size_t>(kKvHeads) * max_context * kHeadSize)
+                                   + (static_cast<std::size_t>(kvh) * max_context + slot) * kHeadSize;
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            kv_cache[v_offset + d] = __float2half(v_head[d]);
+        }
+    }
+}
+
+__global__ void attn_score_kernel(const float *__restrict__ queries,
+                                   const float *__restrict__ gates,
+                                   const __half *__restrict__ kv_cache,
+                                   float *__restrict__ output,
+                                   int base_position, int max_context) {
+    constexpr int kHeads = 24;
+    constexpr int kKvHeads = 4;
+    constexpr int kHeadSize = 256;
+    constexpr int kQPerKv = kHeads / kKvHeads;
+    constexpr int kThreads = 256;
+
+    const int batch = static_cast<int>(blockIdx.x);
+    const int query_head = static_cast<int>(blockIdx.y);
+    const int kv_head = query_head / kQPerKv;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int context_size = base_position + batch + 1;
+
+    const float *q = queries + (static_cast<std::size_t>(batch) * kHeads + query_head) * kHeadSize;
+    const float *gate = gates + (static_cast<std::size_t>(batch) * kHeads + query_head) * kHeadSize;
+    float *out = output + (static_cast<std::size_t>(batch) * kHeads + query_head) * kHeadSize;
+
+    const __half *keys = kv_cache + static_cast<std::size_t>(kv_head) * max_context * kHeadSize;
+    const __half *vals = kv_cache
+        + static_cast<std::size_t>(kKvHeads) * max_context * kHeadSize
+        + static_cast<std::size_t>(kv_head) * max_context * kHeadSize;
+
+    constexpr float scale = 1.0F / 16.0F;
+
+    extern __shared__ float smem[];
+    float *scores = smem;
+
+    // Phase 1: compute all attention scores (threads tile over tokens)
+    for (int t = tid; t < context_size; t += kThreads) {
+        const __half *k_token = keys + static_cast<std::size_t>(t) * kHeadSize;
+        float dot = 0.0F;
+        for (int d = 0; d < kHeadSize; ++d) {
+            dot = fmaf(q[d], __half2float(k_token[d]), dot);
+        }
+        scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // Phase 2: softmax (first warp finds max and sum)
+    __shared__ float s_max;
+    __shared__ float s_inv_sum;
+    if (tid < kWarpSize) {
+        float local_max = -1.0e30F;
+        for (int t = tid; t < context_size; t += kWarpSize) {
+            if (scores[t] > local_max) local_max = scores[t];
+        }
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+            float other = __shfl_down(local_max, offset, kWarpSize);
+            if (other > local_max) local_max = other;
+        }
+        local_max = __shfl(local_max, 0, kWarpSize);
+        if (tid == 0) s_max = local_max;
+    }
+    __syncthreads();
+
+    for (int t = tid; t < context_size; t += kThreads) {
+        scores[t] = expf(scores[t] - s_max);
+    }
+    __syncthreads();
+
+    if (tid < kWarpSize) {
+        float local_sum = 0.0F;
+        for (int t = tid; t < context_size; t += kWarpSize) {
+            local_sum += scores[t];
+        }
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            local_sum += __shfl_down(local_sum, offset, kWarpSize);
+        if (tid == 0) s_inv_sum = 1.0F / __shfl(local_sum, 0, kWarpSize);
+    }
+    __syncthreads();
+
+    // Phase 3: weighted sum of values (threads tile over output dimensions)
+    const float inv_sum = s_inv_sum;
+    for (int d = tid; d < kHeadSize; d += kThreads) {
+        float accum = 0.0F;
+        for (int t = 0; t < context_size; ++t) {
+            accum += scores[t] * __half2float(vals[static_cast<std::size_t>(t) * kHeadSize + d]);
+        }
+        float g = gate[d];
+        g = 1.0F / (1.0F + expf(-g));
+        out[d] = accum * inv_sum * g;
+    }
+}
+
+AttentionDeviceState *create_attention_device_state(int num_layers, int max_context,
+                                                     float rope_freq_base) {
+    auto *s = new AttentionDeviceState();
+    s->max_context = max_context;
+    s->active_tokens = 0;
+
+    constexpr int kKvHeads = AttentionDeviceState::kKvHeads;
+    constexpr int kHeadSize = AttentionDeviceState::kHeadSize;
+    constexpr int kHeads = AttentionDeviceState::kHeads;
+    constexpr int kRotaryPairs = AttentionDeviceState::kRotaryDims / 2;
+
+    const std::size_t kv_per_layer = 2ULL * kKvHeads * max_context * kHeadSize;
+    const std::size_t kv_bytes = num_layers * kv_per_layer * sizeof(__half);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv_cache), kv_bytes), "attn kv cache");
+    hip_check(hipMemset(s->kv_cache, 0, kv_bytes), "attn kv cache zero");
+
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->q_norm_weights), kHeadSize * sizeof(float)), "attn q norm");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->k_norm_weights), kHeadSize * sizeof(float)), "attn k norm");
+
+    const std::size_t out_bytes = 2ULL * 8 * kHeads * kHeadSize * sizeof(float);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->attn_output), out_bytes), "attn output");
+
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->rope_cos), kRotaryPairs * sizeof(float)), "attn rope freq");
+
+    std::array<float, kRotaryPairs> freq_table{};
+    float freq = 1.0F;
+    const float freq_step = std::pow(rope_freq_base, -2.0F / static_cast<float>(kRotaryPairs * 2));
+    for (int p = 0; p < kRotaryPairs; ++p) {
+        freq_table[p] = freq;
+        freq *= freq_step;
+    }
+    hip_check(hipMemcpy(s->rope_cos, freq_table.data(),
+                        kRotaryPairs * sizeof(float), hipMemcpyHostToDevice), "attn rope freq upload");
+
+    return s;
+}
+
+void destroy_attention_device_state(AttentionDeviceState *state) {
+    delete state;
+}
+
+void attention_reset(AttentionDeviceState *state) {
+    state->active_tokens = 0;
+    state->global_position = 0;
+}
+
+static void attention_shift_all_layers(AttentionDeviceState *state, hipStream_t stream) {
+    constexpr int kKvHeads = AttentionDeviceState::kKvHeads;
+    constexpr int kHeadSize = AttentionDeviceState::kHeadSize;
+    constexpr int kBatch = 8;
+    constexpr int kNumLayers = 16;
+
+    const int entries_to_keep = state->max_context - kBatch;
+    const std::size_t entry_bytes = static_cast<std::size_t>(kHeadSize) * sizeof(__half);
+
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+        const std::size_t layer_offset = static_cast<std::size_t>(layer) * 2ULL
+            * kKvHeads * state->max_context * kHeadSize;
+        __half *layer_kv = state->kv_cache + layer_offset;
+        for (int kv = 0; kv < 2; ++kv) {
+            for (int h = 0; h < kKvHeads; ++h) {
+                __half *head_base = layer_kv + (static_cast<std::size_t>(kv) * kKvHeads + h)
+                    * state->max_context * kHeadSize;
+                hip_check(hipMemcpyAsync(head_base, head_base + kBatch * kHeadSize,
+                    static_cast<std::size_t>(entries_to_keep) * entry_bytes,
+                    hipMemcpyDeviceToDevice, stream), "attn shift");
+            }
+        }
+    }
+    state->active_tokens = entries_to_keep;
+}
+
+void pipeline_attention_batch8(DevicePipeline *pipeline, AttentionDeviceState *attn,
+                               int layer_index,
+                               const float *q_norm_weights, const float *k_norm_weights,
+                               float epsilon) {
+    constexpr int kHeads = AttentionDeviceState::kHeads;
+    constexpr int kKvHeads = AttentionDeviceState::kKvHeads;
+    constexpr int kHeadSize = AttentionDeviceState::kHeadSize;
+
+    if (layer_index == 0 && attn->active_tokens + 8 > attn->max_context) {
+        attention_shift_all_layers(attn, pipeline->compute_stream);
+    }
+
+    const int write_offset = attn->active_tokens;
+    const int rope_base = attn->global_position;
+    const int context_size = write_offset + 8;
+
+    hip_check(hipMemcpyAsync(attn->q_norm_weights, q_norm_weights,
+                             kHeadSize * sizeof(float), hipMemcpyHostToDevice,
+                             pipeline->compute_stream), "attn upload q norm");
+    hip_check(hipMemcpyAsync(attn->k_norm_weights, k_norm_weights,
+                             kHeadSize * sizeof(float), hipMemcpyHostToDevice,
+                             pipeline->compute_stream), "attn upload k norm");
+
+    const std::size_t layer_kv_offset = static_cast<std::size_t>(layer_index) * 2ULL
+        * kKvHeads * attn->max_context * kHeadSize;
+    __half *layer_kv = attn->kv_cache + layer_kv_offset;
+
+    float *q_buf = attn->attn_output;
+    float *gate_buf = attn->attn_output + 8ULL * kHeads * kHeadSize;
+
+    hipLaunchKernelGGL(attn_prep_kernel, dim3(8), dim3(kWarpSize), 0, pipeline->compute_stream,
+                       pipeline->slots[0], pipeline->slots[1], pipeline->slots[2],
+                       attn->q_norm_weights, attn->k_norm_weights,
+                       attn->rope_cos,
+                       layer_kv, q_buf, gate_buf,
+                       attn->max_context, write_offset, rope_base, epsilon);
+
+    const std::size_t smem_bytes = static_cast<std::size_t>(context_size) * sizeof(float);
+    hipLaunchKernelGGL(attn_score_kernel, dim3(8, kHeads), dim3(256), smem_bytes,
+                       pipeline->compute_stream,
+                       q_buf, gate_buf, layer_kv, pipeline->slots[0],
+                       write_offset, attn->max_context);
+}
+
+void attention_advance(AttentionDeviceState *state, int tokens) {
+    state->active_tokens += tokens;
+    state->global_position += tokens;
+}
+
+struct RecurrentDeviceState {
+    int num_layers = 0;
+    int qkv_width = 0;
+    int recurrent_width = 0;
+    int embedding_size = 0;
+    int value_heads = 0;
+    int head_size = 0;
+
+    std::vector<float *> conv_states;
+    std::vector<float *> conv_weights;
+    std::vector<float *> beta_weights;
+    std::vector<float *> alpha_weights;
+    std::vector<float *> dt_bias;
+    std::vector<float *> a_weights;
+    std::vector<float *> norm_weights;
+
+    float *queries = nullptr;
+    float *keys = nullptr;
+    float *values = nullptr;
+    float *gdn_output = nullptr;
+    float *decays = nullptr;
+    float *betas = nullptr;
+};
+
+RecurrentDeviceState *create_recurrent_device_state(int num_layers, int qkv_width,
+                                                    int recurrent_width, int embedding_size,
+                                                    int value_heads, int head_size) {
+    auto *s = new RecurrentDeviceState();
+    s->num_layers = num_layers;
+    s->qkv_width = qkv_width;
+    s->recurrent_width = recurrent_width;
+    s->embedding_size = embedding_size;
+    s->value_heads = value_heads;
+    s->head_size = head_size;
+
+    s->conv_states.resize(num_layers);
+    s->conv_weights.resize(num_layers);
+    s->beta_weights.resize(num_layers);
+    s->alpha_weights.resize(num_layers);
+    s->dt_bias.resize(num_layers);
+    s->a_weights.resize(num_layers);
+    s->norm_weights.resize(num_layers);
+
+    const std::size_t conv_state_bytes = 3ULL * qkv_width * sizeof(float);
+    const std::size_t conv_weight_bytes = 4ULL * qkv_width * sizeof(float);
+    const std::size_t proj_weight_bytes = static_cast<std::size_t>(embedding_size) * value_heads * sizeof(float);
+    const std::size_t small_bytes = value_heads * sizeof(float);
+    const std::size_t norm_bytes = head_size * sizeof(float);
+
+    for (int i = 0; i < num_layers; ++i) {
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->conv_states[i]), conv_state_bytes), "recurrent conv_state");
+        hip_check(hipMemset(s->conv_states[i], 0, conv_state_bytes), "recurrent conv_state zero");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->conv_weights[i]), conv_weight_bytes), "recurrent conv_weights");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->beta_weights[i]), proj_weight_bytes), "recurrent beta_weights");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->alpha_weights[i]), proj_weight_bytes), "recurrent alpha_weights");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->dt_bias[i]), small_bytes), "recurrent dt_bias");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->a_weights[i]), small_bytes), "recurrent a_weights");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->norm_weights[i]), norm_bytes), "recurrent norm_weights");
+    }
+
+    const std::size_t qkv_batch = 8ULL * recurrent_width * sizeof(float);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->queries), qkv_batch), "recurrent queries");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->keys), qkv_batch), "recurrent keys");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->values), qkv_batch), "recurrent values");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->gdn_output), qkv_batch), "recurrent gdn_output");
+    const std::size_t db_bytes = 8ULL * value_heads * sizeof(float);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->decays), db_bytes), "recurrent decays");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->betas), db_bytes), "recurrent betas");
+
+    return s;
+}
+
+void destroy_recurrent_device_state(RecurrentDeviceState *s) {
+    if (!s) return;
+    for (auto *p : s->conv_states) if (p) (void)hipFree(p);
+    for (auto *p : s->conv_weights) if (p) (void)hipFree(p);
+    for (auto *p : s->beta_weights) if (p) (void)hipFree(p);
+    for (auto *p : s->alpha_weights) if (p) (void)hipFree(p);
+    for (auto *p : s->dt_bias) if (p) (void)hipFree(p);
+    for (auto *p : s->a_weights) if (p) (void)hipFree(p);
+    for (auto *p : s->norm_weights) if (p) (void)hipFree(p);
+    if (s->queries) (void)hipFree(s->queries);
+    if (s->keys) (void)hipFree(s->keys);
+    if (s->values) (void)hipFree(s->values);
+    if (s->gdn_output) (void)hipFree(s->gdn_output);
+    if (s->decays) (void)hipFree(s->decays);
+    if (s->betas) (void)hipFree(s->betas);
+    delete s;
+}
+
+void recurrent_upload_weights(RecurrentDeviceState *s, int layer,
+                              const float *conv_weights, const float *beta_weights,
+                              const float *alpha_weights, const float *dt_bias,
+                              const float *a_weights, const float *norm_weights) {
+    const std::size_t conv_bytes = 4ULL * s->qkv_width * sizeof(float);
+    const std::size_t proj_bytes = static_cast<std::size_t>(s->embedding_size) * s->value_heads * sizeof(float);
+    const std::size_t small_bytes = s->value_heads * sizeof(float);
+    const std::size_t norm_bytes = s->head_size * sizeof(float);
+    hip_check(hipMemcpy(s->conv_weights[layer], conv_weights, conv_bytes, hipMemcpyHostToDevice), "upload conv_weights");
+    hip_check(hipMemcpy(s->beta_weights[layer], beta_weights, proj_bytes, hipMemcpyHostToDevice), "upload beta_weights");
+    hip_check(hipMemcpy(s->alpha_weights[layer], alpha_weights, proj_bytes, hipMemcpyHostToDevice), "upload alpha_weights");
+    hip_check(hipMemcpy(s->dt_bias[layer], dt_bias, small_bytes, hipMemcpyHostToDevice), "upload dt_bias");
+    hip_check(hipMemcpy(s->a_weights[layer], a_weights, small_bytes, hipMemcpyHostToDevice), "upload a_weights");
+    hip_check(hipMemcpy(s->norm_weights[layer], norm_weights, norm_bytes, hipMemcpyHostToDevice), "upload norm_weights");
+}
+
+void recurrent_reset_conv_states(RecurrentDeviceState *s) {
+    const std::size_t conv_state_bytes = 3ULL * s->qkv_width * sizeof(float);
+    for (int i = 0; i < s->num_layers; ++i) {
+        hip_check(hipMemset(s->conv_states[i], 0, conv_state_bytes), "reset conv_state");
+    }
+}
+
+void pipeline_recurrent_batch8(DevicePipeline *pipeline, RecurrentDeviceState *recurrent,
+                               int layer_index, void *gdn_state, float epsilon) {
+    const int qkv_width = recurrent->qkv_width;
+    const int recurrent_width = recurrent->recurrent_width;
+    const int value_heads = recurrent->value_heads;
+    const int head_size = recurrent->head_size;
+    const int actual_key_heads = (qkv_width - value_heads * head_size) / (2 * head_size);
+
+    // Conv1d kernel: process QKV from slot[0], write queries/keys/values
+    {
+        constexpr int threads = 256;
+        const int blocks = (qkv_width + threads - 1) / threads;
+        hipLaunchKernelGGL(recurrent_conv1d_batch8_kernel, dim3(blocks), dim3(threads),
+                           0, pipeline->compute_stream,
+                           pipeline->slots[0],
+                           recurrent->conv_states[layer_index],
+                           recurrent->conv_weights[layer_index],
+                           recurrent->queries, recurrent->keys, recurrent->values,
+                           qkv_width, actual_key_heads, value_heads, head_size);
+        hip_check(hipGetLastError(), "recurrent conv1d launch");
+    }
+
+
+    // L2 normalize queries and keys
+    hipLaunchKernelGGL(recurrent_l2_norm_batch8_kernel, dim3(value_heads), dim3(128),
+                       0, pipeline->compute_stream,
+                       recurrent->queries, recurrent->keys,
+                       recurrent_width, head_size, epsilon);
+    hip_check(hipGetLastError(), "recurrent l2_norm launch");
+
+    // Decay/beta from hidden state
+    hipLaunchKernelGGL(recurrent_decay_beta_batch8_kernel, dim3(value_heads), dim3(256),
+                       0, pipeline->compute_stream,
+                       pipeline->hidden,
+                       recurrent->beta_weights[layer_index],
+                       recurrent->alpha_weights[layer_index],
+                       recurrent->dt_bias[layer_index],
+                       recurrent->a_weights[layer_index],
+                       recurrent->decays, recurrent->betas,
+                       recurrent->embedding_size);
+    hip_check(hipGetLastError(), "recurrent decay_beta launch");
+
+
+    // Gated delta step on device (no memcpy!)
+    hipLaunchKernelGGL(gated_delta_step_batch8_kernel, dim3(48), dim3(256),
+                       0, pipeline->compute_stream,
+                       recurrent->queries, recurrent->keys, recurrent->values,
+                       recurrent->decays, recurrent->betas,
+                       static_cast<__half *>(gdn_state),
+                       recurrent->gdn_output, head_size, 8);
+    hip_check(hipGetLastError(), "recurrent gdn launch");
+
+
+    // SSM norm + silu(gate) → pipeline hidden
+    hipLaunchKernelGGL(recurrent_ssm_norm_gate_batch8_kernel, dim3(value_heads), dim3(128),
+                       0, pipeline->compute_stream,
+                       recurrent->gdn_output, pipeline->slots[1],
+                       recurrent->norm_weights[layer_index],
+                       pipeline->hidden,
+                       recurrent_width, value_heads, head_size, epsilon);
+    hip_check(hipGetLastError(), "recurrent ssm_norm_gate launch");
 }
 
 } // namespace qwen_native
