@@ -9,9 +9,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(hip CONFIG REQUIRED)
 
 add_executable(qwen38-native
+    src/cpu_matvec.cpp
     src/gguf.cpp
     src/kernels.cpp
     src/main.cpp
+)
+set_source_files_properties(src/cpu_matvec.cpp PROPERTIES
+    COMPILE_OPTIONS "-march=native;-mtune=native;-mavx2;-mfma;-mf16c"
 )
 
 target_include_directories(qwen38-native PRIVATE src)

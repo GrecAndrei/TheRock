@@ -1,3 +1,4 @@
+#include "cpu_matvec.h"
 #include "gguf.h"
 #include "kernels.h"
 
@@ -10,6 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -17,6 +20,7 @@
 #include <fcntl.h>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <sys/mman.h>
@@ -365,9 +369,17 @@ public:
             close(descriptor_);
             throw std::runtime_error("cannot mmap model");
         }
+        if (hipHostRegister(data_, size_, hipHostRegisterReadOnly | hipHostRegisterMapped) != hipSuccess) {
+            std::cerr << "  [warning: hipHostRegister failed, PCIe transfers will be slower]\n";
+        } else {
+            registered_ = true;
+        }
     }
 
     ~Mapping() {
+        if (registered_) {
+            (void) hipHostUnregister(data_);
+        }
         munmap(data_, size_);
         close(descriptor_);
     }
@@ -386,6 +398,7 @@ private:
     int descriptor_ = -1;
     void *data_ = nullptr;
     std::size_t size_ = 0;
+    bool registered_ = false;
 };
 
 float fp16_to_float(std::uint16_t bits) {
@@ -730,6 +743,11 @@ public:
     static constexpr std::size_t kAttentionKvHeads = 4;
     static constexpr std::size_t kAttentionHeadSize = 256;
     static constexpr std::size_t kKvWidth = kAttentionKvHeads * kAttentionHeadSize;
+    // The current FP16 verifier cache is intentionally bounded.  A true 128K
+    // N23KV4 history replaces this limit in the long-context path; until then
+    // mode switches reject an oversized host history instead of silently
+    // dropping it.
+    static constexpr std::size_t kPipelineAttentionCapacity = 4096;
 
     struct StepResult {
         std::uint32_t next_token = 0;
@@ -745,6 +763,10 @@ public:
         double attention_seconds = 0.0;
         double ffn_seconds = 0.0;
         double output_seconds = 0.0;
+    };
+
+    struct SpeculativeCheckpoint {
+        std::size_t active_tokens = 0;
     };
 
     NativeTargetSession(const std::string &path, std::size_t context_capacity,
@@ -795,32 +817,37 @@ public:
             cache.values.reserve(initial_tokens * kKvWidth);
         }
 
-        for (const auto &t : model_.tensors()) {
-            if (t.type == 21 && t.dimensions.size() == 2) {
-                std::cerr << "  converting IQ3_S -> Q8_0: " << t.name << "\n";
-                iq3s_converted_[t.name] = convert_iq3s_to_q8_0(t);
-            }
-        }
-
         // Preload deterministic high-priority matrices before optional entries
         // compete for the remaining cache.  This is a model-load cost, not a
         // decode-timing cost.  Priority: ffn_down (avoids 3-way transfer_stream
         // stall), then recurrent weights that block compute with no prefetch.
         if (resident_weight_budget != 0) {
-            preload_projection("output.weight");
+            if (!std::getenv("QWEN_NATIVE_HYBRID_HEAD")) {
+                preload_projection("output.weight");
+            }
             for (int layer = 0; layer < 64; ++layer) {
                 const std::string prefix = "blk." + std::to_string(layer) + ".";
                 preload_projection(prefix + "ffn_down.weight");
+            }
+            for (int layer = 0; layer < 64; ++layer) {
+                if ((layer + 1) % 4 == 0) {
+                    const std::string prefix = "blk." + std::to_string(layer) + ".";
+                    preload_projection(prefix + "attn_k.weight");
+                    preload_projection(prefix + "attn_v.weight");
+                    preload_projection(prefix + "attn_output.weight");
+                }
             }
             for (int layer = 0; layer < 64; ++layer) {
                 const std::string prefix = "blk." + std::to_string(layer) + ".";
                 if ((layer + 1) % 4 != 0) {
                     preload_projection(prefix + "attn_qkv.weight");
                     preload_projection(prefix + "attn_gate.weight");
-                } else {
-                    preload_projection(prefix + "attn_k.weight");
-                    preload_projection(prefix + "attn_v.weight");
-                    preload_projection(prefix + "attn_output.weight");
+                }
+            }
+            for (int layer = 0; layer < 64; ++layer) {
+                const std::string prefix = "blk." + std::to_string(layer) + ".";
+                if ((layer + 1) % 4 != 0) {
+                    preload_projection(prefix + "ssm_out.weight");
                 }
             }
         }
@@ -849,10 +876,13 @@ public:
         }
 
         attn_device_ = qwen_native::create_attention_device_state(
-            16, 4096, rope_frequency_base_);
+            16, static_cast<int>(context_capacity_), rope_frequency_base_);
     }
 
     [[nodiscard]] std::size_t context_capacity() const { return context_capacity_; }
+    [[nodiscard]] static constexpr std::size_t pipeline_attention_capacity() {
+        return kPipelineAttentionCapacity;
+    }
     [[nodiscard]] std::size_t active_tokens() const { return active_tokens_; }
     [[nodiscard]] std::size_t vocabulary_size() const { return vocabulary_size_; }
     [[nodiscard]] qwen_native::ResidentWeightCacheStats resident_weight_stats() const {
@@ -860,6 +890,22 @@ public:
     }
     [[nodiscard]] const std::array<std::vector<float>, 5> &dflash_features() const {
         return dflash_features_;
+    }
+    [[nodiscard]] std::array<std::vector<float>, 5> batch_dflash_features(
+        std::size_t batch_index) const {
+        if (batch_index >= 8) {
+            throw std::out_of_range("DFlash feature batch index is outside [0, 8)");
+        }
+        std::array<std::vector<float>, 5> result;
+        for (std::size_t feature = 0; feature < result.size(); ++feature) {
+            const auto &all_items = batch_dflash_features_.at(feature);
+            if (all_items.size() != 8 * kEmbedding) {
+                throw std::runtime_error("pipelined target did not capture DFlash features");
+            }
+            const auto begin = all_items.begin() + batch_index * kEmbedding;
+            result[feature].assign(begin, begin + kEmbedding);
+        }
+        return result;
     }
     void set_resident_weight_budget(std::size_t bytes) {
         qwen_native::set_resident_weight_cache_budget(bytes);
@@ -877,12 +923,101 @@ public:
         }
     }
     void simulate_full_attention_window() {
-        qwen_native::attention_advance(attn_device_, 4096 - 8);
+        if (active_tokens_ != 0 || context_capacity_ < 8) {
+            throw std::runtime_error("synthetic full-window timing requires a fresh target session");
+        }
+        active_tokens_ = context_capacity_ - 8;
+        qwen_native::attention_advance(attn_device_, static_cast<int>(active_tokens_));
     }
     void rewind(std::size_t count) {
+        if (count > active_tokens_) {
+            throw std::out_of_range("cannot rewind more target tokens than are active");
+        }
+        if (pipeline_state_current_) {
+            qwen_native::attention_advance(attn_device_, -static_cast<int>(count));
+        } else {
+            for (auto &cache : attention_) {
+                cache.keys.resize((active_tokens_ - count) * kKvWidth);
+                cache.values.resize((active_tokens_ - count) * kKvWidth);
+            }
+        }
         active_tokens_ -= count;
-        qwen_native::attention_advance(attn_device_, -static_cast<int>(count));
     }
+    SpeculativeCheckpoint begin_speculative_checkpoint() {
+        // The N23KV4 history remains device-resident at long context. Only
+        // recurrent state needs a host mirror: replay overwrites KV entries
+        // beyond the restored logical length, so it never reads a rejected
+        // suffix. This avoids materializing an 8 GiB FP16 host cache.
+        if (context_capacity_ > kPipelineAttentionCapacity && pipeline_state_current_) {
+            for (std::size_t layer = 0; layer < recurrent_.size(); ++layer) {
+                auto &state = recurrent_[layer];
+                prepare_host_recurrent_state(state);
+                qwen_native::recurrent_download_convolution_state(
+                    recurrent_device_, static_cast<int>(layer), state.convolution.data(), state.convolution.size());
+            }
+            return {active_tokens_};
+        }
+        synchronize_host_state();
+        for (auto &state : recurrent_) {
+            prepare_host_recurrent_state(state);
+        }
+        return {active_tokens_};
+    }
+
+    void commit_speculative_prefix(SpeculativeCheckpoint checkpoint, std::size_t committed_tokens) {
+        const std::size_t speculative_tokens = active_tokens_ - checkpoint.active_tokens;
+        if (checkpoint.active_tokens > active_tokens_ || committed_tokens == 0 ||
+            committed_tokens > speculative_tokens || speculative_tokens > 8) {
+            throw std::invalid_argument("invalid speculative prefix commit");
+        }
+        active_tokens_ = checkpoint.active_tokens + committed_tokens;
+        qwen_native::attention_set_history_length(attn_device_, static_cast<int>(active_tokens_));
+        for (std::size_t layer = 0; layer < recurrent_.size(); ++layer) {
+            auto &state = recurrent_[layer];
+            // begin_speculative_checkpoint retained these exact host copies.
+            qwen_native::upload_gated_delta_state(state.device_matrix, state.matrix.data());
+            qwen_native::recurrent_upload_convolution_state(
+                recurrent_device_, static_cast<int>(layer), state.convolution.data(), state.convolution.size());
+            qwen_native::recurrent_commit_captured_prefix(
+                recurrent_device_, static_cast<int>(layer), state.device_matrix,
+                static_cast<int>(committed_tokens));
+            state.host_matrix_current = false;
+            state.device_matrix_current = true;
+        }
+        batch_trunk_hidden_.clear();
+        pipeline_state_current_ = true;
+    }
+
+    void restore_speculative_checkpoint(SpeculativeCheckpoint checkpoint) {
+        if (checkpoint.active_tokens > active_tokens_) {
+            throw std::invalid_argument("speculative checkpoint is ahead of target state");
+        }
+        if (context_capacity_ > kPipelineAttentionCapacity) {
+            active_tokens_ = checkpoint.active_tokens;
+            qwen_native::attention_set_history_length(attn_device_, static_cast<int>(active_tokens_));
+            for (auto &state : recurrent_) {
+                state.host_matrix_current = true;
+                state.device_matrix_current = false;
+            }
+            batch_trunk_hidden_.clear();
+            pipeline_state_current_ = false;
+            return;
+        }
+        for (const auto &cache : attention_) {
+            const std::size_t expected = checkpoint.active_tokens * kKvWidth;
+            if (cache.keys.size() != expected || cache.values.size() != expected) {
+                throw std::runtime_error("speculative checkpoint host cache was modified");
+            }
+        }
+        active_tokens_ = checkpoint.active_tokens;
+        for (auto &state : recurrent_) {
+            state.host_matrix_current = true;
+            state.device_matrix_current = false;
+        }
+        batch_trunk_hidden_.clear();
+        pipeline_state_current_ = false;
+    }
+
     std::vector<float> dflash_token_embedding(std::uint32_t token) const {
         if (token >= vocabulary_size_) {
             throw std::out_of_range("input token ID is outside the target vocabulary");
@@ -909,6 +1044,7 @@ public:
     }
 
     StepResult step(std::uint32_t token) {
+        synchronize_host_state();
         if (token >= vocabulary_size_) {
             throw std::out_of_range("input token ID is outside the target vocabulary");
         }
@@ -923,14 +1059,6 @@ public:
         std::size_t recurrent_index = 0;
         std::size_t attention_index = 0;
         for (int layer = 0; layer < 64; ++layer) {
-            switch (layer) {
-            case 6: dflash_features_[0] = hidden; break;
-            case 20: dflash_features_[1] = hidden; break;
-            case 34: dflash_features_[2] = hidden; break;
-            case 48: dflash_features_[3] = hidden; break;
-            case 62: dflash_features_[4] = hidden; break;
-            default: break;
-            }
             const std::string prefix = "blk." + std::to_string(layer) + ".";
             const auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", kEmbedding),
                                                   kEmbedding, epsilon_);
@@ -949,6 +1077,14 @@ public:
                 gate[index] = silu(gate[index]) * up[index];
             }
             hidden = add_vectors(hidden, projection(prefix + "ffn_down.weight", gate));
+            switch (layer) {
+            case 5: dflash_features_[0] = hidden; break;
+            case 19: dflash_features_[1] = hidden; break;
+            case 33: dflash_features_[2] = hidden; break;
+            case 47: dflash_features_[3] = hidden; break;
+            case 61: dflash_features_[4] = hidden; break;
+            default: break;
+            }
         }
         trunk_hidden_ = hidden;
         const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
@@ -963,6 +1099,7 @@ public:
     [[nodiscard]] const std::vector<float> &trunk_hidden() const { return trunk_hidden_; }
 
     std::vector<float> step_logits(std::uint32_t token) {
+        synchronize_host_state();
         if (token >= vocabulary_size_) {
             throw std::out_of_range("input token ID is outside the target vocabulary");
         }
@@ -976,14 +1113,6 @@ public:
         std::size_t recurrent_index = 0;
         std::size_t attention_index = 0;
         for (int layer = 0; layer < 64; ++layer) {
-            switch (layer) {
-            case 6: dflash_features_[0] = hidden; break;
-            case 20: dflash_features_[1] = hidden; break;
-            case 34: dflash_features_[2] = hidden; break;
-            case 48: dflash_features_[3] = hidden; break;
-            case 62: dflash_features_[4] = hidden; break;
-            default: break;
-            }
             const std::string prefix = "blk." + std::to_string(layer) + ".";
             const auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", kEmbedding),
                                                   kEmbedding, epsilon_);
@@ -1002,6 +1131,14 @@ public:
                 gate[index] = silu(gate[index]) * up[index];
             }
             hidden = add_vectors(hidden, projection(prefix + "ffn_down.weight", gate));
+            switch (layer) {
+            case 5: dflash_features_[0] = hidden; break;
+            case 19: dflash_features_[1] = hidden; break;
+            case 33: dflash_features_[2] = hidden; break;
+            case 47: dflash_features_[3] = hidden; break;
+            case 61: dflash_features_[4] = hidden; break;
+            default: break;
+            }
         }
         const auto final_hidden = rms_norm(hidden, f32_vector("output_norm.weight", kEmbedding),
                                            kEmbedding, epsilon_);
@@ -1010,6 +1147,7 @@ public:
     }
 
     std::uint32_t step_mtp(const std::vector<float> &trunk_hidden, std::uint32_t predicted_token) {
+        synchronize_host_state();
         const auto token_emb = embedding(predicted_token);
         const auto enorm = rms_norm(token_emb, f32_vector("blk.64.nextn.enorm.weight", kEmbedding),
                                     kEmbedding, epsilon_);
@@ -1055,6 +1193,7 @@ public:
     // is issued as one native batch-8 HIP kernel.  Consequently cold target
     // weights cross PCIe once per proposed block rather than eight times.
     BatchStepResult step_batch8(const std::array<std::uint32_t, 8> &tokens) {
+        synchronize_host_state();
         if (active_tokens_ + tokens.size() > context_capacity_) {
             throw std::runtime_error("native target context is full");
         }
@@ -1119,25 +1258,58 @@ public:
         return result;
     }
 
-    BatchStepResult step_batch8_pipelined(const std::array<std::uint32_t, 8> &tokens) {
-        if (active_tokens_ + tokens.size() > context_capacity_) {
+    BatchStepResult step_batch8_pipelined(const std::array<std::uint32_t, 8> &tokens,
+                                           std::size_t valid_tokens = 8) {
+        synchronize_pipeline_state();
+        if (valid_tokens == 0 || valid_tokens > tokens.size()) {
+            throw std::invalid_argument("pipelined target batch must contain [1, 8] valid tokens");
+        }
+        if (active_tokens_ + valid_tokens > context_capacity_) {
             throw std::runtime_error("native target context is full");
         }
-        for (const auto token : tokens) {
-            if (token >= vocabulary_size_) {
+        std::array<std::uint32_t, 8> padded_tokens{};
+        for (std::size_t index = 0; index < valid_tokens; ++index) {
+            if (tokens[index] >= vocabulary_size_) {
                 throw std::out_of_range("input token ID is outside the target vocabulary");
             }
+            padded_tokens[index] = tokens[index];
         }
         const auto started = std::chrono::steady_clock::now();
         BatchStepResult result;
+        const auto target_projection = [](qwen_native::DevicePipeline *pipe,
+                                          const void *w, std::uint32_t type,
+                                          std::size_t in_size, std::size_t out_size,
+                                          bool resident, int slot,
+                                          const float *in_buf = nullptr) {
+            static const bool hybrid = std::getenv("QWEN_NATIVE_HYBRID") != nullptr;
+            if (hybrid) {
+                qwen_native::pipeline_project_batch8_hybrid(pipe, w, type, in_size, out_size,
+                                                            resident, slot, in_buf);
+            } else {
+                qwen_native::pipeline_project_batch8(pipe, w, type, in_size, out_size,
+                                                     resident, slot, in_buf);
+            }
+        };
         prepare_batch_recurrent_states();
 
-        auto hidden = embeddings_batch8(tokens);
+        auto hidden = embeddings_batch8(padded_tokens);
         constexpr std::size_t hidden_count = 8 * kEmbedding;
+        for (auto &features : batch_dflash_features_) {
+            features.assign(hidden_count, 0.0F);
+        }
         qwen_native::pipeline_upload_hidden(pipeline_, hidden.data(), hidden_count);
 
         std::size_t recurrent_index = 0;
         std::size_t attention_index = 0;
+
+        {
+            constexpr std::size_t first_qkv_width = 2 * kRecurrentKeyHeads * kRecurrentHeadSize +
+                                                    kRecurrentValueHeads * kRecurrentHeadSize;
+            const auto &first_qkv = tensor("blk.0.attn_qkv.weight");
+            qwen_native::pipeline_prefetch_weights(
+                pipeline_, tensor_data(mapping_, model_, first_qkv), first_qkv.type,
+                kEmbedding, first_qkv_width);
+        }
 
         for (int layer = 0; layer < 64; ++layer) {
             const std::string prefix = "blk." + std::to_string(layer) + ".";
@@ -1145,12 +1317,26 @@ public:
             const auto &up_tensor = tensor(prefix + "ffn_up.weight");
             const auto &down_tensor = tensor(prefix + "ffn_down.weight");
 
-            {
-                const void *gp_data = gate_tensor.type == 21
-                    ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_gate.weight").data())
-                    : tensor_data(mapping_, model_, gate_tensor);
-                const std::uint32_t gp_type = gate_tensor.type == 21 ? 8u : gate_tensor.type;
-                qwen_native::pipeline_prefetch_weights(pipeline_, gp_data, gp_type, kEmbedding, kFfn);
+            const void *gate_data = tensor_data(mapping_, model_, gate_tensor);
+            const std::uint32_t gate_type = gate_tensor.type;
+            const void *up_data = tensor_data(mapping_, model_, up_tensor);
+            const std::uint32_t up_type = up_tensor.type;
+            const void *down_data = tensor_data(mapping_, model_, down_tensor);
+            const std::uint32_t down_type = down_tensor.type;
+
+            const bool hybrid_soa = std::getenv("QWEN_NATIVE_HYBRID") != nullptr;
+            const bool hybrid_ffn = std::getenv("QWEN_NATIVE_HYBRID_FFN") != nullptr;
+            // The SoA tensor-parallel path consumes disjoint rows directly and
+            // does not stage a complete gate/up matrix. Legacy GPU scheduling
+            // retains its overlap prefetch.
+            if (!hybrid_soa) {
+                if (hybrid_ffn) {
+                    qwen_native::pipeline_prefetch_weights(
+                        pipeline_, gate_data, gate_type, kEmbedding, kFfn);
+                } else {
+                    qwen_native::pipeline_prefetch_weights(
+                        pipeline_, up_data, up_type, kEmbedding, kFfn);
+                }
             }
 
             const auto attention_started = std::chrono::steady_clock::now();
@@ -1160,74 +1346,97 @@ public:
                                                   kRecurrentValueHeads * kRecurrentHeadSize;
                 constexpr std::size_t recurrent_width = kRecurrentValueHeads * kRecurrentHeadSize;
 
-                qwen_native::pipeline_save_hidden(pipeline_, 3, hidden_count);
+                float *slot3 = qwen_native::pipeline_slot_ptr(pipeline_, 3);
+                float *hidden = qwen_native::pipeline_hidden_ptr(pipeline_);
+                float *slot0 = qwen_native::pipeline_slot_ptr(pipeline_, 0);
+
                 qwen_native::pipeline_rms_norm(pipeline_,
-                    f32_vector(prefix + "attn_norm.weight", kEmbedding), kEmbedding, epsilon_);
+                    f32_vector(prefix + "attn_norm.weight", kEmbedding), kEmbedding, epsilon_,
+                    slot3, hidden);
 
                 const auto &qkv_tensor = tensor(prefix + "attn_qkv.weight");
                 const auto &gate_t = tensor(prefix + "attn_gate.weight");
                 const auto &ssm_out_tensor = tensor(prefix + "ssm_out.weight");
-                qwen_native::pipeline_project_batch8(pipeline_,
-                    tensor_data(mapping_, model_, qkv_tensor), qkv_tensor.type,
-                    kEmbedding, qkv_width, true, 0);
-                qwen_native::pipeline_project_batch8(pipeline_,
-                    tensor_data(mapping_, model_, gate_t), gate_t.type,
-                    kEmbedding, recurrent_width, true, 1);
+                if (!std::getenv("QWEN_NATIVE_GPU_GATE")) {
+                    qwen_native::pipeline_project_recurrent_qkv_gate_cpu(
+                        pipeline_, tensor_data(mapping_, model_, qkv_tensor), qkv_tensor.type,
+                        kEmbedding, qkv_width, tensor_data(mapping_, model_, gate_t), gate_t.type,
+                        recurrent_width, true, slot3);
+                } else {
+                    target_projection(pipeline_,
+                        tensor_data(mapping_, model_, qkv_tensor), qkv_tensor.type,
+                        kEmbedding, qkv_width, true, 0, slot3);
+                    target_projection(pipeline_,
+                        tensor_data(mapping_, model_, gate_t), gate_t.type,
+                        kEmbedding, recurrent_width, true, 1, slot3);
+                }
 
                 qwen_native::pipeline_prefetch_inline(pipeline_,
                     tensor_data(mapping_, model_, ssm_out_tensor), ssm_out_tensor.type,
                     recurrent_width, kEmbedding);
 
                 qwen_native::pipeline_recurrent_batch8(pipeline_, recurrent_device_,
-                    static_cast<int>(recurrent_index), state.device_matrix, epsilon_);
+                    static_cast<int>(recurrent_index), state.device_matrix, epsilon_,
+                    static_cast<int>(valid_tokens), slot3, slot0);
                 state.host_matrix_current = false;
                 state.device_matrix_current = true;
 
-                qwen_native::pipeline_project_batch8(pipeline_,
+                target_projection(pipeline_,
                     tensor_data(mapping_, model_, ssm_out_tensor), ssm_out_tensor.type,
-                    recurrent_width, kEmbedding, true, 0);
-                qwen_native::pipeline_slot_to_hidden(pipeline_, 3, hidden_count);
-                qwen_native::pipeline_residual_add(pipeline_, 0);
+                    recurrent_width, kEmbedding, true, 1, slot0);
+                qwen_native::pipeline_residual_add(pipeline_, 1);
 
                 recurrent_index++;
                 result.recurrent_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - attention_started).count();
             } else {
+                const auto attention_started = std::chrono::steady_clock::now();
                 constexpr std::size_t q_width = 2 * kAttentionHeads * kAttentionHeadSize;
                 constexpr std::size_t attn_result_width = kAttentionHeads * kAttentionHeadSize;
 
-                qwen_native::pipeline_save_hidden(pipeline_, 3, hidden_count);
+                float *slot3 = qwen_native::pipeline_slot_ptr(pipeline_, 3);
+                float *hidden = qwen_native::pipeline_hidden_ptr(pipeline_);
                 qwen_native::pipeline_rms_norm(pipeline_,
-                    f32_vector(prefix + "attn_norm.weight", kEmbedding), kEmbedding, epsilon_);
+                    f32_vector(prefix + "attn_norm.weight", kEmbedding), kEmbedding, epsilon_,
+                    slot3, hidden);
 
                 const auto &q_tensor = tensor(prefix + "attn_q.weight");
                 const auto &k_tensor = tensor(prefix + "attn_k.weight");
                 const auto &v_tensor = tensor(prefix + "attn_v.weight");
-                qwen_native::pipeline_project_batch8(pipeline_,
-                    tensor_data(mapping_, model_, q_tensor), q_tensor.type,
-                    kEmbedding, q_width, true, 0);
-                qwen_native::pipeline_project_batch8(pipeline_,
-                    tensor_data(mapping_, model_, k_tensor), k_tensor.type,
-                    kEmbedding, kKvWidth, true, 1);
-                qwen_native::pipeline_project_batch8(pipeline_,
-                    tensor_data(mapping_, model_, v_tensor), v_tensor.type,
-                    kEmbedding, kKvWidth, true, 2);
+                if (hybrid_soa) {
+                    qwen_native::pipeline_project_attention_qkv_hybrid(
+                        pipeline_,
+                        tensor_data(mapping_, model_, q_tensor), q_tensor.type, q_width,
+                        tensor_data(mapping_, model_, k_tensor), k_tensor.type, kKvWidth,
+                        tensor_data(mapping_, model_, v_tensor), v_tensor.type, kKvWidth,
+                        kEmbedding, true, slot3);
+                } else {
+                    target_projection(pipeline_,
+                        tensor_data(mapping_, model_, q_tensor), q_tensor.type,
+                        kEmbedding, q_width, true, 0, slot3);
+                    target_projection(pipeline_,
+                        tensor_data(mapping_, model_, k_tensor), k_tensor.type,
+                        kEmbedding, kKvWidth, true, 1, slot3);
+                    target_projection(pipeline_,
+                        tensor_data(mapping_, model_, v_tensor), v_tensor.type,
+                        kEmbedding, kKvWidth, true, 2, slot3);
+                }
 
+                const auto &out_tensor = tensor(prefix + "attn_output.weight");
+                qwen_native::pipeline_prefetch_inline(pipeline_,
+                    tensor_data(mapping_, model_, out_tensor), out_tensor.type,
+                    attn_result_width, kEmbedding);
 
                 qwen_native::pipeline_attention_batch8(pipeline_, attn_device_,
                     static_cast<int>(attention_index),
                     f32_vector(prefix + "attn_q_norm.weight", kAttentionHeadSize),
                     f32_vector(prefix + "attn_k_norm.weight", kAttentionHeadSize),
-                    epsilon_);
+                    epsilon_, static_cast<int>(valid_tokens));
 
-                qwen_native::pipeline_slot_to_hidden(pipeline_, 0, 8 * attn_result_width);
-
-                const auto &out_tensor = tensor(prefix + "attn_output.weight");
-                qwen_native::pipeline_project_batch8(pipeline_,
+                target_projection(pipeline_,
                     tensor_data(mapping_, model_, out_tensor), out_tensor.type,
-                    attn_result_width, kEmbedding, true, 0);
-                qwen_native::pipeline_slot_to_hidden(pipeline_, 3, hidden_count);
-                qwen_native::pipeline_residual_add(pipeline_, 0);
+                    attn_result_width, kEmbedding, true, 1, qwen_native::pipeline_slot_ptr(pipeline_, 0));
+                qwen_native::pipeline_residual_add(pipeline_, 1);
 
                 attention_index++;
                 result.attention_seconds += std::chrono::duration<double>(
@@ -1235,30 +1444,61 @@ public:
             }
 
 
-            const void *gate_data = gate_tensor.type == 21
-                ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_gate.weight").data())
-                : tensor_data(mapping_, model_, gate_tensor);
-            const std::uint32_t gate_type = gate_tensor.type == 21 ? 8u : gate_tensor.type;
-            const void *up_data = up_tensor.type == 21
-                ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_up.weight").data())
-                : tensor_data(mapping_, model_, up_tensor);
-            const std::uint32_t up_type = up_tensor.type == 21 ? 8u : up_tensor.type;
-            const void *down_data = down_tensor.type == 21
-                ? static_cast<const void *>(iq3s_converted_.at(prefix + "ffn_down.weight").data())
-                : tensor_data(mapping_, model_, down_tensor);
-            const std::uint32_t down_type = down_tensor.type == 21 ? 8u : down_tensor.type;
-
-            qwen_native::pipeline_prefetch_weights(pipeline_, up_data, up_type, kEmbedding, kFfn);
             const auto ffn_started = std::chrono::steady_clock::now();
             const bool keep_gate_up = allow_dynamic_target_cache_;
-            qwen_native::pipeline_fused_ffn_batch8(pipeline_,
-                f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
-                kEmbedding, kFfn, epsilon_,
-                gate_data, gate_type, up_data, up_type, down_data, down_type,
-                keep_gate_up);
+            if (hybrid_soa) {
+                qwen_native::pipeline_fused_ffn_batch8_hybrid_soa(pipeline_,
+                    f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                    kEmbedding, kFfn, epsilon_,
+                    gate_data, gate_type, up_data, up_type, down_data, down_type,
+                    keep_gate_up);
+            } else if (hybrid_ffn) {
+                qwen_native::pipeline_fused_ffn_batch8_hybrid_up(pipeline_,
+                    f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                    kEmbedding, kFfn, epsilon_,
+                    gate_data, gate_type, up_data, up_type, down_data, down_type,
+                    keep_gate_up);
+            } else {
+                qwen_native::pipeline_fused_ffn_batch8(pipeline_,
+                    f32_vector(prefix + "post_attention_norm.weight", kEmbedding),
+                    kEmbedding, kFfn, epsilon_,
+                    gate_data, gate_type, up_data, up_type, down_data, down_type,
+                    keep_gate_up);
+            }
             result.ffn_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - ffn_started).count();
 
+            int dflash_feature = -1;
+            switch (layer) {
+            case 5: dflash_feature = 0; break;
+            case 19: dflash_feature = 1; break;
+            case 33: dflash_feature = 2; break;
+            case 47: dflash_feature = 3; break;
+            case 61: dflash_feature = 4; break;
+            default: break;
+            }
+            if (dflash_feature >= 0) {
+                qwen_native::pipeline_download_hidden_async(
+                    pipeline_, batch_dflash_features_[dflash_feature].data(), hidden_count);
+            }
+
+            if (layer + 1 < 64) {
+                const std::string next_prefix = "blk." + std::to_string(layer + 1) + ".";
+                if ((layer + 2) % 4 != 0) {
+                    constexpr std::size_t next_qkv_width = 2 * kRecurrentKeyHeads * kRecurrentHeadSize +
+                                                           kRecurrentValueHeads * kRecurrentHeadSize;
+                    const auto &next_qkv = tensor(next_prefix + "attn_qkv.weight");
+                    qwen_native::pipeline_prefetch_weights(
+                        pipeline_, tensor_data(mapping_, model_, next_qkv), next_qkv.type,
+                        kEmbedding, next_qkv_width);
+                } else {
+                    constexpr std::size_t next_q_width = 2 * kAttentionHeads * kAttentionHeadSize;
+                    const auto &next_q = tensor(next_prefix + "attn_q.weight");
+                    qwen_native::pipeline_prefetch_weights(
+                        pipeline_, tensor_data(mapping_, model_, next_q), next_q.type,
+                        kEmbedding, next_q_width);
+                }
+            }
         }
 
         qwen_native::pipeline_download_hidden(pipeline_, hidden.data(), hidden_count);
@@ -1276,13 +1516,63 @@ public:
             result.next_tokens[batch] = static_cast<std::uint32_t>(best - begin);
             result.top_logits[batch] = *best;
         }
-        active_tokens_ += tokens.size();
-        qwen_native::attention_advance(attn_device_, static_cast<int>(tokens.size()));
+        active_tokens_ += valid_tokens;
+        qwen_native::attention_advance(attn_device_, static_cast<int>(valid_tokens));
+        pipeline_state_current_ = true;
         result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         return result;
     }
 
 private:
+    void synchronize_pipeline_state() {
+        if (pipeline_state_current_) return;
+        const bool long_context = context_capacity_ > kPipelineAttentionCapacity;
+        if (!long_context) {
+            for (std::size_t layer = 0; layer < attention_.size(); ++layer) {
+                const auto &cache = attention_[layer];
+                const std::size_t values = active_tokens_ * kKvWidth;
+                if (cache.keys.size() != values || cache.values.size() != values) {
+                    throw std::runtime_error("scalar attention cache length does not match target state");
+                }
+                qwen_native::attention_upload_history(attn_device_, static_cast<int>(layer),
+                                                       cache.keys.data(), cache.values.data(), active_tokens_);
+            }
+        } else if (active_tokens_ != 0 && attention_.front().keys.size() == active_tokens_ * kKvWidth) {
+            throw std::runtime_error("long-context pipeline cannot replace an existing scalar FP16 history");
+        }
+        qwen_native::attention_set_history_length(attn_device_, static_cast<int>(active_tokens_));
+        for (std::size_t layer = 0; layer < recurrent_.size(); ++layer) {
+            auto &state = recurrent_[layer];
+            if (!state.device_matrix_current) {
+                qwen_native::upload_gated_delta_state(state.device_matrix, state.matrix.data());
+                state.device_matrix_current = true;
+            }
+            qwen_native::recurrent_upload_convolution_state(
+                recurrent_device_, static_cast<int>(layer), state.convolution.data(), state.convolution.size());
+        }
+        pipeline_state_current_ = true;
+    }
+
+    void synchronize_host_state() {
+        if (!pipeline_state_current_) return;
+        for (std::size_t layer = 0; layer < attention_.size(); ++layer) {
+            auto &cache = attention_[layer];
+            const std::size_t values = active_tokens_ * kKvWidth;
+            cache.keys.resize(values);
+            cache.values.resize(values);
+            qwen_native::attention_download_history(attn_device_, static_cast<int>(layer),
+                                                     cache.keys.data(), cache.values.data(), active_tokens_);
+        }
+        for (std::size_t layer = 0; layer < recurrent_.size(); ++layer) {
+            auto &state = recurrent_[layer];
+            qwen_native::recurrent_download_convolution_state(
+                recurrent_device_, static_cast<int>(layer), state.convolution.data(), state.convolution.size());
+            state.host_matrix_current = false;
+            state.device_matrix_current = true;
+        }
+        pipeline_state_current_ = false;
+    }
+
     struct RecurrentState {
         std::vector<float> matrix;
         // Three previous q/k/v vectors, stored channel-major.
@@ -1426,151 +1716,6 @@ private:
                type == 20 || type == 21 || type == 23;
     }
 
-    static constexpr std::uint32_t kIQ3SGridTable[512] = {
-        0x01010101,0x01010103,0x01010105,0x0101010b,0x0101010f,0x01010301,0x01010303,0x01010305,
-        0x01010309,0x0101030d,0x01010501,0x01010503,0x0101050b,0x01010707,0x01010901,0x01010905,
-        0x0101090b,0x0101090f,0x01010b03,0x01010b07,0x01010d01,0x01010d05,0x01010f03,0x01010f09,
-        0x01010f0f,0x01030101,0x01030103,0x01030105,0x01030109,0x01030301,0x01030303,0x0103030b,
-        0x01030501,0x01030507,0x0103050f,0x01030703,0x0103070b,0x01030909,0x01030d03,0x01030d0b,
-        0x01030f05,0x01050101,0x01050103,0x0105010b,0x0105010f,0x01050301,0x01050307,0x0105030d,
-        0x01050503,0x0105050b,0x01050701,0x01050709,0x01050905,0x0105090b,0x0105090f,0x01050b03,
-        0x01050b07,0x01050f01,0x01050f07,0x01070107,0x01070303,0x0107030b,0x01070501,0x01070505,
-        0x01070703,0x01070707,0x0107070d,0x01070909,0x01070b01,0x01070b05,0x01070d0f,0x01070f03,
-        0x01070f0b,0x01090101,0x01090307,0x0109030f,0x01090503,0x01090509,0x01090705,0x01090901,
-        0x01090907,0x01090b03,0x01090f01,0x010b0105,0x010b0109,0x010b0501,0x010b0505,0x010b050d,
-        0x010b0707,0x010b0903,0x010b090b,0x010b090f,0x010b0d0d,0x010b0f07,0x010d010d,0x010d0303,
-        0x010d0307,0x010d0703,0x010d0b05,0x010d0f03,0x010f0101,0x010f0105,0x010f0109,0x010f0501,
-        0x010f0505,0x010f050d,0x010f0707,0x010f0b01,0x010f0b09,0x03010101,0x03010103,0x03010105,
-        0x03010109,0x03010301,0x03010303,0x03010307,0x0301030b,0x0301030f,0x03010501,0x03010505,
-        0x03010703,0x03010709,0x0301070d,0x03010b09,0x03010b0d,0x03010d03,0x03010f05,0x03030101,
-        0x03030103,0x03030107,0x0303010d,0x03030301,0x03030309,0x03030503,0x03030701,0x03030707,
-        0x03030903,0x03030b01,0x03030b05,0x03030f01,0x03030f0d,0x03050101,0x03050305,0x0305030b,
-        0x0305030f,0x03050501,0x03050509,0x03050705,0x03050901,0x03050907,0x03050b0b,0x03050d01,
-        0x03050f05,0x03070103,0x03070109,0x0307010f,0x03070301,0x03070307,0x03070503,0x0307050f,
-        0x03070701,0x03070709,0x03070903,0x03070d05,0x03070f01,0x03090107,0x0309010b,0x03090305,
-        0x03090309,0x03090703,0x03090707,0x03090905,0x0309090d,0x03090b01,0x03090b09,0x030b0103,
-        0x030b0301,0x030b0307,0x030b0503,0x030b0701,0x030b0705,0x030b0b03,0x030d0501,0x030d0509,
-        0x030d050f,0x030d0909,0x030d090d,0x030f0103,0x030f0107,0x030f0301,0x030f0305,0x030f0503,
-        0x030f070b,0x030f0903,0x030f0d05,0x030f0f01,0x05010101,0x05010103,0x05010107,0x0501010b,
-        0x0501010f,0x05010301,0x05010305,0x05010309,0x0501030d,0x05010503,0x05010507,0x0501050f,
-        0x05010701,0x05010705,0x05010903,0x05010907,0x0501090b,0x05010b01,0x05010b05,0x05010d0f,
-        0x05010f01,0x05010f07,0x05010f0b,0x05030101,0x05030105,0x05030301,0x05030307,0x0503030f,
-        0x05030505,0x0503050b,0x05030703,0x05030709,0x05030905,0x05030b03,0x05050103,0x05050109,
-        0x0505010f,0x05050503,0x05050507,0x05050701,0x0505070f,0x05050903,0x05050b07,0x05050b0f,
-        0x05050f03,0x05050f09,0x05070101,0x05070105,0x0507010b,0x05070303,0x05070505,0x05070509,
-        0x05070703,0x05070707,0x05070905,0x05070b01,0x05070d0d,0x05090103,0x0509010f,0x05090501,
-        0x05090507,0x05090705,0x0509070b,0x05090903,0x05090f05,0x05090f0b,0x050b0109,0x050b0303,
-        0x050b0505,0x050b070f,0x050b0901,0x050b0b07,0x050b0f01,0x050d0101,0x050d0105,0x050d010f,
-        0x050d0503,0x050d0b0b,0x050d0d03,0x050f010b,0x050f0303,0x050f050d,0x050f0701,0x050f0907,
-        0x050f0b01,0x07010105,0x07010303,0x07010307,0x0701030b,0x0701030f,0x07010505,0x07010703,
-        0x07010707,0x0701070b,0x07010905,0x07010909,0x0701090f,0x07010b03,0x07010d07,0x07010f03,
-        0x07030103,0x07030107,0x0703010b,0x07030309,0x07030503,0x07030507,0x07030901,0x07030d01,
-        0x07030f05,0x07030f0d,0x07050101,0x07050305,0x07050501,0x07050705,0x07050709,0x07050b01,
-        0x07070103,0x07070301,0x07070309,0x07070503,0x07070507,0x0707050f,0x07070701,0x07070903,
-        0x07070907,0x0707090f,0x07070b0b,0x07070f07,0x07090107,0x07090303,0x0709030d,0x07090505,
-        0x07090703,0x07090b05,0x07090d01,0x07090d09,0x070b0103,0x070b0301,0x070b0305,0x070b050b,
-        0x070b0705,0x070b0909,0x070b0b0d,0x070b0f07,0x070d030d,0x070d0903,0x070f0103,0x070f0107,
-        0x070f0501,0x070f0505,0x070f070b,0x09010101,0x09010109,0x09010305,0x09010501,0x09010509,
-        0x0901050f,0x09010705,0x09010903,0x09010b01,0x09010f01,0x09030105,0x0903010f,0x09030303,
-        0x09030307,0x09030505,0x09030701,0x0903070b,0x09030907,0x09030b03,0x09030b0b,0x09050103,
-        0x09050107,0x09050301,0x0905030b,0x09050503,0x09050707,0x09050901,0x09050b0f,0x09050d05,
-        0x09050f01,0x09070109,0x09070303,0x09070307,0x09070501,0x09070505,0x09070703,0x0907070b,
-        0x09090101,0x09090105,0x09090509,0x0909070f,0x09090901,0x09090f03,0x090b010b,0x090b010f,
-        0x090b0503,0x090b0d05,0x090d0307,0x090d0709,0x090d0d01,0x090f0301,0x090f030b,0x090f0701,
-        0x090f0907,0x090f0b03,0x0b010105,0x0b010301,0x0b010309,0x0b010505,0x0b010901,0x0b010909,
-        0x0b01090f,0x0b010b05,0x0b010d0d,0x0b010f09,0x0b030103,0x0b030107,0x0b03010b,0x0b030305,
-        0x0b030503,0x0b030705,0x0b030f05,0x0b050101,0x0b050303,0x0b050507,0x0b050701,0x0b05070d,
-        0x0b050b07,0x0b070105,0x0b07010f,0x0b070301,0x0b07050f,0x0b070909,0x0b070b03,0x0b070d0b,
-        0x0b070f07,0x0b090103,0x0b090109,0x0b090501,0x0b090705,0x0b09090d,0x0b0b0305,0x0b0b050d,
-        0x0b0b0b03,0x0b0b0b07,0x0b0d0905,0x0b0f0105,0x0b0f0109,0x0b0f0505,0x0d010303,0x0d010307,
-        0x0d01030b,0x0d010703,0x0d010707,0x0d010d01,0x0d030101,0x0d030501,0x0d03050f,0x0d030d09,
-        0x0d050305,0x0d050709,0x0d050905,0x0d050b0b,0x0d050d05,0x0d050f01,0x0d070101,0x0d070309,
-        0x0d070503,0x0d070901,0x0d09050b,0x0d090907,0x0d090d05,0x0d0b0101,0x0d0b0107,0x0d0b0709,
-        0x0d0b0d01,0x0d0d010b,0x0d0d0901,0x0d0f0303,0x0d0f0307,0x0f010101,0x0f010109,0x0f01010f,
-        0x0f010501,0x0f010505,0x0f01070d,0x0f010901,0x0f010b09,0x0f010d05,0x0f030105,0x0f030303,
-        0x0f030509,0x0f030907,0x0f03090b,0x0f050103,0x0f050109,0x0f050301,0x0f05030d,0x0f050503,
-        0x0f050701,0x0f050b03,0x0f070105,0x0f070705,0x0f07070b,0x0f070b07,0x0f090103,0x0f09010b,
-        0x0f090307,0x0f090501,0x0f090b01,0x0f0b0505,0x0f0b0905,0x0f0d0105,0x0f0d0703,0x0f0f0101,
-    };
-
-    std::vector<char> convert_iq3s_to_q8_0(const qwen_native::TensorInfo &item) const {
-        const std::size_t input_size = static_cast<std::size_t>(item.dimensions[0]);
-        const std::size_t output_size = static_cast<std::size_t>(item.dimensions[1]);
-        const auto *raw = static_cast<const std::uint8_t *>(tensor_data(mapping_, model_, item));
-        constexpr std::size_t iq3s_block_size = 256;
-        constexpr std::size_t iq3s_block_bytes = 110;
-        constexpr std::size_t q8_block_size = 32;
-        constexpr std::size_t q8_block_bytes = 34;
-        const std::size_t iq3s_blocks_per_row = input_size / iq3s_block_size;
-        const std::size_t q8_blocks_per_row = input_size / q8_block_size;
-        std::vector<char> q8_data(output_size * q8_blocks_per_row * q8_block_bytes);
-        std::vector<float> row_f32(input_size);
-        for (std::size_t row = 0; row < output_size; ++row) {
-            const auto *src = raw + row * iq3s_blocks_per_row * iq3s_block_bytes;
-            for (std::size_t bi = 0; bi < iq3s_blocks_per_row; ++bi) {
-                const auto *block = src + bi * iq3s_block_bytes;
-                std::uint16_t d_bits;
-                std::memcpy(&d_bits, block, 2);
-                const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
-                const auto *qs = block + 2;
-                const auto *qh = block + 2 + 64;
-                const auto *signs = block + 2 + 64 + 8;
-                const auto *scales = block + 2 + 64 + 8 + 32;
-                float *out = row_f32.data() + bi * iq3s_block_size;
-                std::size_t out_idx = 0;
-                for (int ib32 = 0; ib32 < 8; ib32 += 2) {
-                    const float db1 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] & 0xf));
-                    const float db2 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] >> 4));
-                    for (int l = 0; l < 4; ++l) {
-                        const auto *grid1 = reinterpret_cast<const std::uint8_t *>(
-                            &kIQ3SGridTable[qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)]);
-                        const auto *grid2 = reinterpret_cast<const std::uint8_t *>(
-                            &kIQ3SGridTable[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)]);
-                        for (int j = 0; j < 4; ++j) {
-                            out[out_idx + j + 0] = db1 * grid1[j] * ((signs[l] & (1 << j)) ? -1.0F : 1.0F);
-                            out[out_idx + j + 4] = db1 * grid2[j] * ((signs[l] & (1 << (j + 4))) ? -1.0F : 1.0F);
-                        }
-                        out_idx += 8;
-                    }
-                    qs += 8;
-                    signs += 4;
-                    for (int l = 0; l < 4; ++l) {
-                        const auto *grid1 = reinterpret_cast<const std::uint8_t *>(
-                            &kIQ3SGridTable[qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)]);
-                        const auto *grid2 = reinterpret_cast<const std::uint8_t *>(
-                            &kIQ3SGridTable[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)]);
-                        for (int j = 0; j < 4; ++j) {
-                            out[out_idx + j + 0] = db2 * grid1[j] * ((signs[l] & (1 << j)) ? -1.0F : 1.0F);
-                            out[out_idx + j + 4] = db2 * grid2[j] * ((signs[l] & (1 << (j + 4))) ? -1.0F : 1.0F);
-                        }
-                        out_idx += 8;
-                    }
-                    qh += 2;
-                    qs += 8;
-                    signs += 4;
-                }
-            }
-            auto *dst = q8_data.data() + row * q8_blocks_per_row * q8_block_bytes;
-            for (std::size_t qi = 0; qi < q8_blocks_per_row; ++qi) {
-                float amax = 0.0F;
-                for (std::size_t j = 0; j < q8_block_size; ++j) {
-                    float v = std::abs(row_f32[qi * q8_block_size + j]);
-                    if (v > amax) amax = v;
-                }
-                const float scale = amax / 127.0F;
-                const float inv_scale = (scale != 0.0F) ? 127.0F / amax : 0.0F;
-                __half h_scale = __float2half(scale);
-                std::memcpy(dst + qi * q8_block_bytes, &h_scale, 2);
-                auto *q8_qs = reinterpret_cast<std::int8_t *>(dst + qi * q8_block_bytes + 2);
-                for (std::size_t j = 0; j < q8_block_size; ++j) {
-                    float v = row_f32[qi * q8_block_size + j] * inv_scale;
-                    q8_qs[j] = static_cast<std::int8_t>(std::round(std::clamp(v, -127.0F, 127.0F)));
-                }
-            }
-        }
-        return q8_data;
-    }
-
     std::vector<float> dequantize_q8_projection(const qwen_native::TensorInfo &item) const {
         const std::size_t input_size = static_cast<std::size_t>(item.dimensions[0]);
         const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
@@ -1606,17 +1751,8 @@ private:
             (name.size() >= 6 && name.compare(0, 6, "blk.64") == 0) ||
             (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
                                    name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
-        if (item.type == 21) {
-            auto it = iq3s_converted_.find(name);
-            if (it == iq3s_converted_.end()) {
-                throw std::runtime_error("IQ3_S tensor not pre-converted: " + name);
-            }
-            qwen_native::execute_k_matvec_cached(it->second.data(), 8,
-                                                 input.data(), input.size(), output.data(), output.size(), keep_resident);
-        } else {
-            qwen_native::execute_k_matvec_cached(tensor_data(mapping_, model_, item), item.type,
-                                                 input.data(), input.size(), output.data(), output.size(), keep_resident);
-        }
+        qwen_native::execute_k_matvec_cached(tensor_data(mapping_, model_, item), item.type,
+                                             input.data(), input.size(), output.data(), output.size(), keep_resident);
         return output;
     }
 
@@ -1632,14 +1768,10 @@ private:
         const bool keep_resident = allow_dynamic_target_cache_ && (name == "output.weight" ||
             (name.size() >= 16 && (name.compare(name.size() - 16, 16, ".ffn_down.weight") == 0 ||
                                    name.compare(name.size() - 16, 16, ".attn_qkv.weight") == 0)));
-        if (item.type == 21) {
-            auto it = iq3s_converted_.find(name);
-            if (it == iq3s_converted_.end()) {
-                throw std::runtime_error("IQ3_S tensor not pre-converted: " + name);
-            }
-            qwen_native::execute_k_matvec_cached_batch8(
-                it->second.data(), 8, input.data(),
-                static_cast<std::size_t>(item.dimensions[0]), output.data(), outputs, keep_resident);
+        if (name == "output.weight" && std::getenv("QWEN_NATIVE_HYBRID_HEAD")) {
+            qwen_native::execute_k_matvec_hybrid_cached_batch8(
+                tensor_data(mapping_, model_, item), item.type, input.data(),
+                static_cast<std::size_t>(item.dimensions[0]), output.data(), outputs, false);
         } else {
             qwen_native::execute_k_matvec_cached_batch8(
                 tensor_data(mapping_, model_, item), item.type, input.data(),
@@ -1651,14 +1783,6 @@ private:
     void preload_projection(const std::string &name) const {
         const auto &item = tensor(name);
         if (item.dimensions.size() != 2 || !is_supported_quant(item.type)) {
-            return;
-        }
-        if (item.type == 21) {
-            auto it = iq3s_converted_.find(name);
-            if (it == iq3s_converted_.end()) return;
-            (void) qwen_native::preload_resident_k_matrix(
-                it->second.data(), 8,
-                static_cast<std::size_t>(item.dimensions[0]), static_cast<std::size_t>(item.dimensions[1]));
             return;
         }
         (void) qwen_native::preload_resident_k_matrix(
@@ -1754,6 +1878,8 @@ private:
         constexpr std::size_t state_stride = kRecurrentHeadSize * kRecurrentHeadSize;
         const float q_scale = 1.0F / std::sqrt(static_cast<float>(kRecurrentHeadSize));
         for (std::size_t head = 0; head < kRecurrentValueHeads; ++head) {
+            // GGUF conversion tiles V heads as [replica][K head], so the
+            // matching repeated Q/K head is selected modulo the K-head count.
             const std::size_t key_head = head % kRecurrentKeyHeads;
             const float decay = std::exp(softplus(alpha[head] + dt_bias[head]) * a[head]);
             const float beta = sigmoid(beta_unscaled[head]);
@@ -1937,7 +2063,8 @@ private:
                     output[dim] = std::fma(probability, fp16_to_float(value[dim]), output[dim]);
                 }
             }
-            const float *gate = q_and_gate.data() + head * 2 * kAttentionHeadSize + kAttentionHeadSize;
+            const float *gate = q_and_gate.data()
+                + head * 2 * kAttentionHeadSize + kAttentionHeadSize;
             for (std::size_t dim = 0; dim < kAttentionHeadSize; ++dim) {
                 output[dim] *= sigmoid(gate[dim]);
             }
@@ -1983,16 +2110,19 @@ private:
     float epsilon_ = 1.0e-6F;
     float rope_frequency_base_ = 1.0e7F;
     bool allow_dynamic_target_cache_ = true;
+    bool pipeline_state_current_ = false;
     std::vector<RecurrentState> recurrent_;
     std::vector<AttentionCache> attention_;
     AttentionCache mtp_attention_cache_;
     std::vector<float> trunk_hidden_;
     std::vector<float> batch_trunk_hidden_;
     std::array<std::vector<float>, 5> dflash_features_;
+    // Each entry is eight contiguous target-layer snapshots, one per input
+    // token in the last pipelined verification/replay batch.
+    std::array<std::vector<float>, 5> batch_dflash_features_;
     qwen_native::DevicePipeline *pipeline_ = nullptr;
     qwen_native::RecurrentDeviceState *recurrent_device_ = nullptr;
     qwen_native::AttentionDeviceState *attn_device_ = nullptr;
-    std::unordered_map<std::string, std::vector<char>> iq3s_converted_;
 };
 
 // DFlash2's encoder is intentionally a separate native component: it consumes
@@ -2031,24 +2161,79 @@ public:
         std::vector<float> encoded(5120);
         qwen_native::execute_k_matvec_cached(
             tensor_data(mapping_, model_, fc), fc.type, fused.data(), fused.size(), encoded.data(), encoded.size(), true);
+        float rms_pre = 0;
+        for (float v : encoded) rms_pre += v * v;
+        rms_pre = std::sqrt(rms_pre / encoded.size());
         const auto &norm = require_tensor(model_, "enc.output_norm.weight");
-        return rms_norm(encoded, static_cast<const float *>(tensor_data(mapping_, model_, norm)), 5120, 1.0e-6F);
+        auto result = rms_norm(encoded, static_cast<const float *>(tensor_data(mapping_, model_, norm)), 5120, 1.0e-6F);
+        float rms_post = 0;
+        for (float v : result) rms_post += v * v;
+        rms_post = std::sqrt(rms_post / result.size());
+        static int encode_debug_count = 0;
+        if (std::getenv("QWEN_NATIVE_TRACE") && encode_debug_count < 1) {
+            std::cerr << "  [encode: features rms=[";
+            for (int fi = 0; fi < 5; ++fi) {
+                float fr = 0;
+                for (float v : features[fi]) fr += v * v;
+                std::cerr << std::sqrt(fr / features[fi].size());
+                if (fi < 4) std::cerr << ", ";
+            }
+            std::cerr << "] pre=" << rms_pre << " post=" << rms_post << "]\n";
+            ++encode_debug_count;
+        }
+        return result;
     }
 
     void preload_all_quantized() const {
-        for (const auto &tensor : model_.tensors()) {
-            if (tensor.type == 12 || tensor.type == 13 || tensor.type == 14) {
-                (void) qwen_native::preload_resident_k_matrix(
-                    tensor_data(mapping_, model_, tensor), tensor.type,
+        // N23 is an optional draft-only experiment. The default preloads the
+        // official packed matrices unchanged into the shared exact cache.
+        if (std::getenv("QWEN_NATIVE_DRAFT_N23")) {
+            for (const auto &tensor : model_.tensors()) {
+                if (tensor.type != 12) continue;
+                qwen_native::preload_n23q4_matrix(
+                    tensor_data(mapping_, model_, tensor),
                     static_cast<std::size_t>(tensor.dimensions.at(0)),
                     static_cast<std::size_t>(tensor.dimensions.at(1)));
-                if (tensor.type == 12) {
-                    qwen_native::preload_n23q4_matrix(
-                        tensor_data(mapping_, model_, tensor),
-                        static_cast<std::size_t>(tensor.dimensions.at(0)),
-                        static_cast<std::size_t>(tensor.dimensions.at(1)));
-                }
             }
+            return;
+        }
+        std::size_t required_bytes = 0;
+        for (const auto &item : model_.tensors()) {
+            if (item.dimensions.size() != 2 ||
+                (item.type != 12 && item.type != 13 && item.type != 14)) continue;
+            const std::size_t block_bytes = item.type == 12 ? 144 : item.type == 13 ? 176 : 210;
+            required_bytes += static_cast<std::size_t>(item.dimensions[0]) / 256
+                            * static_cast<std::size_t>(item.dimensions[1]) * block_bytes;
+        }
+        const auto existing = qwen_native::resident_weight_cache_stats();
+        qwen_native::set_resident_weight_cache_budget(existing.budget_bytes + required_bytes);
+        for (const auto &item : model_.tensors()) {
+            if (item.dimensions.size() != 2 ||
+                (item.type != 12 && item.type != 13 && item.type != 14)) continue;
+            if (!qwen_native::preload_resident_k_matrix(
+                    tensor_data(mapping_, model_, item), item.type,
+                    static_cast<std::size_t>(item.dimensions[0]),
+                    static_cast<std::size_t>(item.dimensions[1]))) {
+                throw std::runtime_error("VRAM is insufficient for exact DFlash residency");
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t injected_token_count() const {
+        constexpr std::size_t kv_width = 8 * 128;
+        const std::size_t count = injected_.front().keys.size() / kv_width;
+        for (const auto &cache : injected_) {
+            if (cache.keys.size() != cache.values.size() || cache.keys.size() / kv_width != count) {
+                throw std::runtime_error("DFlash injected KV layers are out of sync");
+            }
+        }
+        return count;
+    }
+
+    void reset() {
+        for (auto &cache : injected_) {
+            cache.keys.clear();
+            cache.values.clear();
         }
     }
 
@@ -2061,6 +2246,58 @@ public:
             keys = rms_norm(keys, f32_vector(prefix + "attn_k_norm.weight", 128), 128, 1.0e-6F);
             apply_rope(keys, 8, position);
             append_injected(layer, keys, values);
+        }
+    }
+
+    void inject_batch(
+        const std::array<std::array<std::vector<float>, 5>, 8> &features,
+        std::size_t valid_count, std::size_t first_position) {
+        if (valid_count == 0 || valid_count > 8) {
+            throw std::invalid_argument("DFlash injection batch must contain [1, 8] items");
+        }
+        constexpr std::size_t feature_width = 5120;
+        constexpr std::size_t fused_width = 5 * feature_width;
+        std::vector<float> fused(8 * fused_width);
+        for (std::size_t batch = 0; batch < 8; ++batch) {
+            const std::size_t source_batch = std::min(batch, valid_count - 1);
+            for (std::size_t feature = 0; feature < 5; ++feature) {
+                if (features[source_batch][feature].size() != feature_width) {
+                    throw std::runtime_error("target did not capture a complete DFlash injection batch");
+                }
+                std::copy(features[source_batch][feature].begin(),
+                          features[source_batch][feature].end(),
+                          fused.begin() + batch * fused_width + feature * feature_width);
+            }
+        }
+        const auto &fc = tensor("fc.weight");
+        std::vector<float> encoded(8 * feature_width);
+        qwen_native::execute_k_matvec_cached_batch8(
+            tensor_data(mapping_, model_, fc), fc.type, fused.data(), fused_width,
+            encoded.data(), feature_width, true);
+        encoded = rms_norm(encoded, f32_vector("enc.output_norm.weight", feature_width),
+                           feature_width, 1.0e-6F);
+
+        constexpr std::size_t kv_width = 8 * 128;
+        for (int layer = 0; layer < 5; ++layer) {
+            const std::string prefix = "blk." + std::to_string(layer) + ".";
+            const auto &k_tensor = tensor(prefix + "attn_k.weight");
+            const auto &v_tensor = tensor(prefix + "attn_v.weight");
+            std::vector<float> keys(8 * kv_width);
+            std::vector<float> values(8 * kv_width);
+            qwen_native::execute_k_matvec_cached_batch8(
+                tensor_data(mapping_, model_, k_tensor), k_tensor.type,
+                encoded.data(), feature_width, keys.data(), kv_width, true);
+            qwen_native::execute_k_matvec_cached_batch8(
+                tensor_data(mapping_, model_, v_tensor), v_tensor.type,
+                encoded.data(), feature_width, values.data(), kv_width, true);
+            keys = rms_norm(keys, f32_vector(prefix + "attn_k_norm.weight", 128),
+                            128, 1.0e-6F);
+            for (std::size_t batch = 0; batch < valid_count; ++batch) {
+                float *key_ptr = keys.data() + batch * kv_width;
+                const float *val_ptr = values.data() + batch * kv_width;
+                apply_rope(key_ptr, 8, first_position + batch);
+                append_injected(layer, key_ptr, val_ptr, kv_width);
+            }
         }
     }
 
@@ -2078,6 +2315,7 @@ public:
             const auto embedding = target.dflash_token_embedding(item == 0 ? anchor : mask);
             std::copy(embedding.begin(), embedding.end(), hidden.begin() + item * width);
         }
+        const auto layers_started = std::chrono::steady_clock::now();
         for (int layer = 0; layer < 5; ++layer) {
             const std::string prefix = "blk." + std::to_string(layer) + ".";
             auto attention_input = rms_norm(hidden, f32_vector(prefix + "attn_norm.weight", width), width, 1.0e-6F);
@@ -2090,14 +2328,8 @@ public:
             queries = rms_norm(queries, f32_vector(prefix + "attn_q_norm.weight", head_size), head_size, 1.0e-6F);
             keys = rms_norm(keys, f32_vector(prefix + "attn_k_norm.weight", head_size), head_size, 1.0e-6F);
             for (std::size_t item = 0; item < block; ++item) {
-                std::vector<float> q_row(queries.begin() + item * heads * head_size,
-                                         queries.begin() + (item + 1) * heads * head_size);
-                std::vector<float> k_row(keys.begin() + item * kv_width,
-                                         keys.begin() + (item + 1) * kv_width);
-                apply_rope(q_row, heads, position + item);
-                apply_rope(k_row, kv_heads, position + item);
-                std::copy(q_row.begin(), q_row.end(), queries.begin() + item * heads * head_size);
-                std::copy(k_row.begin(), k_row.end(), keys.begin() + item * kv_width);
+                apply_rope(queries.data() + item * heads * head_size, heads, position + item);
+                apply_rope(keys.data() + item * kv_width, kv_heads, position + item);
             }
             auto attention = noncausal_attention(layer, queries, keys, values);
             attention = projection_batch8(prefix + "attn_output.weight", attention);
@@ -2118,10 +2350,44 @@ public:
                                       f32_data(prefix + "ffn_conv_base", 2 * 2 * width), 1);
             hidden = add_vectors(ffn_input, ffn_output);
         }
+        const auto layers_done = std::chrono::steady_clock::now();
         hidden = rms_norm(hidden, f32_vector("output_norm.weight", 5120), 5120, 1.0e-6F);
         const auto logits = target.dflash_output_logits_batch8(hidden);
+        const auto logits_done = std::chrono::steady_clock::now();
+        const std::size_t vocab = logits.size() / 8;
+        if (std::getenv("QWEN_NATIVE_TRACE")) {
+            std::cerr << "  [dflash top-1 per pos:";
+            for (int pos = 0; pos < 8; ++pos) {
+                const float *begin = logits.data() + pos * vocab;
+                const auto best = std::max_element(begin, begin + vocab);
+                std::cerr << ' ' << std::distance(begin, best);
+            }
+            std::cerr << "]\n";
+        }
         const auto selector_hidden = projection_batch8("selector_hidden.weight", hidden);
-        return select(anchor, logits, selector_hidden);
+        const auto sel_done = std::chrono::steady_clock::now();
+        const auto result = select(anchor, logits, selector_hidden);
+        const auto end_done = std::chrono::steady_clock::now();
+        if (std::getenv("QWEN_NATIVE_DFLASH_DEBUG")) {
+            std::cerr << "    [dflash breakdown: layers="
+                      << std::chrono::duration<double, std::milli>(layers_done - layers_started).count()
+                      << "ms, logits="
+                      << std::chrono::duration<double, std::milli>(logits_done - layers_done).count()
+                      << "ms, sel_hidden="
+                      << std::chrono::duration<double, std::milli>(sel_done - logits_done).count()
+                      << "ms, select="
+                      << std::chrono::duration<double, std::milli>(end_done - sel_done).count()
+                      << "ms]\n";
+        }
+        return result;
+    }
+
+    [[nodiscard]] int last_candidate_rank(std::size_t position,
+                                          std::uint32_t token) const {
+        if (position >= 7) return -1;
+        const auto &items = last_candidates_.at(position);
+        const auto found = std::find(items.begin(), items.end(), token);
+        return found == items.end() ? -1 : static_cast<int>(std::distance(items.begin(), found));
     }
 
 private:
@@ -2132,6 +2398,10 @@ private:
 
     const qwen_native::TensorInfo &tensor(const std::string &name) const {
         return require_tensor(model_, name);
+    }
+
+    static bool has_n23q4(const void *weights) {
+        return qwen_native::has_n23q4_matrix(weights);
     }
 
     const float *f32_vector(const std::string &name, std::size_t values) const {
@@ -2170,7 +2440,7 @@ private:
         }
         const std::size_t outputs = static_cast<std::size_t>(item.dimensions[1]);
         std::vector<float> output(8 * outputs);
-        if (item.type == 12) {
+        if (item.type == 12 && has_n23q4(tensor_data(mapping_, model_, item))) {
             qwen_native::execute_n23q4_batch8_cached(
                 tensor_data(mapping_, model_, item), input.data(),
                 static_cast<std::size_t>(item.dimensions[0]), outputs, output.data());
@@ -2178,12 +2448,15 @@ private:
         }
         qwen_native::execute_k_matvec_cached_batch8(tensor_data(mapping_, model_, item), item.type,
                                                      input.data(), static_cast<std::size_t>(item.dimensions[0]),
-                                                     output.data(), outputs, true);
+                                                     output.data(), outputs, false);
         return output;
     }
 
-    static void apply_rope(std::vector<float> &values, std::size_t heads, std::size_t position) {
-        constexpr std::size_t rotated = 64;
+    static void apply_rope(float *values, std::size_t heads, std::size_t position) {
+        // The DFlash checkpoint uses Qwen3 attention with a full 128-dimension
+        // rotary head. Unlike the Qwen3.8 target's partial 64/256 RoPE, no
+        // trailing half of a draft head is left unrotated.
+        constexpr std::size_t rotated = 128;
         constexpr std::size_t pairs = rotated / 2;
         const float theta_scale = std::pow(1.0e7F, -2.0F / static_cast<float>(rotated));
         float theta = static_cast<float>(position);
@@ -2195,7 +2468,7 @@ private:
             theta *= theta_scale;
         }
         for (std::size_t head = 0; head < heads; ++head) {
-            float *item = values.data() + head * 128;
+            float *item = values + head * 128;
             for (std::size_t pair = 0; pair < pairs; ++pair) {
                 const float left = item[pair];
                 const float right = item[pair + pairs];
@@ -2203,6 +2476,9 @@ private:
                 item[pair + pairs] = left * sine[pair] + right * cosine[pair];
             }
         }
+    }
+    static void apply_rope(std::vector<float> &values, std::size_t heads, std::size_t position) {
+        apply_rope(values.data(), heads, position);
     }
 
     static std::uint16_t to_fp16(float value) {
@@ -2212,7 +2488,7 @@ private:
         return bits;
     }
 
-    void append_injected(int layer, const std::vector<float> &keys, const std::vector<float> &values) {
+    void append_injected(int layer, const float *keys, const float *values, std::size_t count) {
         auto &cache = injected_.at(layer);
         constexpr std::size_t kv_width = 8 * 128;
         constexpr std::size_t window = 2048;
@@ -2220,8 +2496,16 @@ private:
             cache.keys.erase(cache.keys.begin(), cache.keys.begin() + kv_width);
             cache.values.erase(cache.values.begin(), cache.values.begin() + kv_width);
         }
-        for (const float value : keys) cache.keys.push_back(to_fp16(value));
-        for (const float value : values) cache.values.push_back(to_fp16(value));
+        const std::size_t old_size = cache.keys.size();
+        cache.keys.resize(old_size + count);
+        cache.values.resize(old_size + count);
+        for (std::size_t i = 0; i < count; ++i) {
+            cache.keys[old_size + i] = to_fp16(keys[i]);
+            cache.values[old_size + i] = to_fp16(values[i]);
+        }
+    }
+    void append_injected(int layer, const std::vector<float> &keys, const std::vector<float> &values) {
+        append_injected(layer, keys.data(), values.data(), keys.size());
     }
 
     std::vector<float> dynamic_conv(const std::vector<float> &values, const std::vector<float> &dynamic,
@@ -2257,44 +2541,11 @@ private:
         const auto &cache = injected_.at(layer);
         const std::size_t cached = cache.keys.size() / kv_width;
         std::vector<float> output(block * heads * head_size);
-        std::vector<float> scores(cached + block);
-        for (std::size_t item = 0; item < block; ++item) {
-            for (std::size_t head = 0; head < heads; ++head) {
-                const std::size_t kv_head = head / (heads / kv_heads);
-                const float *query = queries.data() + (item * heads + head) * head_size;
-                float maximum = -std::numeric_limits<float>::infinity();
-                for (std::size_t source = 0; source < cached + block; ++source) {
-                    const std::uint16_t *key = source < cached
-                        ? cache.keys.data() + source * kv_width + kv_head * head_size
-                        : nullptr;
-                    float dot = 0.0F;
-                    for (std::size_t dim = 0; dim < head_size; ++dim) {
-                        const float value = key ? fp16_to_float(key[dim])
-                            : keys[(source - cached) * kv_width + kv_head * head_size + dim];
-                        dot = std::fma(query[dim], value, dot);
-                    }
-                    scores[source] = dot * 0.08838834764831843F;
-                    maximum = std::max(maximum, scores[source]);
-                }
-                float denominator = 0.0F;
-                for (float &score : scores) {
-                    score = std::exp(score - maximum);
-                    denominator += score;
-                }
-                float *result = output.data() + (item * heads + head) * head_size;
-                for (std::size_t source = 0; source < cached + block; ++source) {
-                    const float probability = scores[source] / denominator;
-                    const std::uint16_t *value = source < cached
-                        ? cache.values.data() + source * kv_width + kv_head * head_size
-                        : nullptr;
-                    for (std::size_t dim = 0; dim < head_size; ++dim) {
-                        const float item_value = value ? fp16_to_float(value[dim])
-                            : values[(source - cached) * kv_width + kv_head * head_size + dim];
-                        result[dim] = std::fma(probability, item_value, result[dim]);
-                    }
-                }
-            }
-        }
+        qwen_native::compute_dflash_noncausal_attention(
+            queries.data(), keys.data(), values.data(),
+            cache.keys.empty() ? nullptr : cache.keys.data(),
+            cache.values.empty() ? nullptr : cache.values.data(),
+            cached, output.data());
         return output;
     }
 
@@ -2315,16 +2566,37 @@ private:
         const std::size_t vocabulary = logits.size() / block;
         std::array<std::array<std::uint32_t, top_k>, 8> candidates{};
         std::array<std::array<float, top_k>, 8> unary{};
-        std::vector<std::uint32_t> order(vocabulary);
-        std::iota(order.begin(), order.end(), 0U);
+        struct CandidateItem {
+            float score;
+            std::uint32_t token;
+        };
+        auto heap_cmp = [](const CandidateItem &a, const CandidateItem &b) {
+            return a.score > b.score; // min-heap: smallest at root
+        };
+
         for (std::size_t pos = 1; pos < block; ++pos) {
-            std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
-                [&](std::uint32_t left, std::uint32_t right) {
-                    return logits[pos * vocabulary + left] > logits[pos * vocabulary + right];
-                });
+            const float *row = logits.data() + pos * vocabulary;
+            std::array<CandidateItem, top_k> heap{};
+            for (std::size_t i = 0; i < top_k; ++i) {
+                heap[i] = {row[i], static_cast<std::uint32_t>(i)};
+            }
+            std::make_heap(heap.begin(), heap.end(), heap_cmp);
+
+            float min_score = heap[0].score;
+            for (std::size_t i = top_k; i < vocabulary; ++i) {
+                const float val = row[i];
+                if (val > min_score) {
+                    std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+                    heap.back() = {val, static_cast<std::uint32_t>(i)};
+                    std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                    min_score = heap[0].score;
+                }
+            }
+            std::sort_heap(heap.begin(), heap.end(), heap_cmp);
             for (std::size_t item = 0; item < top_k; ++item) {
-                candidates[pos][item] = order[item];
-                unary[pos][item] = logits[pos * vocabulary + order[item]];
+                candidates[pos][item] = heap[item].token;
+                last_candidates_[pos - 1][item] = heap[item].token;
+                unary[pos][item] = heap[item].score;
             }
         }
         std::array<std::uint32_t, 7> result{};
@@ -2337,14 +2609,28 @@ private:
                 successors[current] = dequantize_selector_row("selector_successor.weight", candidates[pos][current]);
             }
             const float *hidden = selector_hidden.data() + pos * 256;
+            static const float selector_scale = [] {
+                if (const char *env = std::getenv("QWEN_NATIVE_SELECTOR_WEIGHT")) {
+                    return std::stof(env);
+                }
+                return 1.0F;
+            }();
             std::array<float, top_k> scores{};
             for (std::size_t current = 0; current < top_k; ++current) {
-                float score = unary[pos][current];
+                float transition = 0.0F;
                 const auto &previous = predecessors[predecessor];
                 for (std::size_t rank = 0; rank < 256; ++rank) {
-                    score = std::fma(successors[current][rank], previous[rank] * hidden[rank], score);
+                    transition = std::fma(successors[current][rank], previous[rank] * hidden[rank], transition);
                 }
-                scores[current] = score;
+                scores[current] = unary[pos][current] + selector_scale * transition;
+            }
+            if (std::getenv("QWEN_NATIVE_DFLASH_DEBUG") && pos == 1) {
+                std::cerr << "    [dflash pos1 debug: ";
+                for (std::size_t c = 0; c < 3; ++c) {
+                    std::cerr << "c" << c << " tok=" << candidates[pos][c]
+                              << " u=" << unary[pos][c] << " s=" << scores[c] << " | ";
+                }
+                std::cerr << "]\n";
             }
             predecessor = static_cast<std::size_t>(std::distance(scores.begin(),
                 std::max_element(scores.begin(), scores.end())));
@@ -2362,6 +2648,7 @@ private:
     qwen_native::GgufFile model_;
     Mapping mapping_;
     std::array<InjectedCache, 5> injected_;
+    mutable std::array<std::array<std::uint32_t, 16>, 7> last_candidates_{};
 };
 
 void mtp_test(const std::string &path, std::size_t context_capacity,
@@ -2431,9 +2718,6 @@ void target_verify_batch8(const std::string &path, std::size_t context_capacity,
         throw std::invalid_argument("block count must be positive");
     }
     NativeTargetSession session(path, context_capacity, resident_weight_budget);
-    if (context_capacity >= 131072) {
-        session.simulate_full_attention_window();
-    }
     std::array<std::uint32_t, 8> candidate{};
     candidate[0] = first_token;
     // A verifier deliberately accepts arbitrary candidate tokens.  These mask
@@ -2466,6 +2750,146 @@ void target_verify_batch8(const std::string &path, std::size_t context_capacity,
               << "  verifier rate:    " << std::fixed << std::setprecision(3)
               << effective_rate << " candidate tok/s\n"
               << "  measured time:    " << total_seconds << " s\n";
+}
+
+void target_long_window_bench(const std::string &path, std::size_t context_capacity,
+                              std::uint32_t token, std::size_t resident_weight_budget) {
+    NativeTargetSession session(path, context_capacity, resident_weight_budget);
+    session.simulate_full_attention_window();
+    std::array<std::uint32_t, 8> candidate{};
+    candidate.fill(248070);
+    candidate[0] = token;
+    std::cout << "native synthetic full-window target timing\n";
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        const auto result = session.step_batch8_pipelined(candidate);
+        std::cout << "  pass " << iteration + 1 << ": "
+                  << std::fixed << std::setprecision(3) << result.seconds << " s"
+                  << " (recurrent " << result.recurrent_seconds
+                  << ", attention " << result.attention_seconds
+                  << ", FFN " << result.ffn_seconds
+                  << ", head " << result.output_seconds << ")\n";
+        if (iteration != 2) session.rewind(8);
+    }
+    std::cout << "  active context: " << session.active_tokens() << '/' << context_capacity << "\n"
+              << "  note: zero-filled KV timing only; not a semantic 128K fixture\n";
+}
+
+void target_compare_batch(const std::string &path, std::size_t context_capacity,
+                          std::uint32_t first_token, std::size_t resident_weight_budget) {
+    std::array<std::uint32_t, 8> candidate{};
+    candidate.fill(248070);
+    candidate[0] = first_token;
+    // The authoritative target-only oracle uses the same declared Q8 cache
+    // representation and executes one committed token at a time. This avoids
+    // comparing the Q8 long-context engine to the separate FP16 host fixture.
+    std::array<std::uint32_t, 8> reference_tokens{};
+    {
+        NativeTargetSession reference(path, context_capacity, resident_weight_budget);
+        for (std::size_t index = 0; index < candidate.size(); ++index) {
+            std::array<std::uint32_t, 8> scalar_input{};
+            scalar_input.fill(248070);
+            scalar_input[0] = candidate[index];
+            reference_tokens[index] = reference.step_batch8_pipelined(scalar_input, 1).next_tokens[0];
+        }
+    }
+    std::array<std::uint32_t, 8> pipeline_tokens{};
+    {
+        NativeTargetSession pipeline(path, context_capacity, resident_weight_budget);
+        pipeline_tokens = pipeline.step_batch8_pipelined(candidate).next_tokens;
+    }
+    bool matches = true;
+    std::cout << "native target batch verifier comparison\n  reference:";
+    for (const auto token : reference_tokens) std::cout << ' ' << token;
+    std::cout << "\n  pipeline: ";
+    for (const auto token : pipeline_tokens) std::cout << ' ' << token;
+    std::cout << '\n';
+    for (std::size_t index = 0; index < reference_tokens.size(); ++index) {
+        matches = matches && reference_tokens[index] == pipeline_tokens[index];
+    }
+    std::cout << "  result:   " << (matches ? "match" : "MISMATCH") << '\n';
+    if (!matches) {
+        throw std::runtime_error("pipelined target verifier diverges from native reference batch");
+    }
+}
+
+void target_rollback_test(const std::string &path, std::size_t context_capacity,
+                          std::uint32_t first_token, std::size_t resident_weight_budget) {
+    std::array<std::uint32_t, 8> candidate{};
+    candidate.fill(248070);
+    candidate[0] = first_token;
+    std::array<std::uint32_t, 8> follow_up{};
+    follow_up.fill(248070);
+    std::array<std::uint32_t, 8> expected{};
+    {
+        NativeTargetSession reference(path, context_capacity, resident_weight_budget);
+        (void)reference.step_batch8_pipelined(candidate, 1);
+        expected = reference.step_batch8_pipelined(follow_up).next_tokens;
+    }
+    std::array<std::uint32_t, 8> actual{};
+    {
+        NativeTargetSession transaction(path, context_capacity, resident_weight_budget);
+        const auto checkpoint = transaction.begin_speculative_checkpoint();
+        const auto speculative = transaction.step_batch8_pipelined(candidate);
+        transaction.commit_speculative_prefix(checkpoint, 1);
+        if (transaction.active_tokens() != checkpoint.active_tokens + 1) {
+            throw std::runtime_error("captured prefix commit advanced the wrong target length");
+        }
+        actual = transaction.step_batch8_pipelined(follow_up).next_tokens;
+        (void)speculative;
+    }
+    const bool matches = actual == expected;
+    std::cout << "native speculative rollback test\n  expected:";
+    for (const auto token : expected) std::cout << ' ' << token;
+    std::cout << "\n  replayed: ";
+    for (const auto token : actual) std::cout << ' ' << token;
+    std::cout << "\n  result:   " << (matches ? "match" : "MISMATCH") << '\n';
+    if (!matches) {
+        throw std::runtime_error("rejected speculative suffix changed subsequent target state");
+    }
+}
+
+void dflash_commit_test(const std::string &target_path, const std::string &dflash_path,
+                        std::size_t context_capacity, std::uint32_t first_token,
+                        std::size_t resident_weight_budget) {
+    NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
+    NativeDflashEncoder dflash(dflash_path);
+    std::uint32_t anchor_token = 0;
+    if (context_capacity > NativeTargetSession::pipeline_attention_capacity()) {
+        std::array<std::uint32_t, 8> prefill{};
+        prefill.fill(248070);
+        prefill[0] = first_token;
+        const auto prefill_result = target.step_batch8_pipelined(prefill, 1);
+        anchor_token = prefill_result.next_tokens[0];
+        dflash.inject(target.batch_dflash_features(0), 0);
+    } else {
+        const auto anchor = target.step(first_token);
+        anchor_token = anchor.next_token;
+        dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+    }
+    const std::size_t before = target.active_tokens();
+    if (dflash.injected_token_count() != before) {
+        throw std::runtime_error("DFlash prefill injection did not match target position");
+    }
+
+    std::array<std::uint32_t, 8> candidate{};
+    candidate.fill(248070);
+    candidate[0] = anchor_token;
+    const auto checkpoint = target.begin_speculative_checkpoint();
+    (void)target.step_batch8_pipelined(candidate);
+    target.restore_speculative_checkpoint(checkpoint);
+    (void)target.step_batch8_pipelined(candidate, 2);
+    for (std::size_t index = 0; index < 2; ++index) {
+        dflash.inject(target.batch_dflash_features(index), checkpoint.active_tokens + index);
+    }
+    const std::size_t expected = std::min<std::size_t>(target.active_tokens(), 2048);
+    const bool match = dflash.injected_token_count() == expected && target.active_tokens() == before + 2;
+    std::cout << "native DFlash committed-feature test\n"
+              << "  target positions: " << before << " -> " << target.active_tokens() << '\n'
+              << "  DFlash cache:     " << dflash.injected_token_count() << '/' << expected << '\n'
+              << "  result:           " << (match ? "match" : "MISMATCH") << '\n';
+    if (!match) {
+        throw std::runtime_error("DFlash injected rejected or omitted target-token features");
+    }
 }
 
 void dflash_encode(const std::string &target_path, const std::string &dflash_path,
@@ -2562,6 +2986,8 @@ void dflash_verify(const std::string &target_path, const std::string &dflash_pat
               << "  anchor:           " << anchor_result.next_token << "\n"
               << "  proposals:        ";
     for (const auto proposed : proposals) std::cout << proposed << ' ';
+    std::cout << "\n  target says:      ";
+    for (std::size_t item = 0; item < 8; ++item) std::cout << verification.next_tokens[item] << ' ';
     std::cout << "\n"
               << "  accepted prefix:  " << accepted << '/' << proposals.size() << "\n"
               << "  timing:           initial " << std::fixed << std::setprecision(3) << initial_seconds
@@ -2616,11 +3042,249 @@ void dflash_verify_prompt(const std::string &target_path, const std::string &dfl
     std::cout << "native DFlash2 prompt verification\n"
               << "  prompt tokens:    " << prompt.size() << " (DFlash injected per target token)\n"
               << "  anchor:           " << anchor_result.next_token << "\n"
+              << "  proposals:        ";
+    for (const auto proposed : proposals) std::cout << proposed << ' ';
+    std::cout << "\n  target says:      ";
+    for (const auto predicted : verification.next_tokens) std::cout << predicted << ' ';
+    std::cout << "\n"
               << "  accepted prefix:  " << accepted << '/' << proposals.size() << "\n"
               << "  prefill time:     " << std::fixed << std::setprecision(3) << prefill_seconds << " s\n"
               << "  block timing:     draft " << draft_seconds << " s, verifier " << verification.seconds << " s\n"
               << "  accepted rate:    " << std::setprecision(3) << accepted / steady_block_seconds
               << " tok/s (post-prefill single block)\n";
+}
+
+void speculative_equivalence_test(const std::string &target_path,
+                                  const std::string &dflash_path,
+                                  std::size_t context_capacity,
+                                  const std::vector<std::uint32_t> &prompt,
+                                  std::size_t generated_count,
+                                  std::size_t resident_weight_budget) {
+    if (generated_count == 0) {
+        throw std::invalid_argument("speculative equivalence count must be nonzero");
+    }
+    std::vector<std::uint32_t> oracle_tokens;
+    oracle_tokens.reserve(generated_count);
+    {
+        NativeTargetSession oracle(target_path, context_capacity, resident_weight_budget);
+        std::uint32_t anchor = 0;
+        for (std::size_t begin = 0; begin < prompt.size(); begin += 8) {
+            const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
+            std::array<std::uint32_t, 8> batch{};
+            batch.fill(248070);
+            std::copy_n(prompt.begin() + begin, valid, batch.begin());
+            anchor = oracle.step_batch8_pipelined(batch, valid).next_tokens[valid - 1];
+        }
+        while (oracle_tokens.size() < generated_count) {
+            oracle_tokens.push_back(anchor);
+            std::array<std::uint32_t, 8> input{};
+            input.fill(248070);
+            input[0] = anchor;
+            anchor = oracle.step_batch8_pipelined(input, 1).next_tokens[0];
+        }
+    }
+    // The cache is process-global and keyed by a session's mmap addresses.
+    // Release the oracle's entries before opening a second 4.25-GiB Q8 cache.
+    qwen_native::clear_resident_weight_cache();
+
+    std::vector<std::uint32_t> speculative_tokens;
+    speculative_tokens.reserve(generated_count);
+    std::size_t cycles = 0;
+    std::size_t accepted_total = 0;
+    double speculative_elapsed_seconds = 0.0;
+    {
+        NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
+        NativeDflashEncoder dflash(dflash_path);
+        dflash.preload_all_quantized();
+        std::uint32_t anchor = 0;
+        for (std::size_t begin = 0; begin < prompt.size(); begin += 8) {
+            const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
+            std::array<std::uint32_t, 8> batch{};
+            batch.fill(248070);
+            std::copy_n(prompt.begin() + begin, valid, batch.begin());
+            const std::size_t position = target.active_tokens();
+            const auto result = target.step_batch8_pipelined(batch, valid);
+            for (std::size_t index = 0; index < valid; ++index) {
+                dflash.inject(target.batch_dflash_features(index), position + index);
+            }
+            anchor = result.next_tokens[valid - 1];
+        }
+        const auto speculative_started = std::chrono::steady_clock::now();
+        while (speculative_tokens.size() < generated_count) {
+            const auto proposals = dflash.propose(target, anchor, target.active_tokens());
+            std::array<std::uint32_t, 8> candidate{};
+            candidate[0] = anchor;
+            std::copy(proposals.begin(), proposals.end(), candidate.begin() + 1);
+            const auto checkpoint = target.begin_speculative_checkpoint();
+            const auto verification = target.step_batch8_pipelined(candidate);
+            std::size_t accepted = 0;
+            while (accepted < proposals.size() &&
+                   verification.next_tokens[accepted] == proposals[accepted]) {
+                ++accepted;
+            }
+            if (accepted != proposals.size()) {
+                target.commit_speculative_prefix(checkpoint, accepted + 1);
+            }
+            std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
+            for (std::size_t index = 0; index <= accepted; ++index) {
+                injection_features[index] = target.batch_dflash_features(index);
+            }
+            dflash.inject_batch(injection_features, accepted + 1, checkpoint.active_tokens);
+            speculative_tokens.push_back(anchor);
+            for (std::size_t index = 0;
+                 index < accepted && speculative_tokens.size() < generated_count; ++index) {
+                speculative_tokens.push_back(proposals[index]);
+            }
+            anchor = verification.next_tokens[accepted];
+            accepted_total += accepted;
+            ++cycles;
+        }
+        const double speculative_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - speculative_started).count();
+        speculative_elapsed_seconds = speculative_seconds;
+    }
+
+    const bool matches = oracle_tokens == speculative_tokens;
+    std::cout << "native target-only/speculative greedy equivalence\n"
+              << "  prompt tokens:    " << prompt.size() << "\n"
+              << "  generated tokens: " << generated_count << "\n"
+              << "  cycles:           " << cycles << "\n"
+              << "  accepted draft:   " << accepted_total << '/' << cycles * 7 << "\n"
+              << "  speculative rate: " << std::fixed << std::setprecision(2)
+              << generated_count / speculative_elapsed_seconds << " tok/s ("
+              << speculative_elapsed_seconds << " s)\n"
+              << "  result:           " << (matches ? "match" : "MISMATCH") << '\n';
+    if (!matches) {
+        const auto mismatch = std::mismatch(oracle_tokens.begin(), oracle_tokens.end(),
+                                            speculative_tokens.begin());
+        std::cout << "  first mismatch:   " << std::distance(oracle_tokens.begin(), mismatch.first)
+                  << " (target " << *mismatch.first << ", speculative " << *mismatch.second << ")\n";
+        throw std::runtime_error("speculative decode changed deterministic target output");
+    }
+}
+
+std::size_t quant_matrix_bytes(std::uint32_t type, std::size_t input_size,
+                               std::size_t output_size) {
+    std::size_t block_values = 0;
+    std::size_t block_bytes = 0;
+    switch (type) {
+    case 8: block_values = 32; block_bytes = 34; break;
+    case 11: case 21: block_values = 256; block_bytes = 110; break;
+    case 12: block_values = 256; block_bytes = 144; break;
+    case 13: block_values = 256; block_bytes = 176; break;
+    case 14: block_values = 256; block_bytes = 210; break;
+    case 20: block_values = 32; block_bytes = 18; break;
+    case 23: block_values = 256; block_bytes = 136; break;
+    default: throw std::invalid_argument("unsupported exact CPU benchmark format");
+    }
+    if (input_size % block_values != 0) {
+        throw std::invalid_argument("tensor input width is not quant-block aligned");
+    }
+    return input_size / block_values * block_bytes * output_size;
+}
+
+void benchmark_cpu_streamed_batch8(const void *weights, std::uint32_t type,
+                                   std::size_t input_size, std::size_t output_size,
+                                   int iterations) {
+    const std::size_t weight_bytes = quant_matrix_bytes(type, input_size, output_size);
+    std::vector<float> input(8 * input_size);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = std::sin(static_cast<float>(index + 1) * 0.00137F);
+    }
+    std::vector<float> gpu_output(8 * output_size);
+    std::vector<float> cpu_output(8 * output_size);
+    qwen_native::execute_k_matvec_cached_batch8(weights, type, input.data(), input_size,
+                                                gpu_output.data(), output_size, false);
+    const auto gpu_started = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        qwen_native::execute_k_matvec_cached_batch8(weights, type, input.data(), input_size,
+                                                    gpu_output.data(), output_size, false);
+    }
+    const double gpu_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - gpu_started).count() / iterations;
+    std::cout << "  streamed GPU (H2D + kernel):\n"
+              << "    latency:    " << std::fixed << std::setprecision(3)
+              << gpu_seconds * 1000.0 << " ms\n"
+              << "    weight BW:  " << std::setprecision(2)
+              << static_cast<double>(weight_bytes) / gpu_seconds / 1.0e9 << " GB/s\n";
+    try {
+        const auto mapped = qwen_native::benchmark_host_mapped_batch8(
+            weights, type, input_size, output_size, iterations);
+        std::cout << "  mapped-host GPU direct:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3)
+                  << mapped.milliseconds << " ms\n"
+                  << "    weight BW:  " << std::setprecision(2)
+                  << mapped.bandwidth_gbps << " GB/s\n";
+    } catch (const std::exception &error) {
+        std::cout << "  mapped-host GPU direct: unavailable (" << error.what() << ")\n";
+    }
+
+    double best_seconds = std::numeric_limits<double>::infinity();
+    int best_threads = 0;
+    for (const int threads : {6, 12, 14, 20, 24}) {
+        qwen_native::cpu_quant_matvec_batch8_rows(weights, type, input.data(), input_size,
+                                                  cpu_output.data(), output_size, threads);
+        const auto started = std::chrono::steady_clock::now();
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            qwen_native::cpu_quant_matvec_batch8_rows(weights, type, input.data(), input_size,
+                                                      cpu_output.data(), output_size, threads);
+        }
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count() / iterations;
+        std::cout << "  exact CPU GEMM8, " << threads << " workers:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3)
+                  << seconds * 1000.0 << " ms\n"
+                  << "    weight BW:  " << std::setprecision(2)
+                  << static_cast<double>(weight_bytes) / seconds / 1.0e9 << " GB/s\n";
+        if (seconds < best_seconds) {
+            best_seconds = seconds;
+            best_threads = threads;
+        }
+    }
+    qwen_native::cpu_quant_matvec_batch8_rows(weights, type, input.data(), input_size,
+                                              cpu_output.data(), output_size, best_threads);
+    float max_error = 0.0F;
+    for (std::size_t index = 0; index < cpu_output.size(); ++index) {
+        max_error = std::max(max_error, std::abs(cpu_output[index] - gpu_output[index]));
+    }
+    std::cout << "  best exact CPU: " << best_threads << " workers, "
+              << std::fixed << std::setprecision(2)
+              << static_cast<double>(weight_bytes) / best_seconds / 1.0e9 << " GB/s\n"
+              << "  CPU/GPU max delta: " << std::scientific << max_error << '\n';
+    qwen_native::CpuMatvecBenchmarkResult soa;
+    const char *soa_name = nullptr;
+    if (type == 12) {
+        soa = qwen_native::benchmark_cpu_q4k_soa_batch8(
+            weights, input.data(), input_size, output_size, iterations,
+            best_threads, gpu_output.data());
+        soa_name = "Q4_K";
+    } else if (type == 13) {
+        soa = qwen_native::benchmark_cpu_q5k_soa_batch8(
+            weights, input.data(), input_size, output_size, iterations,
+            best_threads, gpu_output.data());
+        soa_name = "Q5_K";
+    } else if (type == 14) {
+        soa = qwen_native::benchmark_cpu_q6k_soa_batch8(
+            weights, input.data(), input_size, output_size, iterations,
+            best_threads, gpu_output.data());
+        soa_name = "Q6_K";
+    } else if (type == 23) {
+        soa = qwen_native::benchmark_cpu_iq4xs_soa_batch8(
+            weights, input.data(), input_size, output_size, iterations,
+            best_threads, gpu_output.data());
+        soa_name = "IQ4_XS";
+    }
+    if (soa_name) {
+        std::cout << "  exact " << soa_name << " SoA GEMM8:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3)
+                  << soa.milliseconds << " ms\n"
+                  << "    weight BW:  " << std::setprecision(2)
+                  << soa.bandwidth_gbps << " GB/s\n"
+                  << "    pack once:  " << std::setprecision(1)
+                  << soa.packing_milliseconds << " ms\n"
+                  << "    max delta:  " << std::scientific
+                  << soa.max_absolute_error << '\n';
+    }
 }
 
 void bench_matvec(const std::string &path, const std::string &tensor_name, int iterations) {
@@ -2629,8 +3293,11 @@ void bench_matvec(const std::string &path, const std::string &tensor_name, int i
     if (!tensor) {
         throw std::runtime_error("tensor not found: " + tensor_name);
     }
-    if ((tensor->type != 12 && tensor->type != 13 && tensor->type != 14) || tensor->dimensions.size() != 2) {
-        throw std::runtime_error("benchmark requires a rank-2 Q4_K, Q5_K, or Q6_K tensor");
+    const bool supported = tensor->type == 8 || tensor->type == 11 || tensor->type == 12 ||
+                           tensor->type == 13 || tensor->type == 14 || tensor->type == 20 ||
+                           tensor->type == 21 || tensor->type == 23;
+    if (!supported || tensor->dimensions.size() != 2) {
+        throw std::runtime_error("benchmark requires a supported rank-2 exact quant tensor");
     }
     const Mapping mapping(path);
     const auto input_size = static_cast<std::size_t>(tensor->dimensions[0]);
@@ -2638,26 +3305,29 @@ void bench_matvec(const std::string &path, const std::string &tensor_name, int i
     std::cout << qwen_native::ggml_type_name(tensor->type) << " real-weight benchmark: " << tensor_name << '\n'
               << "  shape: " << input_size << " x " << output_size << '\n';
     const void *weights = mapping.at(model.data_offset() + tensor->offset);
-    qwen_native::Q4KBenchmarkResult result;
-    qwen_native::Q4KBenchmarkResult batch8;
-    if (tensor->type == 12) {
-        result = qwen_native::benchmark_q4k(weights, input_size, output_size, iterations);
-        batch8 = qwen_native::benchmark_q4k_batch8(weights, input_size, output_size, iterations);
-    } else if (tensor->type == 13) {
-        result = qwen_native::benchmark_q5k(weights, input_size, output_size, iterations);
-        batch8 = qwen_native::benchmark_q5k_batch8(weights, input_size, output_size, iterations);
-    } else {
-        result = qwen_native::benchmark_q6k(weights, input_size, output_size, iterations);
-        batch8 = qwen_native::benchmark_q6k_batch8(weights, input_size, output_size, iterations);
+    if (tensor->type == 12 || tensor->type == 13 || tensor->type == 14) {
+        qwen_native::Q4KBenchmarkResult result;
+        qwen_native::Q4KBenchmarkResult batch8;
+        if (tensor->type == 12) {
+            result = qwen_native::benchmark_q4k(weights, input_size, output_size, iterations);
+            batch8 = qwen_native::benchmark_q4k_batch8(weights, input_size, output_size, iterations);
+        } else if (tensor->type == 13) {
+            result = qwen_native::benchmark_q5k(weights, input_size, output_size, iterations);
+            batch8 = qwen_native::benchmark_q5k_batch8(weights, input_size, output_size, iterations);
+        } else {
+            result = qwen_native::benchmark_q6k(weights, input_size, output_size, iterations);
+            batch8 = qwen_native::benchmark_q6k_batch8(weights, input_size, output_size, iterations);
+        }
+        std::cout << "  native direct:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3) << result.milliseconds << " ms\n"
+                  << "    bandwidth:  " << std::setprecision(2) << result.bandwidth_gbps << " GB/s\n"
+                  << "    max error:  " << std::scientific << result.max_absolute_error << '\n'
+                  << "  eight-token resident verifier:\n"
+                  << "    latency:    " << std::fixed << std::setprecision(3) << batch8.milliseconds << " ms\n"
+                  << "    weight BW:  " << std::setprecision(2) << batch8.bandwidth_gbps << " GB/s\n"
+                  << "    max error:  " << std::scientific << batch8.max_absolute_error << '\n';
     }
-    std::cout << "  native direct:\n"
-              << "    latency:    " << std::fixed << std::setprecision(3) << result.milliseconds << " ms\n"
-              << "    bandwidth:  " << std::setprecision(2) << result.bandwidth_gbps << " GB/s\n"
-              << "    max error:  " << std::scientific << result.max_absolute_error << '\n';
-    std::cout << "  eight-token verifier:\n"
-              << "    latency:    " << std::fixed << std::setprecision(3) << batch8.milliseconds << " ms\n"
-              << "    weight BW:  " << std::setprecision(2) << batch8.bandwidth_gbps << " GB/s\n"
-              << "    max error:  " << std::scientific << batch8.max_absolute_error << '\n';
+    benchmark_cpu_streamed_batch8(weights, tensor->type, input_size, output_size, iterations);
     if (tensor->type == 12) {
         const auto n23 = qwen_native::benchmark_n23q4_from_q4k(weights, input_size, output_size, iterations);
         std::cout << "  N23Q4 wave32 + DP4A:\n"
@@ -2812,13 +3482,358 @@ void plan_128k(const std::string &target_path, const std::string &draft_path) {
               << "  reclaimed for weights: " << gib(native_weight_budget - q8_weight_budget) << " GiB\n";
 }
 
+struct BenchmarkDecodeStats {
+    std::size_t generated = 0;
+    std::size_t cycles = 0;
+    std::size_t proposed = 0;
+    std::size_t accepted = 0;
+    double seconds = 0.0;
+    double draft_seconds = 0.0;
+    double target_seconds = 0.0;
+    double injection_seconds = 0.0;
+    bool ended_early = false;
+    std::vector<std::uint32_t> tokens;
+};
+
+std::uint64_t token_hash(const std::vector<std::uint32_t> &tokens) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto token : tokens) {
+        for (int byte = 0; byte < 4; ++byte) {
+            hash ^= (token >> (8 * byte)) & 0xFFU;
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
+std::vector<std::uint32_t> make_128k_benchmark_prompt(Tokenizer &tokenizer) {
+    constexpr std::size_t prompt_tokens = 131072;
+    std::vector<std::uint32_t> prefix{
+        tokenizer.im_start(), 8678, 198,
+    };
+    const auto system_text = tokenizer.encode_full(
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+        "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.");
+    prefix.insert(prefix.end(), system_text.begin(), system_text.end());
+    prefix.push_back(tokenizer.im_end());
+    prefix.push_back(198);
+    prefix.push_back(tokenizer.im_start());
+    prefix.push_back(846);
+    prefix.push_back(198);
+
+    const std::vector<std::uint32_t> suffix{
+        tokenizer.im_end(), 198, tokenizer.im_start(), 74455, 198,
+    };
+    if (prefix.size() + suffix.size() >= prompt_tokens) {
+        throw std::runtime_error("128K benchmark template exceeds its token budget");
+    }
+    const std::size_t filler_needed = prompt_tokens - prefix.size() - suffix.size();
+    const auto paragraph_tokens = tokenizer.encode_full(
+        "This is deterministic long-context evidence. Preserve every numbered fact, compare distant details, "
+        "and finish with a careful technical synthesis rather than a short answer.\n");
+    if (paragraph_tokens.empty()) {
+        throw std::runtime_error("128K benchmark filler did not tokenize");
+    }
+    std::vector<std::uint32_t> filler_tokens;
+    filler_tokens.reserve(filler_needed);
+    while (filler_tokens.size() < filler_needed) {
+        const std::size_t count = std::min(paragraph_tokens.size(),
+                                           filler_needed - filler_tokens.size());
+        filler_tokens.insert(filler_tokens.end(), paragraph_tokens.begin(),
+                             paragraph_tokens.begin() + count);
+    }
+    prefix.insert(prefix.end(), filler_tokens.begin(), filler_tokens.end());
+    prefix.insert(prefix.end(), suffix.begin(), suffix.end());
+    if (prefix.size() != prompt_tokens) {
+        throw std::runtime_error("128K benchmark prompt construction is not exact");
+    }
+    return prefix;
+}
+
+BenchmarkDecodeStats benchmark_decode_tokens(NativeTargetSession &target,
+                                              NativeDflashEncoder &dflash,
+                                              Tokenizer &tokenizer,
+                                              std::uint32_t &anchor,
+                                              std::size_t requested_tokens) {
+    BenchmarkDecodeStats stats;
+    stats.tokens.reserve(requested_tokens);
+    const auto started = std::chrono::steady_clock::now();
+    while (stats.generated < requested_tokens) {
+        if (anchor == tokenizer.im_end() || anchor == tokenizer.eos_token()) {
+            stats.ended_early = true;
+            break;
+        }
+        const std::size_t remaining = requested_tokens - stats.generated;
+        const std::size_t proposal_count = std::min<std::size_t>(7, remaining - 1);
+        std::array<std::uint32_t, 7> proposals{};
+        if (proposal_count != 0) {
+            const auto draft_started = std::chrono::steady_clock::now();
+            proposals = dflash.propose(target, anchor, target.active_tokens());
+            stats.draft_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - draft_started).count();
+        }
+        stats.proposed += proposal_count;
+
+        std::array<std::uint32_t, 8> candidate{};
+        candidate.fill(248070);
+        candidate[0] = anchor;
+        std::copy_n(proposals.begin(), proposal_count, candidate.begin() + 1);
+        const auto checkpoint = target.begin_speculative_checkpoint();
+        const auto target_started = std::chrono::steady_clock::now();
+        const auto verification = target.step_batch8_pipelined(candidate, proposal_count + 1);
+        std::size_t accepted = 0;
+        while (accepted < proposal_count &&
+               verification.next_tokens[accepted] == proposals[accepted]) {
+            ++accepted;
+        }
+        if (accepted != proposal_count) {
+            target.commit_speculative_prefix(checkpoint, accepted + 1);
+        }
+        stats.target_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - target_started).count();
+        stats.accepted += accepted;
+
+        const auto injection_started = std::chrono::steady_clock::now();
+        std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
+        for (std::size_t index = 0; index <= accepted; ++index) {
+            injection_features[index] = target.batch_dflash_features(index);
+        }
+        dflash.inject_batch(injection_features, accepted + 1, checkpoint.active_tokens);
+        stats.injection_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - injection_started).count();
+        if (dflash.injected_token_count() != std::min<std::size_t>(target.active_tokens(), 2048)) {
+            throw std::runtime_error("128K benchmark DFlash cache lost target alignment");
+        }
+
+        stats.tokens.push_back(anchor);
+        ++stats.generated;
+        for (std::size_t index = 0; index < accepted; ++index) {
+            stats.tokens.push_back(proposals[index]);
+            ++stats.generated;
+            if (proposals[index] == tokenizer.im_end() ||
+                proposals[index] == tokenizer.eos_token()) {
+                stats.ended_early = true;
+                break;
+            }
+        }
+        anchor = verification.next_tokens[accepted];
+        ++stats.cycles;
+        if (stats.ended_early) break;
+    }
+    stats.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return stats;
+}
+
+void benchmark_128k(const std::string &target_path, const std::string &dflash_path,
+                    const std::string &output_path, std::size_t resident_weight_budget,
+                    int runs) {
+    constexpr std::size_t prompt_token_count = 131072;
+    constexpr std::size_t warmup_token_count = 8;
+    constexpr std::size_t output_token_count = 256;
+    constexpr std::size_t context_capacity =
+        prompt_token_count + warmup_token_count + output_token_count;
+    if (runs < 1) throw std::invalid_argument("128K benchmark RUNS must be positive");
+
+    const qwen_native::GgufFile model(target_path);
+    Tokenizer tokenizer(model);
+    const auto prompt = make_128k_benchmark_prompt(tokenizer);
+    const std::uint64_t prompt_digest = token_hash(prompt);
+    const std::filesystem::path records_path(output_path);
+    if (!records_path.parent_path().empty()) {
+        std::filesystem::create_directories(records_path.parent_path());
+    }
+    std::ofstream records(records_path, std::ios::trunc);
+    if (!records) throw std::runtime_error("cannot create 128K benchmark record file");
+    std::ofstream prompt_record(records_path.string() + ".prompt.tokens", std::ios::trunc);
+    if (!prompt_record) throw std::runtime_error("cannot create 128K benchmark prompt record");
+    for (std::size_t index = 0; index < prompt.size(); ++index) {
+        if (index) prompt_record << ' ';
+        prompt_record << prompt[index];
+    }
+    prompt_record << '\n';
+    prompt_record.close();
+
+    int device = 0;
+    hipDeviceProp_t properties{};
+    hip_check(hipGetDevice(&device), "128K benchmark get device");
+    hip_check(hipGetDeviceProperties(&properties, device), "128K benchmark device properties");
+    double initial_load = 0.0;
+    {
+        std::ifstream loadavg("/proc/loadavg");
+        loadavg >> initial_load;
+    }
+    std::string cpu_model = "unknown";
+    {
+        std::ifstream cpuinfo("/proc/cpuinfo");
+        std::string line;
+        while (std::getline(cpuinfo, line)) {
+            constexpr const char *key = "model name\t: ";
+            if (line.rfind(key, 0) == 0) {
+                cpu_model = line.substr(std::strlen(key));
+                break;
+            }
+        }
+    }
+    const auto environment = [](const char *name, const char *fallback) {
+        const char *value = std::getenv(name);
+        return std::string(value ? value : fallback);
+    };
+    records << "{\"metadata\":true"
+            << ",\"device\":\"" << properties.name << "\""
+            << ",\"arch\":\"" << properties.gcnArchName << "\""
+            << ",\"cpu\":\"" << cpu_model << "\""
+            << ",\"target\":\"" << target_path << "\""
+            << ",\"target_bytes\":" << std::filesystem::file_size(target_path)
+            << ",\"dflash\":\"" << dflash_path << "\""
+            << ",\"dflash_bytes\":" << std::filesystem::file_size(dflash_path)
+            << ",\"prompt_tokens\":" << prompt_token_count
+            << ",\"prompt_fnv64\":\"0x" << std::hex << prompt_digest << std::dec << "\""
+            << ",\"prompt_record\":\"" << records_path.string() << ".prompt.tokens\""
+            << ",\"greedy\":true,\"streams\":1,\"draft_block\":8"
+            << ",\"warmup_tokens\":" << warmup_token_count
+            << ",\"output_tokens\":" << output_token_count
+            << ",\"runs\":" << runs
+            << ",\"resident_gib\":"
+            << static_cast<double>(resident_weight_budget) / (1024.0 * 1024.0 * 1024.0)
+            << ",\"QWEN_NATIVE_HYBRID\":\"" << environment("QWEN_NATIVE_HYBRID", "0") << "\""
+            << ",\"QWEN_NATIVE_Q8_TILED\":\"" << environment("QWEN_NATIVE_Q8_TILED", "default") << "\""
+            << ",\"QWEN_NATIVE_CPU_THREADS\":\"" << environment("QWEN_NATIVE_CPU_THREADS", "default") << "\""
+            << ",\"QWEN_NATIVE_SOA_SPLIT\":\"" << environment("QWEN_NATIVE_SOA_SPLIT", "default") << "\""
+            << ",\"initial_loadavg\":" << initial_load << "}\n";
+    records.flush();
+    std::cerr << "native deterministic 128K benchmark\n"
+              << "  device: " << properties.name << " / " << properties.gcnArchName << '\n'
+              << "  prompt: " << prompt.size() << " actually tokenized tokens, FNV64 0x"
+              << std::hex << prompt_digest << std::dec << '\n'
+              << "  decode: " << output_token_count
+              << " committed greedy tokens, one stream, " << runs << " runs\n"
+              << "  warmup: " << warmup_token_count << " generated tokens excluded\n"
+              << "  initial loadavg: " << std::fixed << std::setprecision(2) << initial_load << '\n'
+              << "  records: " << records_path.string() << "\n";
+    if (initial_load > 2.0) {
+        std::cerr << "  [warning: system load is above the clean-run threshold]\n";
+    }
+
+    std::vector<std::uint32_t> reference_tokens;
+    std::vector<double> throughputs;
+    for (int run = 1; run <= runs; ++run) {
+        qwen_native::clear_resident_weight_cache();
+        const auto initialization_started = std::chrono::steady_clock::now();
+        NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
+        NativeDflashEncoder dflash(dflash_path);
+        dflash.preload_all_quantized();
+        const double initialization_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - initialization_started).count();
+
+        const auto prefill_started = std::chrono::steady_clock::now();
+        std::uint32_t anchor = 0;
+        for (std::size_t begin = 0; begin < prompt.size(); begin += 8) {
+            const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
+            std::array<std::uint32_t, 8> batch{};
+            batch.fill(248070);
+            std::copy_n(prompt.begin() + begin, valid, batch.begin());
+            const std::size_t position = target.active_tokens();
+            const auto result = target.step_batch8_pipelined(batch, valid);
+            std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
+            for (std::size_t index = 0; index < valid; ++index) {
+                injection_features[index] = target.batch_dflash_features(index);
+            }
+            dflash.inject_batch(injection_features, valid, position);
+            anchor = result.next_tokens[valid - 1];
+            if ((begin + valid) % 8192 == 0) {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - prefill_started).count();
+                std::cerr << "  [run " << run << " prefill " << begin + valid << '/'
+                          << prompt.size() << ", " << std::fixed << std::setprecision(1)
+                          << elapsed << "s]\n";
+            }
+        }
+        const double ttft_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - prefill_started).count();
+        if (target.active_tokens() != prompt_token_count) {
+            throw std::runtime_error("128K benchmark did not physically commit the complete prompt");
+        }
+
+        const auto warmup = benchmark_decode_tokens(
+            target, dflash, tokenizer, anchor, warmup_token_count);
+        if (warmup.generated != warmup_token_count || warmup.ended_early) {
+            throw std::runtime_error("128K benchmark warmup ended before eight generated tokens");
+        }
+        const auto measured = benchmark_decode_tokens(
+            target, dflash, tokenizer, anchor, output_token_count);
+        if (measured.generated != output_token_count || measured.ended_early) {
+            throw std::runtime_error("128K benchmark response ended before 256 generated tokens");
+        }
+        if (run == 1) {
+            reference_tokens = measured.tokens;
+        } else if (measured.tokens != reference_tokens) {
+            throw std::runtime_error("128K benchmark greedy output changed between runs");
+        }
+
+        const double throughput = measured.generated / measured.seconds;
+        throughputs.push_back(throughput);
+        const double acceptance = measured.proposed == 0 ? 0.0
+            : static_cast<double>(measured.accepted) / measured.proposed;
+        const auto stats = target.resident_weight_stats();
+        records << std::setprecision(9)
+                << "{\"run\":" << run
+                << ",\"device\":\"" << properties.name << "\""
+                << ",\"arch\":\"" << properties.gcnArchName << "\""
+                << ",\"target\":\"" << target_path << "\""
+                << ",\"dflash\":\"" << dflash_path << "\""
+                << ",\"prompt_tokens\":" << prompt_token_count
+                << ",\"prompt_fnv64\":\"0x" << std::hex << prompt_digest << std::dec << "\""
+                << ",\"context_capacity\":" << context_capacity
+                << ",\"warmup_tokens\":" << warmup.generated
+                << ",\"output_tokens\":" << measured.generated
+                << ",\"output_fnv64\":\"0x" << std::hex << token_hash(measured.tokens)
+                << std::dec << "\""
+                << ",\"initialization_seconds\":" << initialization_seconds
+                << ",\"ttft_seconds\":" << ttft_seconds
+                << ",\"decode_seconds\":" << measured.seconds
+                << ",\"tokens_per_second\":" << throughput
+                << ",\"cycles\":" << measured.cycles
+                << ",\"draft_proposed\":" << measured.proposed
+                << ",\"draft_accepted\":" << measured.accepted
+                << ",\"acceptance\":" << acceptance
+                << ",\"draft_seconds\":" << measured.draft_seconds
+                << ",\"target_seconds\":" << measured.target_seconds
+                << ",\"injection_seconds\":" << measured.injection_seconds
+                << ",\"resident_bytes\":" << stats.resident_bytes
+                << ",\"resident_matrices\":" << stats.matrix_count
+                << ",\"tokens\":[";
+        for (std::size_t index = 0; index < measured.tokens.size(); ++index) {
+            if (index) records << ',';
+            records << measured.tokens[index];
+        }
+        records << "]}\n";
+        records.flush();
+        std::cerr << "  run " << run << ": " << std::fixed << std::setprecision(3)
+                  << measured.seconds << "s, " << throughput << " tok/s, accepted "
+                  << measured.accepted << '/' << measured.proposed << ", TTFT "
+                  << ttft_seconds << "s\n";
+    }
+
+    const double mean = std::accumulate(throughputs.begin(), throughputs.end(), 0.0)
+                      / throughputs.size();
+    records << "{\"summary\":true,\"runs\":" << runs
+            << ",\"mean_tokens_per_second\":" << std::setprecision(9) << mean
+            << ",\"requirement_tokens_per_second\":10.0"
+            << ",\"passed\":" << (mean >= 10.0 ? "true" : "false") << "}\n";
+    records.flush();
+    std::cerr << "  arithmetic mean: " << std::fixed << std::setprecision(3)
+              << mean << " generated tok/s — " << (mean >= 10.0 ? "PASS" : "FAIL") << '\n';
+    if (mean < 10.0) {
+        throw std::runtime_error("128K benchmark mean is below 10.0 generated tokens/s");
+    }
+}
 
 void chat(const std::string &target_path, const std::string &dflash_path,
           std::size_t context_capacity, std::size_t resident_weight_budget) {
     NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
     NativeDflashEncoder dflash(dflash_path);
     dflash.preload_all_quantized();
-    target.freeze_target_weight_cache();
 
     const qwen_native::GgufFile model(target_path);
     Tokenizer tokenizer(model);
@@ -2859,12 +3874,24 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         if (line == "/reset") {
             target.~NativeTargetSession();
             new (&target) NativeTargetSession(target_path, context_capacity, resident_weight_budget);
-            target.freeze_target_weight_cache();
+            dflash.reset();
             std::cerr << "  [context reset]\n\n";
             continue;
         }
 
         std::vector<std::uint32_t> prompt;
+        // Match the checkpoint's default chat template: thinking mode inserts
+        // the xhigh reasoning instruction as a system turn even when the user
+        // did not provide an explicit system message.
+        prompt.push_back(tokenizer.im_start());
+        prompt.push_back(8678);  // system
+        prompt.push_back(198);   // \n
+        const auto system_text = tokenizer.encode_full(
+            "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+            "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.");
+        prompt.insert(prompt.end(), system_text.begin(), system_text.end());
+        prompt.push_back(tokenizer.im_end());
+        prompt.push_back(198);
         prompt.push_back(tokenizer.im_start());
         prompt.push_back(846);   // user
         prompt.push_back(198);   // \n
@@ -2876,12 +3903,33 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         prompt.push_back(74455); // assistant
         prompt.push_back(198);
 
-        // Prefill: scalar step + DFlash inject for each prompt token
+        // Prefill with the same native pipeline used for verification when a
+        // genuine long context was requested. This writes every prompt KV into
+        // the N23KV4 cache rather than building a truncated scalar cache.
         const auto prefill_started = std::chrono::steady_clock::now();
-        NativeTargetSession::StepResult anchor_result{};
-        for (const auto token : prompt) {
-            anchor_result = target.step(token);
-            dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+        std::uint32_t anchor = 0;
+        if (context_capacity > NativeTargetSession::pipeline_attention_capacity()) {
+            for (std::size_t begin = 0; begin < prompt.size(); begin += 8) {
+                const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
+                std::array<std::uint32_t, 8> batch{};
+                batch.fill(248070);
+                std::copy_n(prompt.begin() + begin, valid, batch.begin());
+                const std::size_t position = target.active_tokens();
+                const auto result = target.step_batch8_pipelined(batch, valid);
+                std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
+                for (std::size_t index = 0; index < valid; ++index) {
+                    injection_features[index] = target.batch_dflash_features(index);
+                }
+                dflash.inject_batch(injection_features, valid, position);
+                anchor = result.next_tokens[valid - 1];
+            }
+        } else {
+            NativeTargetSession::StepResult anchor_result{};
+            for (const auto token : prompt) {
+                anchor_result = target.step(token);
+                dflash.inject(target.dflash_features(), target.active_tokens() - 1);
+            }
+            anchor = anchor_result.next_token;
         }
         const double prefill_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prefill_started).count();
@@ -2895,21 +3943,39 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         bool thinking = false;
 
         // Speculative decode loop: DFlash proposes 7, target verifies 8
-        std::uint32_t anchor = anchor_result.next_token;
+        int cycle_count = 0;
+        std::optional<std::array<std::uint32_t, 7>> pending_stale_block;
 
         while (!done && generated < 8192) {
             if (anchor == tokenizer.im_end() || anchor == tokenizer.eos_token()) break;
 
+            const auto cycle_start = std::chrono::steady_clock::now();
+
             // DFlash proposes 7 continuation tokens
             const auto proposals = dflash.propose(target, anchor, target.active_tokens());
+            if (pending_stale_block && std::getenv("QWEN_NATIVE_CASCADE_TRACE")) {
+                std::size_t matching = 0;
+                while (matching + 1 < pending_stale_block->size() &&
+                       (*pending_stale_block)[matching + 1] == proposals[matching]) {
+                    ++matching;
+                }
+                std::cerr << "  [cascade stale/fresh continuation: " << matching << "/6]\n";
+                pending_stale_block.reset();
+            }
+
+            const auto propose_done = std::chrono::steady_clock::now();
 
             // Build verification batch: [anchor, proposal_0, ..., proposal_6]
             std::array<std::uint32_t, 8> candidate{};
             candidate[0] = anchor;
             std::copy(proposals.begin(), proposals.end(), candidate.begin() + 1);
 
-            // Target verifies all 8 in one pipelined batch
-            const auto verification = target.step_batch8_pipelined(candidate);
+            // Target verifies all 8 in one pipelined batch.  Keep a host
+            // checkpoint so a rejected suffix cannot leak into recurrent or
+            // attention state.
+            const auto checkpoint = target.begin_speculative_checkpoint();
+            auto verification = target.step_batch8_pipelined(candidate);
+            const auto step_done = std::chrono::steady_clock::now();
 
             // Find accepted prefix (draft agrees with target)
             std::size_t accepted = 0;
@@ -2917,6 +3983,61 @@ void chat(const std::string &target_path, const std::string &dflash_path,
                    verification.next_tokens[accepted] == proposals[accepted]) {
                 ++accepted;
             }
+
+            if (accepted != proposals.size()) {
+                // The verifier's causal prefix activations, KV entries, target
+                // features, and logits are already final. Restore only the
+                // recurrent checkpoint and replay its captured update factors;
+                // rerunning 64 layers would duplicate the dominant weight pass.
+                target.commit_speculative_prefix(checkpoint, accepted + 1);
+            }
+            const auto commit_done = std::chrono::steady_clock::now();
+
+            if (accepted == proposals.size() && std::getenv("QWEN_NATIVE_CASCADE_TRACE")) {
+                const auto stale = dflash.propose(
+                    target, proposals.back(), checkpoint.active_tokens + 7);
+                const bool guessed_bonus = stale[0] == verification.next_tokens[7];
+                std::cerr << "  [cascade stale bonus: "
+                          << (guessed_bonus ? "match" : "miss") << "]\n";
+                if (guessed_bonus) pending_stale_block = stale;
+            }
+
+            // DFlash conditions its next block on target features for every
+            // committed input token. Encode the committed prefix in one exact
+            // batch, and never append the speculative suffix.
+            std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
+            for (std::size_t index = 0; index <= accepted; ++index) {
+                injection_features[index] = target.batch_dflash_features(index);
+            }
+            dflash.inject_batch(injection_features, accepted + 1, checkpoint.active_tokens);
+            if (dflash.injected_token_count() != std::min<std::size_t>(target.active_tokens(), 2048)) {
+                throw std::runtime_error("DFlash injected cache did not advance exactly once per committed token");
+            }
+            const auto inject_done = std::chrono::steady_clock::now();
+
+            if (cycle_count < 5) {
+                const double propose_ms = std::chrono::duration<double, std::milli>(propose_done - cycle_start).count();
+                const double step_ms = std::chrono::duration<double, std::milli>(step_done - propose_done).count();
+                const double commit_ms = std::chrono::duration<double, std::milli>(commit_done - step_done).count();
+                const double inject_ms = std::chrono::duration<double, std::milli>(inject_done - commit_done).count();
+                const double total_ms = std::chrono::duration<double, std::milli>(inject_done - cycle_start).count();
+                const double rate = (accepted + 1) / (total_ms / 1000.0);
+                std::cerr << "  [cycle " << cycle_count << ": prop " << std::fixed << std::setprecision(1)
+                          << propose_ms << "ms, step " << step_ms << "ms (rec "
+                          << verification.recurrent_seconds * 1000.0 << ", attn "
+                          << verification.attention_seconds * 1000.0 << ", ffn "
+                          << verification.ffn_seconds * 1000.0 << ", head "
+                          << verification.output_seconds * 1000.0 << "), commit " << commit_ms
+                          << "ms, inj " << inject_ms << "ms, total " << total_ms << "ms ("
+                          << rate << " tok/s), acc=" << accepted << "/7";
+                if (accepted < proposals.size()) {
+                    std::cerr << ", target-rank="
+                              << dflash.last_candidate_rank(accepted,
+                                                            verification.next_tokens[accepted]);
+                }
+                std::cerr << '\n';
+            }
+            ++cycle_count;
 
             // Emit anchor token
             emit_token(anchor, thinking);
@@ -2934,13 +4055,8 @@ void chat(const std::string &target_path, const std::string &dflash_path,
 
             if (done) break;
 
-            // Rewind context past rejected positions so attention ignores them
-            const std::size_t rejected = 7 - accepted;
-            if (rejected > 0) {
-                target.rewind(rejected);
-            }
-
-            // The bonus token: target's prediction at the rejection point
+            // The prefix commit retained exactly [anchor, accepted proposals].
+            // The target prediction at the rejection point is the next anchor.
             anchor = verification.next_tokens[accepted];
 
             if (target.active_tokens() >= context_capacity - 8) {
@@ -2998,16 +4114,25 @@ void usage(const char *program) {
               << "  " << program << " metadata MODEL.gguf\n"
               << "  " << program << " show-token MODEL.gguf TOKEN_ID\n"
               << "  " << program << " find-token MODEL.gguf TOKEN\n"
-              << "  " << program << " chat TARGET.gguf [CONTEXT] [RESIDENT_GIB]\n"
+              << "  " << program << " tokenize MODEL.gguf TEXT\n"
+              << "  " << program << " prompt-test TARGET.gguf TEXT [TOKENS]\n"
+              << "  " << program << " chat TARGET.gguf DFLASH.gguf [CONTEXT] [RESIDENT_GIB]\n"
+              << "  " << program << " benchmark-128k TARGET.gguf DFLASH.gguf OUTPUT.jsonl [RESIDENT_GIB] [RUNS]\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
               << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
               << "  " << program << " bench-gdn [ITERATIONS]\n"
+              << "  " << program << " mtp-test TARGET.gguf CONTEXT TOKEN_ID [TOKENS] [RESIDENT_GIB]\n"
               << "  " << program << " target-generate TARGET.gguf CONTEXT TOKEN_ID [TOKENS] [RESIDENT_GIB]\n"
               << "  " << program << " target-verify-batch TARGET.gguf CONTEXT TOKEN_ID [BLOCKS] [RESIDENT_GIB]\n"
+              << "  " << program << " target-long-window-bench TARGET.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
+              << "  " << program << " target-compare-batch TARGET.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
+              << "  " << program << " target-rollback-test TARGET.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
+              << "  " << program << " dflash-commit-test TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
               << "  " << program << " dflash-encode TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
               << "  " << program << " dflash-propose TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
               << "  " << program << " dflash-verify TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
               << "  " << program << " dflash-verify-prompt TARGET.gguf DFLASH.gguf CONTEXT TOKENS_CSV [RESIDENT_GIB]\n"
+              << "  " << program << " speculative-equivalence TARGET.gguf DFLASH.gguf CONTEXT TOKENS_CSV COUNT [RESIDENT_GIB]\n"
               << "  " << program << " bench-kv4 [CONTEXT] [ITERATIONS] [PARTITIONS]\n"
               << "  " << program << " plan-128k TARGET.gguf DFLASH.gguf\n";
 }
@@ -3087,9 +4212,20 @@ int main(int argc, char **argv) {
             }
             return EXIT_SUCCESS;
         }
+        if (argc >= 5 && argc <= 7 && std::string(argv[1]) == "benchmark-128k") {
+            const double gib = argc >= 6 ? std::stod(argv[5]) : 1.0;
+            if (gib < 0.0 || gib > 2.0) {
+                throw std::invalid_argument("benchmark RESIDENT_GIB must be in [0, 2]");
+            }
+            const int runs = argc >= 7 ? std::stoi(argv[6]) : 3;
+            benchmark_128k(argv[2], argv[3], argv[4],
+                           static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0),
+                           runs);
+            return EXIT_SUCCESS;
+        }
         if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "chat") {
             const std::size_t context = argc >= 5 ? static_cast<std::size_t>(std::stoull(argv[4])) : 4096;
-            const double gib = argc >= 6 ? std::stod(argv[5]) : 5.5;
+            const double gib = argc >= 6 ? std::stod(argv[5]) : 6.0;
             chat(argv[2], argv[3], context,
                  static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0));
             return EXIT_SUCCESS;
@@ -3149,6 +4285,49 @@ int main(int argc, char **argv) {
                                            : default_resident_weight_budget);
             return EXIT_SUCCESS;
         }
+        if ((argc == 5 || argc == 6) && std::string(argv[1]) == "target-long-window-bench") {
+            const char *kv_env = std::getenv("QWEN_NATIVE_KV");
+            const double default_gib = (kv_env && std::strcmp(kv_env, "q4") == 0) ? 4.0 : 1.0;
+            const double requested_gib = argc == 6 ? std::stod(argv[5]) : default_gib;
+            if (requested_gib < 0.0 || requested_gib > 7.0) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7]");
+            }
+            target_long_window_bench(
+                argv[2], static_cast<std::size_t>(std::stoull(argv[3])),
+                static_cast<std::uint32_t>(std::stoul(argv[4])),
+                static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 5 || argc == 6) && std::string(argv[1]) == "target-compare-batch") {
+            const double requested_gib = argc == 6 ? std::stod(argv[5]) : 0.0;
+            if (requested_gib < 0.0 || requested_gib > 7.0) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7]");
+            }
+            target_compare_batch(argv[2], static_cast<std::size_t>(std::stoull(argv[3])),
+                                 static_cast<std::uint32_t>(std::stoul(argv[4])),
+                                 static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 5 || argc == 6) && std::string(argv[1]) == "target-rollback-test") {
+            const double requested_gib = argc == 6 ? std::stod(argv[5]) : 0.0;
+            if (requested_gib < 0.0 || requested_gib > 7.0) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7]");
+            }
+            target_rollback_test(argv[2], static_cast<std::size_t>(std::stoull(argv[3])),
+                                 static_cast<std::uint32_t>(std::stoul(argv[4])),
+                                 static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 6 || argc == 7) && std::string(argv[1]) == "dflash-commit-test") {
+            const double requested_gib = argc == 7 ? std::stod(argv[6]) : 0.0;
+            if (requested_gib < 0.0 || requested_gib > 7.0) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7]");
+            }
+            dflash_commit_test(argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
+                                static_cast<std::uint32_t>(std::stoul(argv[5])),
+                                static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "dflash-encode") {
             const double requested_gib = argc == 7 ? std::stod(argv[6]) : 7.3;
             if (requested_gib < 0.0 || requested_gib > 7.5) {
@@ -3187,6 +4366,17 @@ int main(int argc, char **argv) {
             dflash_verify_prompt(argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
                                  parse_token_list(argv[5]),
                                  static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 7 || argc == 8) && std::string(argv[1]) == "speculative-equivalence") {
+            const double requested_gib = argc == 8 ? std::stod(argv[7]) : 1.0;
+            if (requested_gib < 0.0 || requested_gib > 7.0) {
+                throw std::invalid_argument("RESIDENT_GIB must be in [0, 7]");
+            }
+            speculative_equivalence_test(
+                argv[2], argv[3], static_cast<std::size_t>(std::stoull(argv[4])),
+                parse_token_list(argv[5]), static_cast<std::size_t>(std::stoull(argv[6])),
+                static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0));
             return EXIT_SUCCESS;
         }
         if (argc >= 2 && argc <= 5 && std::string(argv[1]) == "bench-kv4") {

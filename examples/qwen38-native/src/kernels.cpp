@@ -1,4 +1,6 @@
 #include "kernels.h"
+#include "cpu_matvec.h"
+#include "iq3s_codebook.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -8,10 +10,13 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <future>
 #include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -95,6 +100,22 @@ struct Q3KBlock {
     std::uint16_t d;
 };
 static_assert(sizeof(Q3KBlock) == 110);
+
+#pragma pack(push, 1)
+struct IQ3SBlock {
+    std::uint16_t d;
+    std::uint8_t qs[64];
+    std::uint8_t qh[8];
+    std::uint8_t signs[32];
+    std::uint8_t scales[4];
+};
+#pragma pack(pop)
+static_assert(sizeof(IQ3SBlock) == 110);
+
+__device__ __constant__ std::uint16_t kIq3SCodebookDevice[512] = {
+    QWEN_IQ3S_CODEBOOK_VALUES
+};
+#undef QWEN_IQ3S_CODEBOOK_VALUES
 
 constexpr int kQ8Block = 32;
 constexpr int kIQ4NLBlock = 32;
@@ -220,6 +241,16 @@ struct ResidentWeightCache {
         return device;
     }
 
+    void clear() {
+        for (const auto &[host, entry] : entries) {
+            (void) host;
+            if (entry.device) hip_check(hipFree(entry.device), "clear resident weight cache");
+        }
+        entries.clear();
+        resident_bytes = 0;
+        budget_bytes = 0;
+    }
+
     ResidentWeightCacheStats stats() const {
         return {budget_bytes, resident_bytes, entries.size()};
     }
@@ -315,7 +346,7 @@ __global__ void q4k_matvec_batch8_kernel(const Q4KBlock *__restrict__ weights,
                                          const float *__restrict__ input,
                                          float *__restrict__ output,
                                          int input_size, int blocks_per_row, int rows) {
-    const int row = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.y) + static_cast<int>(threadIdx.y);
     const int lane = static_cast<int>(threadIdx.x);
     if (row >= rows || lane >= kWarpSize) {
         return;
@@ -494,23 +525,29 @@ __global__ void q6k_matvec_kernel(const Q6KBlock *__restrict__ weights,
 
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            const int offset = half * 64;
-            const std::uint8_t low0 = block.low_quants[offset + lane];
-            const std::uint8_t low1 = block.low_quants[offset + lane + 32];
+            // Each 128-value stripe occupies 64 packed low-nibble bytes but
+            // advances 128 values in the activation row.
+            const int quant_offset = half * 64;
+            const int value_offset = half * 128;
+            const std::uint8_t low0 = block.low_quants[quant_offset + lane];
+            const std::uint8_t low1 = block.low_quants[quant_offset + lane + 32];
             const std::uint8_t high = block.high_quants[half * 32 + lane];
-            const int scale_offset = half * 8;
+            // Q6_K stores one signed scale per 16 weights. Lanes 0..15
+            // therefore use the even scale slots and lanes 16..31 the odd
+            // slots for each of the four 32-value stripes.
+            const int scale_offset = half * 8 + lane / 16;
             const int code0 = static_cast<int>(low0 & 0x0F) + ((high & 0x03) << 4) - 32;
             const int code1 = static_cast<int>(low1 & 0x0F) + (((high >> 2) & 0x03) << 4) - 32;
             const int code2 = static_cast<int>(low0 >> 4) + (((high >> 4) & 0x03) << 4) - 32;
             const int code3 = static_cast<int>(low1 >> 4) + (((high >> 6) & 0x03) << 4) - 32;
             sum = fmaf(scale_all * static_cast<float>(block.scales[scale_offset]) * static_cast<float>(code0),
-                       block_input[offset + lane], sum);
+                       block_input[value_offset + lane], sum);
             sum = fmaf(scale_all * static_cast<float>(block.scales[scale_offset + 2]) * static_cast<float>(code1),
-                       block_input[offset + lane + 32], sum);
+                       block_input[value_offset + lane + 32], sum);
             sum = fmaf(scale_all * static_cast<float>(block.scales[scale_offset + 4]) * static_cast<float>(code2),
-                       block_input[offset + lane + 64], sum);
+                       block_input[value_offset + lane + 64], sum);
             sum = fmaf(scale_all * static_cast<float>(block.scales[scale_offset + 6]) * static_cast<float>(code3),
-                       block_input[offset + lane + 96], sum);
+                       block_input[value_offset + lane + 96], sum);
         }
     }
 
@@ -541,11 +578,12 @@ __global__ void q6k_matvec_batch8_kernel(const Q6KBlock *__restrict__ weights,
 
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            const int offset = half * 64;
-            const std::uint8_t low0 = block.low_quants[offset + lane];
-            const std::uint8_t low1 = block.low_quants[offset + lane + 32];
+            const int quant_offset = half * 64;
+            const int value_offset = half * 128;
+            const std::uint8_t low0 = block.low_quants[quant_offset + lane];
+            const std::uint8_t low1 = block.low_quants[quant_offset + lane + 32];
             const std::uint8_t high = block.high_quants[half * 32 + lane];
-            const int scale_offset = half * 8;
+            const int scale_offset = half * 8 + lane / 16;
             const float weight0 = scale_all * static_cast<float>(block.scales[scale_offset])
                                 * static_cast<float>(static_cast<int>(low0 & 0x0F) + ((high & 0x03) << 4) - 32);
             const float weight1 = scale_all * static_cast<float>(block.scales[scale_offset + 2])
@@ -557,10 +595,11 @@ __global__ void q6k_matvec_batch8_kernel(const Q6KBlock *__restrict__ weights,
 #pragma unroll
             for (int batch = 0; batch < 8; ++batch) {
                 const float *batch_input = input + static_cast<std::size_t>(batch) * input_size;
-                sums[batch] = fmaf(weight0, batch_input[block_index * kQuantBlock + offset + lane], sums[batch]);
-                sums[batch] = fmaf(weight1, batch_input[block_index * kQuantBlock + offset + lane + 32], sums[batch]);
-                sums[batch] = fmaf(weight2, batch_input[block_index * kQuantBlock + offset + lane + 64], sums[batch]);
-                sums[batch] = fmaf(weight3, batch_input[block_index * kQuantBlock + offset + lane + 96], sums[batch]);
+                const int base = block_index * kQuantBlock + value_offset + lane;
+                sums[batch] = fmaf(weight0, batch_input[base], sums[batch]);
+                sums[batch] = fmaf(weight1, batch_input[base + 32], sums[batch]);
+                sums[batch] = fmaf(weight2, batch_input[base + 64], sums[batch]);
+                sums[batch] = fmaf(weight3, batch_input[base + 96], sums[batch]);
             }
         }
     }
@@ -760,10 +799,10 @@ __device__ int q3k_decode_scale(const std::uint8_t *scales, int sb) {
         low4 = scales[j] & 0xf;
         high2 = (scales[8 + j] >> 0) & 3;
     } else if (sb < 8) {
-        low4 = scales[j] >> 4;
+        low4 = scales[4 + j] & 0xf;
         high2 = (scales[8 + j] >> 2) & 3;
     } else if (sb < 12) {
-        low4 = scales[4 + j] & 0xf;
+        low4 = scales[j] >> 4;
         high2 = (scales[8 + j] >> 4) & 3;
     } else {
         low4 = scales[4 + j] >> 4;
@@ -789,11 +828,14 @@ __global__ void q3k_matvec_batch8_kernel(const Q3KBlock *__restrict__ weights,
         for (int iter = 0; iter < 8; ++iter) {
             const int p = iter * 32 + lane;
             const int sb = p / 16;
-            const int pos_in_sub = p % 16;
-            const int q_group = sb / 4;
-            const int shift = (sb % 4) * 2;
-            const int low2 = (block.qs[q_group * 16 + pos_in_sub] >> shift) & 3;
-            const int high1 = (block.hmask[p / 8] >> (p % 8)) & 1;
+            // Each 32-byte q stripe carries four successive 2-bit planes.
+            // The second stripe starts at value 128; hmask advances once per
+            // 32 decoded weights.
+            const int stripe = p / 32;
+            const int qs_index = (stripe / 4) * 32 + lane;
+            const int shift = (stripe & 3) * 2;
+            const int low2 = (block.qs[qs_index] >> shift) & 3;
+            const int high1 = (block.hmask[lane] >> stripe) & 1;
             const int q3 = low2 | (high1 << 2);
             const float dl = d * static_cast<float>(q3k_decode_scale(block.scales, sb));
             const float weight = dl * static_cast<float>(q3 - 4);
@@ -817,6 +859,94 @@ __global__ void q3k_matvec_batch8_kernel(const Q3KBlock *__restrict__ weights,
             output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
         }
     }
+}
+
+__device__ float iq3s_decode_weight(const IQ3SBlock &block, int position) {
+    const int block32 = position / 32;
+    const int pair = block32 / 2;
+    const int half = block32 & 1;
+    const int local = position & 31;
+    const int group8 = local / 8;
+    const int item8 = local & 7;
+    const int grid_half = item8 / 4;
+    const int coordinate = item8 & 3;
+    const int q_offset = pair * 16 + half * 8 + group8 * 2 + grid_half;
+    const int high_bit = (block.qh[pair * 2 + half]
+                        >> (2 * group8 + grid_half)) & 1;
+    const int codebook_index = block.qs[q_offset] | (high_bit << 8);
+    const std::uint16_t lattice = kIq3SCodebookDevice[codebook_index];
+    int magnitude = 2 * ((lattice >> (3 * coordinate)) & 7) + 1;
+    if (block.signs[pair * 8 + half * 4 + group8] & (1U << item8)) {
+        magnitude = -magnitude;
+    }
+    const int nibble = half == 0 ? block.scales[pair] & 15
+                                 : block.scales[pair] >> 4;
+    const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+    return d * static_cast<float>(1 + 2 * nibble) * static_cast<float>(magnitude);
+}
+
+__global__ void iq3s_matvec_batch8_kernel(const IQ3SBlock *__restrict__ weights,
+                                          const float *__restrict__ input,
+                                          float *__restrict__ output,
+                                          int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+    float sums[8] = {};
+    const IQ3SBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const IQ3SBlock &block = row_weights[block_index];
+#pragma unroll
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            const int position = iteration * 32 + lane;
+            const float weight = iq3s_decode_weight(block, position);
+            const int input_index = block_index * kQuantBlock + position;
+#pragma unroll
+            for (int batch = 0; batch < 8; ++batch) {
+                sums[batch] = fmaf(
+                    weight, input[static_cast<std::size_t>(batch) * input_size + input_index],
+                    sums[batch]);
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            output[static_cast<std::size_t>(batch) * rows + row] = sums[batch];
+        }
+    }
+}
+
+__global__ void iq3s_matvec_kernel(const IQ3SBlock *__restrict__ weights,
+                                   const float *__restrict__ input,
+                                   float *__restrict__ output,
+                                   int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kWarpSize) return;
+    float sum = 0.0F;
+    const IQ3SBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
+    for (int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const IQ3SBlock &block = row_weights[block_index];
+#pragma unroll
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            const int position = iteration * 32 + lane;
+            sum = fmaf(iq3s_decode_weight(block, position),
+                       input[block_index * kQuantBlock + position], sum);
+        }
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down(sum, offset, kWarpSize);
+    }
+    if (lane == 0) output[row] = sum;
 }
 
 __global__ void q8_0_matvec_kernel(const Q8_0Block *__restrict__ weights,
@@ -929,11 +1059,11 @@ __global__ void q3k_matvec_kernel(const Q3KBlock *__restrict__ weights,
         for (int iter = 0; iter < 8; ++iter) {
             const int p = iter * 32 + lane;
             const int sb = p / 16;
-            const int pos_in_sub = p % 16;
-            const int q_group = sb / 4;
-            const int shift = (sb % 4) * 2;
-            const int low2 = (block.qs[q_group * 16 + pos_in_sub] >> shift) & 3;
-            const int high1 = (block.hmask[p / 8] >> (p % 8)) & 1;
+            const int stripe = p / 32;
+            const int qs_index = (stripe / 4) * 32 + lane;
+            const int shift = (stripe & 3) * 2;
+            const int low2 = (block.qs[qs_index] >> shift) & 3;
+            const int high1 = (block.hmask[lane] >> stripe) & 1;
             const int q3 = low2 | (high1 << 2);
             const float dl = d * static_cast<float>(q3k_decode_scale(block.scales, sb));
             const float weight = dl * static_cast<float>(q3 - 4);
@@ -959,7 +1089,7 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
                                         const float *__restrict__ values,
                                         const float *__restrict__ decays,
                                         const float *__restrict__ betas,
-                                        __half *__restrict__ states,
+                                        float *__restrict__ states,
                                         float *__restrict__ output,
                                         int head_size) {
     const int head = static_cast<int>(blockIdx.x);
@@ -971,7 +1101,7 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
     if (thread < head_size) {
         float predicted = 0.0F;
         for (int row = 0; row < head_size; ++row) {
-            predicted = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+            predicted = fmaf(states[state_offset + static_cast<std::size_t>(row) * head_size + thread],
                              keys[vector_offset + row], predicted);
         }
         delta[thread] = (values[vector_offset + thread] - decay * predicted) * betas[head];
@@ -981,16 +1111,16 @@ __global__ void gated_delta_step_kernel(const float *__restrict__ queries,
     for (int element = thread; element < head_size * head_size; element += static_cast<int>(blockDim.x)) {
         const int row = element / head_size;
         const int column = element % head_size;
-        const float updated = decay * __half2float(states[state_offset + element])
+        const float updated = decay * states[state_offset + element]
                             + keys[vector_offset + row] * delta[column];
-        states[state_offset + element] = __float2half(updated);
+        states[state_offset + element] = updated;
     }
     __syncthreads();
 
     if (thread < head_size) {
         float sum = 0.0F;
         for (int row = 0; row < head_size; ++row) {
-            sum = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+            sum = fmaf(states[state_offset + static_cast<std::size_t>(row) * head_size + thread],
                        queries[vector_offset + row], sum);
         }
         output[vector_offset + thread] = sum * 0.08838834764831843F;
@@ -1002,7 +1132,7 @@ __global__ void gated_delta_step_batch8_kernel(const float *__restrict__ queries
                                                const float *__restrict__ values,
                                                const float *__restrict__ decays,
                                                const float *__restrict__ betas,
-                                               __half *__restrict__ states,
+                                               float *__restrict__ states,
                                                float *__restrict__ output,
                                                int head_size, int batch_count) {
     const int head = static_cast<int>(blockIdx.x);
@@ -1022,7 +1152,7 @@ __global__ void gated_delta_step_batch8_kernel(const float *__restrict__ queries
         if (thread < head_size) {
             float predicted = 0.0F;
             for (int row = 0; row < head_size; ++row) {
-                predicted = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+                predicted = fmaf(states[state_offset + static_cast<std::size_t>(row) * head_size + thread],
                                  t_keys[vector_offset + row], predicted);
             }
             delta[thread] = (t_values[vector_offset + thread] - t_decay * predicted) * t_beta;
@@ -1032,16 +1162,16 @@ __global__ void gated_delta_step_batch8_kernel(const float *__restrict__ queries
         for (int element = thread; element < head_size * head_size; element += static_cast<int>(blockDim.x)) {
             const int row = element / head_size;
             const int column = element % head_size;
-            const float updated = t_decay * __half2float(states[state_offset + element])
+            const float updated = t_decay * states[state_offset + element]
                                 + t_keys[vector_offset + row] * delta[column];
-            states[state_offset + element] = __float2half(updated);
+            states[state_offset + element] = updated;
         }
         __syncthreads();
 
         if (thread < head_size) {
             float sum = 0.0F;
             for (int row = 0; row < head_size; ++row) {
-                sum = fmaf(__half2float(states[state_offset + static_cast<std::size_t>(row) * head_size + thread]),
+                sum = fmaf(states[state_offset + static_cast<std::size_t>(row) * head_size + thread],
                            t_queries[vector_offset + row], sum);
             }
             output[token * vectors_per_batch + vector_offset + thread] = sum * 0.08838834764831843F;
@@ -1052,9 +1182,69 @@ __global__ void gated_delta_step_batch8_kernel(const float *__restrict__ queries
 
 // GPU-native recurrent: conv1d + SiLU + split QKV + L2 norm.
 // One block per channel group, iterates over 8 tokens sequentially (state is serial).
-// qkv_width = 2*key_heads*head_size + value_heads*head_size = 7680 for this model.
+// qkv_width = 2*key_heads*head_size + value_heads*head_size = 10240 for this model.
 // Output: queries[8*recurrent_width], keys[8*recurrent_width], values[8*recurrent_width]
 // where recurrent_width = value_heads * head_size = 6144.
+// Rebuild convolution history from its checkpoint and the already projected
+// prefix. The caller restores the checkpoint history before this launch.
+__global__ void recurrent_conv_commit_prefix_kernel(
+        const float *__restrict__ qkv_input,
+        float *__restrict__ conv_state,
+        int qkv_width, int committed_tokens) {
+    const int channel = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                      + static_cast<int>(threadIdx.x);
+    if (channel >= qkv_width) return;
+    float s0 = conv_state[channel * 3 + 0];
+    float s1 = conv_state[channel * 3 + 1];
+    float s2 = conv_state[channel * 3 + 2];
+    for (int token = 0; token < committed_tokens; ++token) {
+        s0 = s1;
+        s1 = s2;
+        s2 = qkv_input[static_cast<std::size_t>(token) * qkv_width + channel];
+    }
+    conv_state[channel * 3 + 0] = s0;
+    conv_state[channel * 3 + 1] = s1;
+    conv_state[channel * 3 + 2] = s2;
+}
+
+__global__ void recurrent_gdn_commit_prefix_kernel(
+        const float *__restrict__ keys,
+        const float *__restrict__ values,
+        const float *__restrict__ decays,
+        const float *__restrict__ betas,
+        float *__restrict__ states,
+        int head_size, int committed_tokens) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int thread = static_cast<int>(threadIdx.x);
+    const std::size_t vector_offset = static_cast<std::size_t>(head) * head_size;
+    const std::size_t state_offset = vector_offset * head_size;
+    const std::size_t vectors_per_batch = 48ULL * head_size;
+    __shared__ float delta[128];
+    for (int token = 0; token < committed_tokens; ++token) {
+        const float *t_keys = keys + static_cast<std::size_t>(token) * vectors_per_batch;
+        const float *t_values = values + static_cast<std::size_t>(token) * vectors_per_batch;
+        const float decay = decays[token * 48 + head];
+        const float beta = betas[token * 48 + head];
+        if (thread < head_size) {
+            float predicted = 0.0F;
+            for (int row = 0; row < head_size; ++row) {
+                predicted = fmaf(states[state_offset + static_cast<std::size_t>(row) * head_size + thread],
+                                 t_keys[vector_offset + row], predicted);
+            }
+            delta[thread] = (t_values[vector_offset + thread] - decay * predicted) * beta;
+        }
+        __syncthreads();
+        for (int element = thread; element < head_size * head_size;
+             element += static_cast<int>(blockDim.x)) {
+            const int row = element / head_size;
+            const int column = element % head_size;
+            states[state_offset + element] = decay * states[state_offset + element]
+                + t_keys[vector_offset + row] * delta[column];
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void recurrent_conv1d_batch8_kernel(
         const float *__restrict__ qkv_input,   // slot[0]: 8 × qkv_width
         float *__restrict__ conv_state,         // 3 × qkv_width (persistent per layer)
@@ -1062,7 +1252,7 @@ __global__ void recurrent_conv1d_batch8_kernel(
         float *__restrict__ queries,            // 8 × recurrent_width output
         float *__restrict__ keys,               // 8 × recurrent_width output
         float *__restrict__ values,             // 8 × recurrent_width output
-        int qkv_width, int key_heads, int value_heads, int head_size) {
+        int qkv_width, int key_heads, int value_heads, int head_size, int batch_count) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= qkv_width) return;
 
@@ -1076,7 +1266,7 @@ __global__ void recurrent_conv1d_batch8_kernel(
     float s1 = conv_state[channel * 3 + 1];
     float s2 = conv_state[channel * 3 + 2];
 
-    for (int token = 0; token < 8; ++token) {
+    for (int token = 0; token < batch_count; ++token) {
         const float input_val = qkv_input[token * qkv_width + channel];
         float sum = fmaf(s0, w0, fmaf(s1, w1, fmaf(s2, w2, input_val * w3)));
         float activated = sum / (1.0f + expf(-sum)); // SiLU
@@ -1088,21 +1278,22 @@ __global__ void recurrent_conv1d_batch8_kernel(
         // Split into Q/K/V based on channel position
         const int key_region = key_heads * head_size;
         if (channel < key_region) {
-            // Q region: replicate each key head to value_heads/key_heads copies
+            // The GGUF converter tiles V heads as [replica][K head] and
+            // applies the same permutation to V/Z/A/B/conv/out weights.
             const int key_head = channel / head_size;
             const int dim = channel % head_size;
             const int heads_per_key = value_heads / key_heads;
             for (int rep = 0; rep < heads_per_key; ++rep) {
-                const int out_head = key_head * heads_per_key + rep;
+                const int out_head = rep * key_heads + key_head;
                 queries[token * recurrent_width + out_head * head_size + dim] = activated;
             }
         } else if (channel < 2 * key_region) {
-            // K region: replicate each key head to value_heads/key_heads copies
+            // K uses the same tiled broadcast as Q.
             const int key_head = (channel - key_region) / head_size;
             const int dim = (channel - key_region) % head_size;
             const int heads_per_key = value_heads / key_heads;
             for (int rep = 0; rep < heads_per_key; ++rep) {
-                const int out_head = key_head * heads_per_key + rep;
+                const int out_head = rep * key_heads + key_head;
                 keys[token * recurrent_width + out_head * head_size + dim] = activated;
             }
         } else {
@@ -1122,12 +1313,12 @@ __global__ void recurrent_conv1d_batch8_kernel(
 __global__ void recurrent_l2_norm_batch8_kernel(
         float *__restrict__ queries,  // 8 × recurrent_width
         float *__restrict__ keys,     // 8 × recurrent_width
-        int recurrent_width, int head_size, float epsilon) {
+        int recurrent_width, int head_size, float epsilon, int batch_count) {
     const int head = blockIdx.x;
     const int dim = threadIdx.x;
     if (dim >= head_size) return;
 
-    for (int token = 0; token < 8; ++token) {
+    for (int token = 0; token < batch_count; ++token) {
         const int base = token * recurrent_width + head * head_size;
 
         // L2 norm queries
@@ -1138,7 +1329,10 @@ __global__ void recurrent_l2_norm_batch8_kernel(
             if (dim < stride) q_sum_sq[dim] += q_sum_sq[dim + stride];
             __syncthreads();
         }
-        float q_scale = rsqrtf(q_sum_sq[0] / head_size + epsilon);
+        // Match the scalar reference's L2 normalization exactly.  This is
+        // deliberately not RMS normalization: dividing by head_size here
+        // changes every recurrent update and quickly changes greedy tokens.
+        float q_scale = rsqrtf(q_sum_sq[0] + epsilon);
         queries[base + dim] *= q_scale;
 
         // L2 norm keys
@@ -1149,7 +1343,7 @@ __global__ void recurrent_l2_norm_batch8_kernel(
             if (dim < stride) k_sum_sq[dim] += k_sum_sq[dim + stride];
             __syncthreads();
         }
-        float k_scale = rsqrtf(k_sum_sq[0] / head_size + epsilon);
+        float k_scale = rsqrtf(k_sum_sq[0] + epsilon);
         keys[base + dim] *= k_scale;
         __syncthreads();
     }
@@ -1166,7 +1360,7 @@ __global__ void recurrent_decay_beta_batch8_kernel(
         const float *__restrict__ a_weights,     // 48
         float *__restrict__ decays,              // 8 × 48 output
         float *__restrict__ betas,               // 8 × 48 output
-        int embedding_size) {
+        int embedding_size, int batch_count) {
     const int head = blockIdx.x;
     const int tid = threadIdx.x;
     __shared__ float partial_beta[256];
@@ -1177,7 +1371,7 @@ __global__ void recurrent_decay_beta_batch8_kernel(
     const float bias = dt_bias[head];
     const float a_val = a_weights[head];
 
-    for (int token = 0; token < 8; ++token) {
+    for (int token = 0; token < batch_count; ++token) {
         const float *input = hidden + token * embedding_size;
         float sum_beta = 0.0f;
         float sum_alpha = 0.0f;
@@ -1214,14 +1408,14 @@ __global__ void recurrent_ssm_norm_gate_batch8_kernel(
         const float *__restrict__ gate,        // slot[1]: 8 × recurrent_width
         const float *__restrict__ norm_weights,// head_size
         float *__restrict__ output,            // 8 × recurrent_width → pipeline hidden
-        int recurrent_width, int /*value_heads*/, int head_size, float epsilon) {
+        int recurrent_width, int /*value_heads*/, int head_size, float epsilon, int batch_count) {
     const int head = blockIdx.x;
     const int dim = threadIdx.x;
     if (dim >= head_size) return;
 
     __shared__ float sum_sq_shared[128];
 
-    for (int token = 0; token < 8; ++token) {
+    for (int token = 0; token < batch_count; ++token) {
         const int base = token * recurrent_width + head * head_size;
         float val = gdn_output[base + dim];
 
@@ -1509,7 +1703,7 @@ __global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys
                                             const std::int8_t *__restrict__ queries,
                                             const float *__restrict__ query_scales,
                                             float *__restrict__ partials,
-                                            int context_size, int partitions) {
+                                            int context_size, int cache_stride, int base_position, int partitions) {
     constexpr int groups_per_head = 8;
     constexpr int query_heads = 24;
     constexpr int query_groups_per_kv = 6;
@@ -1526,7 +1720,8 @@ __global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys
     const int partition = static_cast<int>(blockIdx.x);
     const int chunk = (context_size + partitions - 1) / partitions;
     const int begin = partition * chunk;
-    const int end = min(context_size, begin + chunk);
+    const int query_context_size = base_position + batch + 1;
+    const int end = min(query_context_size, begin + chunk);
     const int lane_group = lane / 8;
     const int lane_in_group = lane & 7;
 
@@ -1545,7 +1740,7 @@ __global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys
     for (int token = begin; token < end; ++token) {
         float score_partial = 0.0F;
         const auto *token_keys = keys
-            + (static_cast<std::size_t>(kv_head) * context_size + token) * groups_per_head;
+            + (static_cast<std::size_t>(kv_head) * cache_stride + token) * groups_per_head;
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             const int group = half * 4 + lane_group;
@@ -1590,9 +1785,12 @@ __global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys
 
         if (thread < 8) {
             const float old_max = state_max[thread];
-            const float new_max = fmaxf(old_max, tile_scores[thread]);
-            const float scale_old = isinf(old_max) ? 0.0F : expf(old_max - new_max);
-            const float probability = expf(tile_scores[thread] - new_max);
+            const float score = tile_scores[thread];
+            const bool raises_maximum = score > old_max;
+            const float new_max = raises_maximum ? score : old_max;
+            const float scale_old = raises_maximum
+                ? (isinf(old_max) ? 0.0F : expf(old_max - score)) : 1.0F;
+            const float probability = raises_maximum ? 1.0F : expf(score - old_max);
             rescale[thread] = scale_old;
             probabilities[thread] = probability;
             state_sum[thread] = state_sum[thread] * scale_old + probability;
@@ -1602,7 +1800,7 @@ __global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys
 
         const int value_group_index = thread / 32;
         const int value_index = thread & 31;
-        const auto &value_group = values[(static_cast<std::size_t>(kv_head) * context_size + token)
+        const auto &value_group = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
                                          * groups_per_head + value_group_index];
         const auto value_byte = value_group.quants[value_index / 2];
         const int value_nibble = (value_byte >> ((value_index & 1) * 4)) & 0x0F;
@@ -1629,6 +1827,1208 @@ __global__ void n23kv4_flash_partial_kernel(const N23KV4Group *__restrict__ keys
             destination[256] = state_max[query];
             destination[257] = state_sum[query];
         }
+    }
+}
+
+// Exact-layout Q8 KV flash attention for the correctness-critical long target
+// path. One workgroup evaluates eight (batch, query-head) pairs while loading
+// each K/V vector once. Six workgroups cover the 8x6 queries sharing one KV
+// head, reducing full-context cache traffic by 8x without changing Q8 values.
+__global__ void q8kv_flash_partial_kernel(const Q8_0Block *__restrict__ keys,
+                                          const Q8_0Block *__restrict__ values,
+                                          const float *__restrict__ queries,
+                                          float *__restrict__ partials,
+                                          int context_size, int cache_stride, int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kQueryGroupsPerKv = 6;
+    constexpr int kPartialStride = 258;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int kv_head = static_cast<int>(blockIdx.y) / kQueryGroupsPerKv;
+    const int local_query_group = static_cast<int>(blockIdx.y) % kQueryGroupsPerKv;
+    const int local_query = local_query_group * 8 + warp;
+    const int batch = local_query / kHeadsPerKv;
+    const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int end = min(context_size, begin + chunk);
+
+    __shared__ float key_values[256];
+    __shared__ float tile_scores[8];
+    __shared__ float state_max[8];
+    __shared__ float state_sum[8];
+    __shared__ float rescale[8];
+    __shared__ float probabilities[8];
+    if (thread < 8) {
+        state_max[thread] = -INFINITY;
+        state_sum[thread] = 0.0F;
+    }
+    __syncthreads();
+
+    float accumulator[8] = {};
+    for (int token = begin; token < end; ++token) {
+        const int group = thread / 32;
+        const int group_dimension = thread & 31;
+        const auto &key_block = keys[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                     * kGroups + group];
+        key_values[thread] = static_cast<float>(key_block.qs[group_dimension])
+                           * __half2float(*reinterpret_cast<const __half *>(&key_block.d));
+        __syncthreads();
+
+        float score = 0.0F;
+#pragma unroll
+        for (int query_group = 0; query_group < kGroups; ++query_group) {
+            const int dimension = query_group * 32 + lane;
+            score = fmaf(queries[(static_cast<std::size_t>(batch) * kHeads + query_head) * 256
+                                 + dimension], key_values[dimension], score);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            score += __shfl_down(score, offset, kWarpSize);
+        }
+        if (lane == 0) tile_scores[warp] = score * 0.0625F;
+        __syncthreads();
+
+        if (thread < 8) {
+            const int local = local_query_group * 8 + thread;
+            const int query_batch = local / kHeadsPerKv;
+            if (token < base_position + query_batch + 1) {
+                const float old_max = state_max[thread];
+                const float score = tile_scores[thread];
+                const bool raises_maximum = score > old_max;
+                const float new_max = raises_maximum ? score : old_max;
+                const float scale_old = raises_maximum
+                    ? (isinf(old_max) ? 0.0F : expf(old_max - score)) : 1.0F;
+                const float probability = raises_maximum ? 1.0F : expf(score - old_max);
+                rescale[thread] = scale_old;
+                probabilities[thread] = probability;
+                state_sum[thread] = state_sum[thread] * scale_old + probability;
+                state_max[thread] = new_max;
+            } else {
+                rescale[thread] = 1.0F;
+                probabilities[thread] = 0.0F;
+            }
+        }
+        __syncthreads();
+
+        const auto &value_block = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                          * kGroups + group];
+        const float value = static_cast<float>(value_block.qs[group_dimension])
+                          * __half2float(*reinterpret_cast<const __half *>(&value_block.d));
+#pragma unroll
+        for (int query = 0; query < 8; ++query) {
+            accumulator[query] = accumulator[query] * rescale[query]
+                               + probabilities[query] * value;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int query = 0; query < 8; ++query) {
+        const int local = local_query_group * 8 + query;
+        const int query_batch = local / kHeadsPerKv;
+        const int query_head_out = kv_head * kHeadsPerKv + local % kHeadsPerKv;
+        const int query_index = query_batch * kHeads + query_head_out;
+        float *destination = partials
+            + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+        destination[thread] = accumulator[query];
+        if (thread == 0) {
+            destination[256] = state_max[query];
+            destination[257] = state_sum[query];
+        }
+    }
+}
+
+// Barrier-amortized exact-Q8 variant. It preserves the same eight-query
+// grouping and token-order recurrence as q8kv_flash_partial_kernel, but stages
+// eight complete K/V vectors per LDS tile and pays four workgroup barriers per
+// tile instead of per token.
+__global__ void q8kv_flash_partial_tiled8_kernel(const Q8_0Block *__restrict__ keys,
+                                                 const Q8_0Block *__restrict__ values,
+                                                 const float *__restrict__ queries,
+                                                 float *__restrict__ partials,
+                                                 int context_size, int cache_stride,
+                                                 int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kQueryGroupsPerKv = 6;
+    constexpr int kPartialStride = 258;
+    constexpr int kTileTokens = 8;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int kv_head = static_cast<int>(blockIdx.y) / kQueryGroupsPerKv;
+    const int local_query_group = static_cast<int>(blockIdx.y) % kQueryGroupsPerKv;
+    const int local_query = local_query_group * 8 + warp;
+    const int batch = local_query / kHeadsPerKv;
+    const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int end = min(context_size, begin + chunk);
+
+    __shared__ float key_tiles[kTileTokens * 256];
+    __shared__ float value_tiles[kTileTokens * 256];
+    __shared__ float tile_scores[8 * kTileTokens];
+    __shared__ float tile_rescale[8 * kTileTokens];
+    __shared__ float tile_probability[8 * kTileTokens];
+    __shared__ float state_max[8];
+    __shared__ float state_sum[8];
+    if (thread < 8) {
+        state_max[thread] = -INFINITY;
+        state_sum[thread] = 0.0F;
+    }
+    __syncthreads();
+
+    float accumulator[8] = {};
+    for (int tile_begin = begin; tile_begin < end; tile_begin += kTileTokens) {
+        const int tile_count = min(kTileTokens, end - tile_begin);
+        const int group = thread / 32;
+        const int group_dimension = thread & 31;
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const int token = tile_begin + tile_token;
+            const auto &key_block = keys[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                         * kGroups + group];
+            const auto &value_block = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                             * kGroups + group];
+            key_tiles[tile_token * 256 + thread]
+                = static_cast<float>(key_block.qs[group_dimension])
+                * __half2float(*reinterpret_cast<const __half *>(&key_block.d));
+            value_tiles[tile_token * 256 + thread]
+                = static_cast<float>(value_block.qs[group_dimension])
+                * __half2float(*reinterpret_cast<const __half *>(&value_block.d));
+        }
+        __syncthreads();
+
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            float score = 0.0F;
+#pragma unroll
+            for (int query_group = 0; query_group < kGroups; ++query_group) {
+                const int dimension = query_group * 32 + lane;
+                score = fmaf(queries[(static_cast<std::size_t>(batch) * kHeads + query_head) * 256
+                                     + dimension],
+                             key_tiles[tile_token * 256 + dimension], score);
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                score += __shfl_down(score, offset, kWarpSize);
+            }
+            if (lane == 0) tile_scores[warp * kTileTokens + tile_token] = score * 0.0625F;
+        }
+        __syncthreads();
+
+        if (thread < 8) {
+            const int local = local_query_group * 8 + thread;
+            const int query_batch = local / kHeadsPerKv;
+            float maximum = state_max[thread];
+            float sum = state_sum[thread];
+            for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+                const int token = tile_begin + tile_token;
+                float rescale = 1.0F;
+                float probability = 0.0F;
+                if (token < base_position + query_batch + 1) {
+                    const float score = tile_scores[thread * kTileTokens + tile_token];
+                    if (score > maximum) {
+                        rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                        probability = 1.0F;
+                        maximum = score;
+                    } else {
+                        probability = expf(score - maximum);
+                    }
+                    sum = sum * rescale + probability;
+                }
+                tile_rescale[thread * kTileTokens + tile_token] = rescale;
+                tile_probability[thread * kTileTokens + tile_token] = probability;
+            }
+            state_max[thread] = maximum;
+            state_sum[thread] = sum;
+        }
+        __syncthreads();
+
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const float value = value_tiles[tile_token * 256 + thread];
+#pragma unroll
+            for (int query = 0; query < 8; ++query) {
+                accumulator[query]
+                    = accumulator[query] * tile_rescale[query * kTileTokens + tile_token]
+                    + tile_probability[query * kTileTokens + tile_token] * value;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int query = 0; query < 8; ++query) {
+        const int local = local_query_group * 8 + query;
+        const int query_batch = local / kHeadsPerKv;
+        const int query_head_out = kv_head * kHeadsPerKv + local % kHeadsPerKv;
+        const int query_index = query_batch * kHeads + query_head_out;
+        float *destination = partials
+            + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+        destination[thread] = accumulator[query];
+        if (thread == 0) {
+            destination[256] = state_max[query];
+            destination[257] = state_sum[query];
+        }
+    }
+}
+
+// Two-read GQA variant: each workgroup owns 24 of the 48 queries sharing a KV
+// head, so the complete K/V history is read twice rather than six times.
+__global__ void q8kv_flash_partial_tiled24_kernel(const Q8_0Block *__restrict__ keys,
+                                                  const Q8_0Block *__restrict__ values,
+                                                  const float *__restrict__ queries,
+                                                  float *__restrict__ partials,
+                                                  int context_size, int cache_stride,
+                                                  int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kQueryGroupsPerKv = 2;
+    constexpr int kQueriesPerGroup = 24;
+    constexpr int kPartialStride = 258;
+    constexpr int kTileTokens = 8;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int kv_head = static_cast<int>(blockIdx.y) / kQueryGroupsPerKv;
+    const int query_supergroup = static_cast<int>(blockIdx.y) % kQueryGroupsPerKv;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int end = min(context_size, begin + chunk);
+
+    __shared__ float key_tiles[kTileTokens * 256];
+    __shared__ float value_tiles[kTileTokens * 256];
+    __shared__ float tile_scores[kQueriesPerGroup * kTileTokens];
+    __shared__ float tile_rescale[kQueriesPerGroup * kTileTokens];
+    __shared__ float tile_probability[kQueriesPerGroup * kTileTokens];
+    __shared__ float state_max[kQueriesPerGroup];
+    __shared__ float state_sum[kQueriesPerGroup];
+    if (thread < kQueriesPerGroup) {
+        state_max[thread] = -INFINITY;
+        state_sum[thread] = 0.0F;
+    }
+    __syncthreads();
+
+    float accumulator[kQueriesPerGroup] = {};
+    for (int tile_begin = begin; tile_begin < end; tile_begin += kTileTokens) {
+        const int tile_count = min(kTileTokens, end - tile_begin);
+        const int group = thread / 32;
+        const int group_dimension = thread & 31;
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const int token = tile_begin + tile_token;
+            const auto &key_block = keys[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                         * kGroups + group];
+            const auto &value_block = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                             * kGroups + group];
+            key_tiles[tile_token * 256 + thread]
+                = static_cast<float>(key_block.qs[group_dimension])
+                * __half2float(*reinterpret_cast<const __half *>(&key_block.d));
+            value_tiles[tile_token * 256 + thread]
+                = static_cast<float>(value_block.qs[group_dimension])
+                * __half2float(*reinterpret_cast<const __half *>(&value_block.d));
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int query_wave = 0; query_wave < 3; ++query_wave) {
+            const int group_query = query_wave * 8 + warp;
+            const int local_query = query_supergroup * kQueriesPerGroup + group_query;
+            const int batch = local_query / kHeadsPerKv;
+            const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+            for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+                float score = 0.0F;
+#pragma unroll
+                for (int query_group = 0; query_group < kGroups; ++query_group) {
+                    const int dimension = query_group * 32 + lane;
+                    score = fmaf(queries[(static_cast<std::size_t>(batch) * kHeads + query_head) * 256
+                                         + dimension],
+                                 key_tiles[tile_token * 256 + dimension], score);
+                }
+#pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    score += __shfl_down(score, offset, kWarpSize);
+                }
+                if (lane == 0) {
+                    tile_scores[group_query * kTileTokens + tile_token] = score * 0.0625F;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (thread < kQueriesPerGroup) {
+            const int local_query = query_supergroup * kQueriesPerGroup + thread;
+            const int query_batch = local_query / kHeadsPerKv;
+            float maximum = state_max[thread];
+            float sum = state_sum[thread];
+            for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+                const int token = tile_begin + tile_token;
+                float rescale = 1.0F;
+                float probability = 0.0F;
+                if (token < base_position + query_batch + 1) {
+                    const float score = tile_scores[thread * kTileTokens + tile_token];
+                    if (score > maximum) {
+                        rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                        probability = 1.0F;
+                        maximum = score;
+                    } else {
+                        probability = expf(score - maximum);
+                    }
+                    sum = sum * rescale + probability;
+                }
+                tile_rescale[thread * kTileTokens + tile_token] = rescale;
+                tile_probability[thread * kTileTokens + tile_token] = probability;
+            }
+            state_max[thread] = maximum;
+            state_sum[thread] = sum;
+        }
+        __syncthreads();
+
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const float value = value_tiles[tile_token * 256 + thread];
+#pragma unroll
+            for (int query = 0; query < kQueriesPerGroup; ++query) {
+                accumulator[query]
+                    = accumulator[query] * tile_rescale[query * kTileTokens + tile_token]
+                    + tile_probability[query * kTileTokens + tile_token] * value;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int query = 0; query < kQueriesPerGroup; ++query) {
+        const int local_query = query_supergroup * kQueriesPerGroup + query;
+        const int query_batch = local_query / kHeadsPerKv;
+        const int query_head_out = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+        const int query_index = query_batch * kHeads + query_head_out;
+        float *destination = partials
+            + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+        destination[thread] = accumulator[query];
+        if (thread == 0) {
+            destination[256] = state_max[query];
+            destination[257] = state_sum[query];
+        }
+    }
+}
+
+// Barrier-free query-warp variant. Each wave owns one query and keeps all 256
+// output dimensions in eight lane-local accumulators. It intentionally relies
+// on L2 reuse between the 48 queries sharing a KV head rather than coordinating
+// them through per-token workgroup barriers.
+__global__ void q8kv_flash_partial_warp_kernel(const Q8_0Block *__restrict__ keys,
+                                               const Q8_0Block *__restrict__ values,
+                                               const float *__restrict__ queries,
+                                               float *__restrict__ partials,
+                                               int context_size, int cache_stride,
+                                               int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kPartialStride = 258;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int queries_per_group = static_cast<int>(blockDim.x) / kWarpSize;
+    const int query_groups_per_kv = 48 / queries_per_group;
+    const int kv_head = static_cast<int>(blockIdx.y) / query_groups_per_kv;
+    const int local_query_group = static_cast<int>(blockIdx.y) % query_groups_per_kv;
+    const int local_query = local_query_group * queries_per_group + warp;
+    const int batch = local_query / kHeadsPerKv;
+    const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+    const int query_index = batch * kHeads + query_head;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int end = min(min(context_size, begin + chunk), base_position + batch + 1);
+    const float *query = queries + static_cast<std::size_t>(query_index) * 256;
+
+    float maximum = -INFINITY;
+    float sum = 0.0F;
+    float accumulator[kGroups] = {};
+    for (int token = begin; token < end; ++token) {
+        float score = 0.0F;
+#pragma unroll
+        for (int group = 0; group < kGroups; ++group) {
+            const auto &key_block = keys[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                         * kGroups + group];
+            const float key = static_cast<float>(key_block.qs[lane])
+                            * __half2float(*reinterpret_cast<const __half *>(&key_block.d));
+            score = fmaf(query[group * 32 + lane], key, score);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            score += __shfl_down(score, offset, kWarpSize);
+        }
+        score = __shfl(score, 0, kWarpSize) * 0.0625F;
+        float rescale = 0.0F;
+        float probability = 0.0F;
+        if (lane == 0) {
+            if (score > maximum) {
+                rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                probability = 1.0F;
+                maximum = score;
+            } else {
+                rescale = 1.0F;
+                probability = expf(score - maximum);
+            }
+            sum = sum * rescale + probability;
+        }
+        rescale = __shfl(rescale, 0, kWarpSize);
+        probability = __shfl(probability, 0, kWarpSize);
+        maximum = __shfl(maximum, 0, kWarpSize);
+        sum = __shfl(sum, 0, kWarpSize);
+#pragma unroll
+        for (int group = 0; group < kGroups; ++group) {
+            const auto &value_block = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                             * kGroups + group];
+            const float value = static_cast<float>(value_block.qs[lane])
+                              * __half2float(*reinterpret_cast<const __half *>(&value_block.d));
+            accumulator[group] = accumulator[group] * rescale + probability * value;
+        }
+    }
+
+    float *destination = partials
+        + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+#pragma unroll
+    for (int group = 0; group < kGroups; ++group) {
+        destination[group * 32 + lane] = accumulator[group];
+    }
+    if (lane == 0) {
+        destination[256] = maximum;
+        destination[257] = sum;
+    }
+}
+
+// LDS-tiled companion to the barrier-free query-wave kernel. Sixteen query
+// waves share each dequantized K/V tile, reducing cache requests while paying
+// only two workgroup barriers per sixteen history tokens.
+__global__ void q8kv_flash_partial_warp16_lds_kernel(
+    const Q8_0Block *__restrict__ keys,
+    const Q8_0Block *__restrict__ values,
+    const float *__restrict__ queries,
+    float *__restrict__ partials,
+    int context_size, int cache_stride,
+    int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kQueriesPerGroup = 16;
+    constexpr int kQueryGroupsPerKv = 3;
+    constexpr int kTileTokens = 16;
+    constexpr int kPartialStride = 258;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int kv_head = static_cast<int>(blockIdx.y) / kQueryGroupsPerKv;
+    const int query_group = static_cast<int>(blockIdx.y) % kQueryGroupsPerKv;
+    const int local_query = query_group * kQueriesPerGroup + warp;
+    const int batch = local_query / kHeadsPerKv;
+    const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+    const int query_index = batch * kHeads + query_head;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int partition_end = min(context_size, begin + chunk);
+    const int query_end = min(partition_end, base_position + batch + 1);
+    const float *query = queries + static_cast<std::size_t>(query_index) * 256;
+
+    __shared__ float key_tile[kTileTokens * 256];
+    __shared__ float value_tile[kTileTokens * 256];
+    float maximum = -INFINITY;
+    float sum = 0.0F;
+    float accumulator[kGroups] = {};
+
+    for (int tile_begin = begin; tile_begin < partition_end; tile_begin += kTileTokens) {
+        const int tile_count = min(kTileTokens, partition_end - tile_begin);
+        const int tile_values = tile_count * 256;
+        for (int item = thread; item < tile_values; item += static_cast<int>(blockDim.x)) {
+            const int tile_token = item / 256;
+            const int dimension = item - tile_token * 256;
+            const int group = dimension / 32;
+            const int group_lane = dimension & 31;
+            const int token = tile_begin + tile_token;
+            const std::size_t block_index =
+                (static_cast<std::size_t>(kv_head) * cache_stride + token) * kGroups + group;
+            const auto &key_block = keys[block_index];
+            const auto &value_block = values[block_index];
+            key_tile[item] = static_cast<float>(key_block.qs[group_lane])
+                           * __half2float(*reinterpret_cast<const __half *>(&key_block.d));
+            value_tile[item] = static_cast<float>(value_block.qs[group_lane])
+                             * __half2float(*reinterpret_cast<const __half *>(&value_block.d));
+        }
+        __syncthreads();
+
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const int token = tile_begin + tile_token;
+            if (token >= query_end) continue;
+            float score = 0.0F;
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) {
+                score = fmaf(query[group * 32 + lane],
+                             key_tile[tile_token * 256 + group * 32 + lane], score);
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                score += __shfl_down(score, offset, kWarpSize);
+            }
+            score = __shfl(score, 0, kWarpSize) * 0.0625F;
+            float rescale = 0.0F;
+            float probability = 0.0F;
+            if (lane == 0) {
+                if (score > maximum) {
+                    rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                    probability = 1.0F;
+                    maximum = score;
+                } else {
+                    rescale = 1.0F;
+                    probability = expf(score - maximum);
+                }
+                sum = sum * rescale + probability;
+            }
+            rescale = __shfl(rescale, 0, kWarpSize);
+            probability = __shfl(probability, 0, kWarpSize);
+            maximum = __shfl(maximum, 0, kWarpSize);
+            sum = __shfl(sum, 0, kWarpSize);
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) {
+                const float value = value_tile[tile_token * 256 + group * 32 + lane];
+                accumulator[group] = accumulator[group] * rescale + probability * value;
+            }
+        }
+        __syncthreads();
+    }
+
+    float *destination = partials
+        + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+#pragma unroll
+    for (int group = 0; group < kGroups; ++group) {
+        destination[group * 32 + lane] = accumulator[group];
+    }
+    if (lane == 0) {
+        destination[256] = maximum;
+        destination[257] = sum;
+    }
+}
+
+// Long-context target attention keeps values in Q8_0. Key-score quantization
+// is still N23KV4, but preserving value precision is necessary to retain the
+// target's greedy decisions through stacked full-attention layers.
+__global__ void n23k_q8v_flash_partial_kernel(const N23KV4Group *__restrict__ keys,
+                                               const Q8_0Block *__restrict__ values,
+                                               const std::int8_t *__restrict__ queries,
+                                               const float *__restrict__ query_scales,
+                                               float *__restrict__ partials,
+                                               int context_size, int cache_stride, int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kPartialStride = 258;
+    const int dimension = static_cast<int>(threadIdx.x);
+    const int query_index = static_cast<int>(blockIdx.y);
+    const int batch = query_index / kHeads;
+    const int query_head = query_index % kHeads;
+    const int kv_head = query_head / kHeadsPerKv;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int query_context_size = base_position + batch + 1;
+    const int end = min(query_context_size, begin + chunk);
+    const int group = dimension / 32;
+    const int group_dimension = dimension & 31;
+    const std::size_t query_group = (static_cast<std::size_t>(batch) * kHeads + query_head) * kGroups + group;
+    const float query_scale = query_scales[query_group];
+    const std::int8_t query_value = queries[query_group * 32 + group_dimension];
+    __shared__ float reduction[256];
+    __shared__ float state_max;
+    __shared__ float state_sum;
+    __shared__ float probability;
+    __shared__ float rescale;
+    if (dimension == 0) {
+        state_max = -INFINITY;
+        state_sum = 0.0F;
+    }
+    __syncthreads();
+    float accumulator = 0.0F;
+    for (int token = begin; token < end; ++token) {
+        const auto &key_group = keys[(static_cast<std::size_t>(kv_head) * cache_stride + token) * kGroups + group];
+        const std::uint8_t packed = key_group.quants[group_dimension / 2];
+        const int nibble = (packed >> ((group_dimension & 1) * 4)) & 0x0f;
+        const int key_value = nibble >= 8 ? nibble - 16 : nibble;
+        const float key_scale = __half2float(*reinterpret_cast<const __half *>(&key_group.scale));
+        reduction[dimension] = static_cast<float>(key_value) * static_cast<float>(query_value)
+                             * key_scale * query_scale;
+        __syncthreads();
+        for (int offset = 128; offset > 0; offset /= 2) {
+            if (dimension < offset) reduction[dimension] += reduction[dimension + offset];
+            __syncthreads();
+        }
+        if (dimension == 0) {
+            const float score = reduction[0] * 0.0625F;
+            if (score > state_max) {
+                rescale = isinf(state_max) ? 0.0F : expf(state_max - score);
+                probability = 1.0F;
+                state_max = score;
+            } else {
+                rescale = 1.0F;
+                probability = expf(score - state_max);
+            }
+            state_sum = state_sum * rescale + probability;
+        }
+        __syncthreads();
+        const auto &value_block = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                          * kGroups + group];
+        const float value = static_cast<float>(value_block.qs[group_dimension])
+                          * __half2float(*reinterpret_cast<const __half *>(&value_block.d));
+        accumulator = accumulator * rescale + probability * value;
+        __syncthreads();
+    }
+    float *destination = partials + (static_cast<std::size_t>(query_index) * partitions + partition)
+                                 * kPartialStride;
+    destination[dimension] = accumulator;
+    if (dimension == 0) {
+        destination[256] = state_max;
+        destination[257] = state_sum;
+    }
+}
+
+// Explicit-GQA Q4 flash-attention kernel for gfx1032/RDNA2.
+//
+// One 192-thread workgroup owns one (KV head, token partition). Its six
+// wave32s cover all 48 causal queries that share that KV head. Each wave is
+// divided into eight 4-lane subgroups, so it scores eight queries at once.
+// K/V are decoded once per workgroup into a 16-token LDS tile; no correctness
+// or performance assumption is made about inter-workgroup Infinity-Cache reuse.
+__device__ __forceinline__ int q4x4_sign_extend_bytes(std::uint32_t x) {
+    x &= 0x0f0f0f0fU;
+    return static_cast<int>(x | ((x & 0x08080808U) * 0x1eU));
+}
+
+__device__ __forceinline__ std::uint32_t load_q4_dword_unaligned(
+    const std::uint8_t *__restrict__ p) {
+    std::uint32_t result;
+    __builtin_memcpy(&result, p, sizeof(result));
+    return result;
+}
+
+__device__ __forceinline__ int packed_s8_byte(int packed, int byte_index) {
+    return static_cast<int>(static_cast<std::int8_t>(
+        static_cast<std::uint32_t>(packed) >> (byte_index * 8)));
+}
+
+__global__ __launch_bounds__(192)
+void n23kv4_flash_gqa48_tile16_kernel(
+    const N23KV4Group *__restrict__ keys,
+    const N23KV4Group *__restrict__ values,
+    const std::int8_t *__restrict__ queries,
+    const float *__restrict__ query_scales,
+    float *__restrict__ partials,
+    int context_size, int cache_stride,
+    int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kQueriesPerWave = 8;
+    constexpr int kTileTokens = 16;
+    constexpr int kPartialStride = 258;
+
+    const int thread = static_cast<int>(threadIdx.x);
+    const int wave = thread >> 5;
+    const int lane = thread & 31;
+    const int subgroup = lane >> 2;
+    const int lane4 = lane & 3;
+
+    const int partition = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int partition_end = min(context_size, begin + chunk);
+
+    const int owned_local_query = wave * kQueriesPerWave + subgroup;
+    const int owned_batch = owned_local_query / kHeadsPerKv;
+    const int owned_query_head = kv_head * kHeadsPerKv
+                               + owned_local_query % kHeadsPerKv;
+    const int owned_query_index = owned_batch * kHeads + owned_query_head;
+
+    int query_words[kGroups][2];
+    float query_group_scales[kGroups];
+#pragma unroll
+    for (int group = 0; group < kGroups; ++group) {
+        const std::size_t qg = static_cast<std::size_t>(owned_query_index)
+                             * kGroups + group;
+        const auto *q = queries + qg * 32 + lane4 * 8;
+        query_words[group][0] = static_cast<int>(
+              static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[0]))
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[2])) << 8)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[4])) << 16)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[6])) << 24));
+        query_words[group][1] = static_cast<int>(
+              static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[1]))
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[3])) << 8)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[5])) << 16)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[7])) << 24));
+        query_group_scales[group] = query_scales[qg] * 0.0625F;
+    }
+
+    // 4,096 + 512 + 16,384 = 20,992 bytes of LDS.
+    __shared__ int key_words[kTileTokens][kGroups][8];
+    __shared__ float key_group_scales[kTileTokens][kGroups];
+    __shared__ float value_tile[kTileTokens][kGroups][32];
+
+    float maximum = -INFINITY;
+    float sum = 0.0F;
+    float accumulator[kQueriesPerWave][kGroups] = {};
+
+    for (int tile_begin = begin; tile_begin < partition_end;
+         tile_begin += kTileTokens) {
+        const int tile_count = min(kTileTokens, partition_end - tile_begin);
+        const int loader_tasks = tile_count * kGroups * 3;
+        for (int task = thread; task < loader_tasks;
+             task += static_cast<int>(blockDim.x)) {
+            const int part = task % 3;
+            const int token_group = task / 3;
+            const int tile_token = token_group / kGroups;
+            const int group = token_group - tile_token * kGroups;
+            const int token = tile_begin + tile_token;
+            const std::size_t cache_group =
+                (static_cast<std::size_t>(kv_head) * cache_stride + token)
+                * kGroups + group;
+
+            if (part == 0) {
+                const auto &key_group = keys[cache_group];
+                key_group_scales[tile_token][group] = __half2float(
+                    *reinterpret_cast<const __half *>(&key_group.scale));
+#pragma unroll
+                for (int chunk8 = 0; chunk8 < 4; ++chunk8) {
+                    const std::uint32_t packed = load_q4_dword_unaligned(
+                        key_group.quants + chunk8 * 4);
+                    key_words[tile_token][group][chunk8 * 2]
+                        = q4x4_sign_extend_bytes(packed);
+                    key_words[tile_token][group][chunk8 * 2 + 1]
+                        = q4x4_sign_extend_bytes(packed >> 4);
+                }
+            } else {
+                const auto &value_group = values[cache_group];
+                const float value_scale = __half2float(
+                    *reinterpret_cast<const __half *>(&value_group.scale));
+                const int half = part - 1;
+                const int half_base = half * 16;
+#pragma unroll
+                for (int chunk8 = 0; chunk8 < 2; ++chunk8) {
+                    const std::uint32_t packed = load_q4_dword_unaligned(
+                        value_group.quants + half * 8 + chunk8 * 4);
+                    const int even = q4x4_sign_extend_bytes(packed);
+                    const int odd = q4x4_sign_extend_bytes(packed >> 4);
+                    const int base = half_base + chunk8 * 8;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        value_tile[tile_token][group][base + i * 2]
+                            = static_cast<float>(packed_s8_byte(even, i)) * value_scale;
+                        value_tile[tile_token][group][base + i * 2 + 1]
+                            = static_cast<float>(packed_s8_byte(odd, i)) * value_scale;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll 1
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const int token = tile_begin + tile_token;
+            float score = 0.0F;
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) {
+                int dot = __builtin_amdgcn_sdot4(
+                    key_words[tile_token][group][lane4 * 2],
+                    query_words[group][0], 0, false);
+                dot = __builtin_amdgcn_sdot4(
+                    key_words[tile_token][group][lane4 * 2 + 1],
+                    query_words[group][1], dot, false);
+                score = fmaf(static_cast<float>(dot) * key_group_scales[tile_token][group],
+                             query_group_scales[group], score);
+            }
+            score += __shfl_down(score, 2, 4);
+            score += __shfl_down(score, 1, 4);
+
+            float probability = 0.0F;
+            float rescale = 1.0F;
+            bool raises_maximum = false;
+            if (lane4 == 0 && token < base_position + owned_batch + 1) {
+                raises_maximum = score > maximum;
+                if (raises_maximum) {
+                    rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                    probability = 1.0F;
+                    maximum = score;
+                } else {
+                    probability = expf(score - maximum);
+                }
+                sum = fmaf(sum, rescale, probability);
+            }
+
+            if (__any(raises_maximum)) {
+#pragma unroll
+                for (int query = 0; query < kQueriesPerWave; ++query) {
+                    const float r = __shfl(rescale, query * 4, 32);
+                    if (r != 1.0F) {
+#pragma unroll
+                        for (int group = 0; group < kGroups; ++group) {
+                            accumulator[query][group] *= r;
+                        }
+                    }
+                }
+            }
+
+            float value[kGroups];
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) {
+                value[group] = value_tile[tile_token][group][lane];
+            }
+#pragma unroll
+            for (int query = 0; query < kQueriesPerWave; ++query) {
+                const float p = __shfl(probability, query * 4, 32);
+#pragma unroll
+                for (int group = 0; group < kGroups; ++group) {
+                    accumulator[query][group] = fmaf(p, value[group], accumulator[query][group]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int query = 0; query < kQueriesPerWave; ++query) {
+        const int local_query = wave * kQueriesPerWave + query;
+        const int batch = local_query / kHeadsPerKv;
+        const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+        const int query_index = batch * kHeads + query_head;
+        float *destination = partials
+            + (static_cast<std::size_t>(query_index) * partitions + partition)
+              * kPartialStride;
+#pragma unroll
+        for (int group = 0; group < kGroups; ++group) {
+            destination[group * 32 + lane] = accumulator[query][group];
+        }
+        if (lane == query * 4) {
+            destination[256] = maximum;
+            destination[257] = sum;
+        }
+    }
+}
+
+// Occupancy-oriented companion to GQA48. Two six-wave workgroups cover one
+// KV head, so each lane keeps 32 rather than 64 value accumulators. The K/V
+// tile is consequently traversed twice, which is the intentional trade-off.
+__device__ __forceinline__ int q4x4_expand_sequential(std::uint32_t packed2) {
+    const std::uint32_t nibbles = packed2 & 0xffffU;
+    const std::uint32_t bytes = (nibbles & 0x000fU)
+                              | ((nibbles & 0x00f0U) << 4)
+                              | ((nibbles & 0x0f00U) << 8)
+                              | ((nibbles & 0xf000U) << 12);
+    return q4x4_sign_extend_bytes(bytes);
+}
+
+__global__ __launch_bounds__(192)
+void n23kv4_flash_gqa24_tile16_kernel(
+    const N23KV4Group *__restrict__ keys,
+    const N23KV4Group *__restrict__ values,
+    const std::int8_t *__restrict__ queries,
+    const float *__restrict__ query_scales,
+    float *__restrict__ partials,
+    int context_size, int cache_stride,
+    int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kQueriesPerWave = 4;
+    constexpr int kQueriesPerWorkgroup = 24;
+    constexpr int kQueryGroupsPerKv = 2;
+    constexpr int kTileTokens = 16;
+    constexpr int kPartialStride = 258;
+
+    const int thread = static_cast<int>(threadIdx.x);
+    const int wave = thread >> 5;
+    const int lane = thread & 31;
+    const int subgroup = lane >> 3;
+    const int lane8 = lane & 7;
+    const int partition = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y) / kQueryGroupsPerKv;
+    const int query_group = static_cast<int>(blockIdx.y) % kQueryGroupsPerKv;
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int partition_end = min(context_size, begin + chunk);
+
+    const int owned_local_query = query_group * kQueriesPerWorkgroup
+                                + wave * kQueriesPerWave + subgroup;
+    const int owned_batch = owned_local_query / kHeadsPerKv;
+    const int owned_query_head = kv_head * kHeadsPerKv
+                               + owned_local_query % kHeadsPerKv;
+    const int owned_query_index = owned_batch * kHeads + owned_query_head;
+
+    int query_words[kGroups];
+    float query_group_scales[kGroups];
+#pragma unroll
+    for (int group = 0; group < kGroups; ++group) {
+        const std::size_t qg = static_cast<std::size_t>(owned_query_index) * kGroups + group;
+        const auto *q = queries + qg * 32 + lane8 * 4;
+        query_words[group] = static_cast<int>(
+              static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[0]))
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[1])) << 8)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[2])) << 16)
+            | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[3])) << 24));
+        query_group_scales[group] = query_scales[qg] * 0.0625F;
+    }
+
+    __shared__ int key_words[kTileTokens][kGroups][8];
+    __shared__ float key_group_scales[kTileTokens][kGroups];
+    __shared__ float value_tile[kTileTokens][kGroups][32];
+    float maximum = -INFINITY;
+    float sum = 0.0F;
+    float accumulator[kQueriesPerWave][kGroups] = {};
+
+    for (int tile_begin = begin; tile_begin < partition_end; tile_begin += kTileTokens) {
+        const int tile_count = min(kTileTokens, partition_end - tile_begin);
+        const int loader_tasks = tile_count * kGroups * 3;
+        for (int task = thread; task < loader_tasks; task += static_cast<int>(blockDim.x)) {
+            const int part = task % 3;
+            const int token_group = task / 3;
+            const int tile_token = token_group / kGroups;
+            const int group = token_group - tile_token * kGroups;
+            const int token = tile_begin + tile_token;
+            const std::size_t cache_group =
+                (static_cast<std::size_t>(kv_head) * cache_stride + token) * kGroups + group;
+            if (part == 0) {
+                const auto &key_group = keys[cache_group];
+                key_group_scales[tile_token][group] = __half2float(
+                    *reinterpret_cast<const __half *>(&key_group.scale));
+#pragma unroll
+                for (int word = 0; word < 8; ++word) {
+                    std::uint16_t packed;
+                    __builtin_memcpy(&packed, key_group.quants + word * 2, sizeof(packed));
+                    key_words[tile_token][group][word] = q4x4_expand_sequential(packed);
+                }
+            } else {
+                const auto &value_group = values[cache_group];
+                const float value_scale = __half2float(
+                    *reinterpret_cast<const __half *>(&value_group.scale));
+                const int half = part - 1;
+                const int half_base = half * 16;
+#pragma unroll
+                for (int chunk8 = 0; chunk8 < 2; ++chunk8) {
+                    const std::uint32_t packed = load_q4_dword_unaligned(
+                        value_group.quants + half * 8 + chunk8 * 4);
+                    const int even = q4x4_sign_extend_bytes(packed);
+                    const int odd = q4x4_sign_extend_bytes(packed >> 4);
+                    const int base = half_base + chunk8 * 8;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        value_tile[tile_token][group][base + i * 2]
+                            = static_cast<float>(packed_s8_byte(even, i)) * value_scale;
+                        value_tile[tile_token][group][base + i * 2 + 1]
+                            = static_cast<float>(packed_s8_byte(odd, i)) * value_scale;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (int tile_token = 0; tile_token < tile_count; ++tile_token) {
+            const int token = tile_begin + tile_token;
+            float score = 0.0F;
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) {
+                const int dot = __builtin_amdgcn_sdot4(
+                    key_words[tile_token][group][lane8], query_words[group], 0, false);
+                score = fmaf(static_cast<float>(dot) * key_group_scales[tile_token][group],
+                             query_group_scales[group], score);
+            }
+#pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) score += __shfl_down(score, offset, 8);
+
+            float probability = 0.0F;
+            float rescale = 1.0F;
+            bool raises_maximum = false;
+            if (lane8 == 0 && token < base_position + owned_batch + 1) {
+                raises_maximum = score > maximum;
+                if (raises_maximum) {
+                    rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                    probability = 1.0F;
+                    maximum = score;
+                } else {
+                    probability = expf(score - maximum);
+                }
+                sum = fmaf(sum, rescale, probability);
+            }
+            if (__any(raises_maximum)) {
+#pragma unroll
+                for (int query = 0; query < kQueriesPerWave; ++query) {
+                    const float r = __shfl(rescale, query * 8, 32);
+                    if (r != 1.0F) {
+#pragma unroll
+                        for (int group = 0; group < kGroups; ++group) accumulator[query][group] *= r;
+                    }
+                }
+            }
+            float value[kGroups];
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) value[group] = value_tile[tile_token][group][lane];
+#pragma unroll
+            for (int query = 0; query < kQueriesPerWave; ++query) {
+                const float p = __shfl(probability, query * 8, 32);
+#pragma unroll
+                for (int group = 0; group < kGroups; ++group) {
+                    accumulator[query][group] = fmaf(p, value[group], accumulator[query][group]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int query = 0; query < kQueriesPerWave; ++query) {
+        const int local_query = query_group * kQueriesPerWorkgroup
+                              + wave * kQueriesPerWave + query;
+        const int batch = local_query / kHeadsPerKv;
+        const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+        const int query_index = batch * kHeads + query_head;
+        float *destination = partials
+            + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+#pragma unroll
+        for (int group = 0; group < kGroups; ++group) destination[group * 32 + lane] = accumulator[query][group];
+        if (lane == query * 8) {
+            destination[256] = maximum;
+            destination[257] = sum;
+        }
+    }
+}
+
+__global__ void n23kv4_flash_warp16_kernel(const N23KV4Group *__restrict__ keys,
+                                            const N23KV4Group *__restrict__ values,
+                                            const std::int8_t *__restrict__ queries,
+                                            const float *__restrict__ query_scales,
+                                            float *__restrict__ partials,
+                                            int context_size, int cache_stride,
+                                            int base_position, int partitions) {
+    constexpr int kGroups = 8;
+    constexpr int kHeads = 24;
+    constexpr int kHeadsPerKv = 6;
+    constexpr int kPartialStride = 258;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / kWarpSize;
+    const int lane = thread & (kWarpSize - 1);
+    const int queries_per_group = static_cast<int>(blockDim.x) / kWarpSize;
+    const int query_groups_per_kv = 48 / queries_per_group;
+    const int kv_head = static_cast<int>(blockIdx.x) / query_groups_per_kv;
+    const int local_query_group = static_cast<int>(blockIdx.x) % query_groups_per_kv;
+    const int local_query = local_query_group * queries_per_group + warp;
+    const int batch = local_query / kHeadsPerKv;
+    const int query_head = kv_head * kHeadsPerKv + local_query % kHeadsPerKv;
+    const int query_index = batch * kHeads + query_head;
+    const int partition = static_cast<int>(blockIdx.y);
+    const int chunk = (context_size + partitions - 1) / partitions;
+    const int begin = partition * chunk;
+    const int end = min(min(context_size, begin + chunk), base_position + batch + 1);
+
+    const int lane_group = lane / 8;
+    const int lane_in_group = lane & 7;
+
+    int preloaded_query[2];
+    float preloaded_qscale[2];
+    for (int half = 0; half < 2; ++half) {
+        const int group = half * 4 + lane_group;
+        const std::size_t qg = static_cast<std::size_t>(query_index) * kGroups + group;
+        preloaded_query[half] = *reinterpret_cast<const int *>(
+            queries + qg * 32 + lane_in_group * 4);
+        preloaded_qscale[half] = query_scales[qg] * 0.0625F;
+    }
+
+    float maximum = -INFINITY;
+    float sum = 0.0F;
+    float accumulator[kGroups] = {};
+
+    for (int token = begin; token < end; ++token) {
+        float score = 0.0F;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int group = half * 4 + lane_group;
+            const auto &key_group = keys[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                         * kGroups + group];
+            const auto *nibbles = key_group.quants + 2 * lane_in_group;
+            const std::uint8_t low = nibbles[0];
+            const std::uint8_t high = nibbles[1];
+            const int w0 = ((static_cast<int>(low & 0x0F) ^ 8) - 8);
+            const int w1 = ((static_cast<int>(low >> 4) ^ 8) - 8);
+            const int w2 = ((static_cast<int>(high & 0x0F) ^ 8) - 8);
+            const int w3 = ((static_cast<int>(high >> 4) ^ 8) - 8);
+            const std::uint32_t key_word = static_cast<std::uint8_t>(w0)
+                | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w1)) << 8)
+                | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w2)) << 16)
+                | (static_cast<std::uint32_t>(static_cast<std::uint8_t>(w3)) << 24);
+            const int dot = __builtin_amdgcn_sdot4(static_cast<int>(key_word),
+                                                    preloaded_query[half], 0, false);
+            const float key_scale = __half2float(
+                *reinterpret_cast<const __half *>(&key_group.scale));
+            score += static_cast<float>(dot) * key_scale * preloaded_qscale[half];
+        }
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            const float other = __shfl_down(score, offset, kWarpSize);
+            if (lane_in_group + offset < 8) {
+                score += other;
+            }
+        }
+        score = __shfl(score, 0, kWarpSize) + __shfl(score, 8, kWarpSize)
+              + __shfl(score, 16, kWarpSize) + __shfl(score, 24, kWarpSize);
+
+        float rescale = 1.0F;
+        float probability = 0.0F;
+        if (lane == 0) {
+            if (score > maximum) {
+                rescale = isinf(maximum) ? 0.0F : expf(maximum - score);
+                probability = 1.0F;
+                maximum = score;
+            } else {
+                probability = expf(score - maximum);
+            }
+            sum = sum * rescale + probability;
+        }
+        rescale = __shfl(rescale, 0, kWarpSize);
+        probability = __shfl(probability, 0, kWarpSize);
+
+        if (rescale != 1.0F) {
+#pragma unroll
+            for (int group = 0; group < kGroups; ++group) {
+                accumulator[group] *= rescale;
+            }
+            maximum = __shfl(maximum, 0, kWarpSize);
+            sum = __shfl(sum, 0, kWarpSize);
+        }
+
+#pragma unroll
+        for (int group = 0; group < kGroups; ++group) {
+            const auto &value_group = values[(static_cast<std::size_t>(kv_head) * cache_stride + token)
+                                             * kGroups + group];
+            const auto value_byte = value_group.quants[lane / 2];
+            const int value_nibble = (value_byte >> ((lane & 1) * 4)) & 0x0F;
+            const float value = static_cast<float>((value_nibble ^ 8) - 8)
+                              * __half2float(*reinterpret_cast<const __half *>(&value_group.scale));
+            accumulator[group] += probability * value;
+        }
+    }
+
+    float *destination = partials
+        + (static_cast<std::size_t>(query_index) * partitions + partition) * kPartialStride;
+#pragma unroll
+    for (int group = 0; group < kGroups; ++group) {
+        destination[group * 32 + lane] = accumulator[group];
+    }
+    if (lane == 0) {
+        destination[256] = maximum;
+        destination[257] = sum;
     }
 }
 
@@ -1749,17 +3149,18 @@ float q6k_reference_row(const Q6KBlock *weights, const float *input, std::size_t
         const auto &block = weights[block_index];
         const float scale_all = fp16_to_float(block.d);
         for (int half = 0; half < 2; ++half) {
-            const int offset = half * 64;
-            const int scale_offset = half * 8;
+            const int quant_offset = half * 64;
+            const int value_offset = half * 128;
             for (int lane = 0; lane < kWarpSize; ++lane) {
-                const std::uint8_t low0 = block.low_quants[offset + lane];
-                const std::uint8_t low1 = block.low_quants[offset + lane + 32];
+                const int scale_offset = half * 8 + lane / 16;
+                const std::uint8_t low0 = block.low_quants[quant_offset + lane];
+                const std::uint8_t low1 = block.low_quants[quant_offset + lane + 32];
                 const std::uint8_t high = block.high_quants[half * 32 + lane];
                 const int code0 = static_cast<int>(low0 & 0x0F) + ((high & 0x03) << 4) - 32;
                 const int code1 = static_cast<int>(low1 & 0x0F) + (((high >> 2) & 0x03) << 4) - 32;
                 const int code2 = static_cast<int>(low0 >> 4) + (((high >> 4) & 0x03) << 4) - 32;
                 const int code3 = static_cast<int>(low1 >> 4) + (((high >> 6) & 0x03) << 4) - 32;
-                const std::size_t base = block_index * kQuantBlock + offset + lane;
+                const std::size_t base = block_index * kQuantBlock + value_offset + lane;
                 sum = std::fma(scale_all * static_cast<float>(block.scales[scale_offset]) * static_cast<float>(code0), input[base], sum);
                 sum = std::fma(scale_all * static_cast<float>(block.scales[scale_offset + 2]) * static_cast<float>(code1), input[base + 32], sum);
                 sum = std::fma(scale_all * static_cast<float>(block.scales[scale_offset + 4]) * static_cast<float>(code2), input[base + 64], sum);
@@ -1906,68 +3307,81 @@ std::size_t k_quant_weight_bytes(std::uint32_t type, std::size_t input_size,
     case 13: return (input_size / kQuantBlock) * output_size * sizeof(Q5KBlock);
     case 14: return (input_size / kQuantBlock) * output_size * sizeof(Q6KBlock);
     case 20: return (input_size / kIQ4NLBlock) * output_size * sizeof(IQ4NLBlock);
-    case 21: return (input_size / kQuantBlock) * output_size * sizeof(Q3KBlock);
+    case 21: return (input_size / kQuantBlock) * output_size * sizeof(IQ3SBlock);
     case 23: return (input_size / kQuantBlock) * output_size * sizeof(IQ4XSBlock);
     default: throw std::invalid_argument("matrix is not a supported quant type");
     }
 }
 
+int hybrid_cpu_worker_count() {
+    if (const char *requested = std::getenv("QWEN_NATIVE_CPU_THREADS")) {
+        return std::clamp(std::atoi(requested), 1, 24);
+    }
+    // Match the i5-14600K's 20 schedulable CPUs. Oversubscribing 24 workers
+    // helps isolated CPU-only microbenchmarks but slows concurrent HIP service.
+    return 20;
+}
+
 void launch_k_matvec_batch8(std::uint32_t type, const void *weights, const float *input,
-                            float *output, std::size_t input_size, std::size_t output_size) {
+                            float *output, std::size_t input_size, std::size_t output_size,
+                            hipStream_t stream = nullptr) {
     const dim3 grid(static_cast<unsigned int>(output_size));
     const dim3 block(kWarpSize);
     switch (type) {
     case 8:
-        hipLaunchKernelGGL(q8_0_matvec_batch8_kernel, grid, block, 0, nullptr,
+        hipLaunchKernelGGL(q8_0_matvec_batch8_kernel, grid, block, 0, stream,
                            static_cast<const Q8_0Block *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQ8Block),
                            static_cast<int>(output_size));
         return;
     case 11:
-        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, nullptr,
+        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, stream,
                            static_cast<const Q3KBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
-    case 12:
-        hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid, block, 0, nullptr,
+    case 12: {
+        const dim3 grid4(static_cast<unsigned int>((output_size + 3) / 4));
+        const dim3 block4(kWarpSize, 4);
+        hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid4, block4, 0, stream,
                            static_cast<const Q4KBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
+    }
     case 13:
-        hipLaunchKernelGGL(q5k_matvec_batch8_kernel, grid, block, 0, nullptr,
+        hipLaunchKernelGGL(q5k_matvec_batch8_kernel, grid, block, 0, stream,
                            static_cast<const Q5KBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
     case 14:
-        hipLaunchKernelGGL(q6k_matvec_batch8_kernel, grid, block, 0, nullptr,
+        hipLaunchKernelGGL(q6k_matvec_batch8_kernel, grid, block, 0, stream,
                            static_cast<const Q6KBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
     case 20:
-        hipLaunchKernelGGL(iq4nl_matvec_batch8_kernel, grid, block, 0, nullptr,
+        hipLaunchKernelGGL(iq4nl_matvec_batch8_kernel, grid, block, 0, stream,
                            static_cast<const IQ4NLBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kIQ4NLBlock),
                            static_cast<int>(output_size));
         return;
     case 21:
-        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, nullptr,
-                           static_cast<const Q3KBlock *>(weights), input, output,
+        hipLaunchKernelGGL(iq3s_matvec_batch8_kernel, grid, block, 0, stream,
+                           static_cast<const IQ3SBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
     case 23:
-        hipLaunchKernelGGL(iq4xs_matvec_batch8_kernel, grid, block, 0, nullptr,
+        hipLaunchKernelGGL(iq4xs_matvec_batch8_kernel, grid, block, 0, stream,
                            static_cast<const IQ4XSBlock *>(weights), input, output,
                            static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
@@ -2008,9 +3422,14 @@ void launch_k_matvec(std::uint32_t type, const void *weights, const float *input
                            static_cast<int>(output_size));
         return;
     case 11:
-    case 21:
         hipLaunchKernelGGL(q3k_matvec_kernel, grid, block, 0, nullptr,
                            static_cast<const Q3KBlock *>(weights), input, output,
+                           static_cast<int>(input_size / kQuantBlock),
+                           static_cast<int>(output_size));
+        return;
+    case 21:
+        hipLaunchKernelGGL(iq3s_matvec_kernel, grid, block, 0, nullptr,
+                           static_cast<const IQ3SBlock *>(weights), input, output,
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         return;
@@ -2342,6 +3761,55 @@ Q4KBenchmarkResult benchmark_q6k_batch8(const void *weights, std::size_t input_s
                                         q6k_reference_row);
 }
 
+Q4KBenchmarkResult benchmark_host_mapped_batch8(const void *weights, std::uint32_t type,
+                                                std::size_t input_size,
+                                                std::size_t output_size, int iterations) {
+    if (!weights || input_size == 0 || output_size == 0 || iterations <= 0) {
+        throw std::invalid_argument("invalid mapped-host benchmark arguments");
+    }
+    void *device_weights = nullptr;
+    hip_check(hipHostGetDevicePointer(&device_weights, const_cast<void *>(weights), 0),
+              "mapped-host weight pointer");
+    std::vector<float> input(8 * input_size);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = std::sin(static_cast<float>(index + 1) * 0.00137F);
+    }
+    float *device_input = nullptr;
+    float *device_output = nullptr;
+    hipEvent_t begin = nullptr;
+    hipEvent_t end = nullptr;
+    hip_check(hipMalloc(reinterpret_cast<void **>(&device_input), input.size() * sizeof(float)),
+              "mapped-host benchmark input");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&device_output),
+                        8 * output_size * sizeof(float)), "mapped-host benchmark output");
+    hip_check(hipMemcpy(device_input, input.data(), input.size() * sizeof(float),
+                        hipMemcpyHostToDevice), "mapped-host benchmark upload input");
+    hip_check(hipEventCreate(&begin), "mapped-host benchmark begin event");
+    hip_check(hipEventCreate(&end), "mapped-host benchmark end event");
+    launch_k_matvec_batch8(type, device_weights, device_input, device_output,
+                           input_size, output_size);
+    hip_check(hipDeviceSynchronize(), "mapped-host benchmark warmup");
+    hip_check(hipEventRecord(begin), "mapped-host benchmark record begin");
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        launch_k_matvec_batch8(type, device_weights, device_input, device_output,
+                               input_size, output_size);
+    }
+    hip_check(hipEventRecord(end), "mapped-host benchmark record end");
+    hip_check(hipEventSynchronize(end), "mapped-host benchmark wait");
+    float elapsed_ms = 0.0F;
+    hip_check(hipEventElapsedTime(&elapsed_ms, begin, end),
+              "mapped-host benchmark elapsed");
+    Q4KBenchmarkResult result;
+    result.milliseconds = elapsed_ms / iterations;
+    result.bandwidth_gbps = static_cast<float>(k_quant_weight_bytes(type, input_size, output_size))
+                          / (result.milliseconds * 1.0e6F);
+    hip_check(hipEventDestroy(end), "mapped-host destroy end");
+    hip_check(hipEventDestroy(begin), "mapped-host destroy begin");
+    hip_check(hipFree(device_output), "mapped-host free output");
+    hip_check(hipFree(device_input), "mapped-host free input");
+    return result;
+}
+
 void execute_k_matvec(const void *weights, std::uint32_t weight_type,
                       const float *input, std::size_t input_size,
                       float *output, std::size_t output_size) {
@@ -2359,6 +3827,11 @@ void execute_k_matvec(const void *weights, std::uint32_t weight_type,
 
 void set_resident_weight_cache_budget(std::size_t bytes) {
     resident_weight_cache().set_budget(bytes);
+}
+
+void clear_resident_weight_cache() {
+    resident_weight_cache().clear();
+    clear_cpu_packed_matrix_cache();
 }
 
 ResidentWeightCacheStats resident_weight_cache_stats() {
@@ -2436,11 +3909,64 @@ void execute_k_matvec_cached_batch8(const void *weights, std::uint32_t weight_ty
               "hipMemcpy native cached batch8 matvec output");
 }
 
+void execute_k_matvec_hybrid_cached_batch8(const void *weights, std::uint32_t weight_type,
+                                           const float *input, std::size_t input_size,
+                                           float *output, std::size_t output_size,
+                                           bool keep_resident) {
+    constexpr std::size_t batch_size = 8;
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &cache = resident_weight_cache();
+    if (cache.find_or_add(weights, weight_bytes, keep_resident) != nullptr || output_size < 256) {
+        execute_k_matvec_cached_batch8(weights, weight_type, input, input_size,
+                                       output, output_size, keep_resident);
+        return;
+    }
+    std::size_t cpu_rows = output_size * 3 / 10;
+    if (weight_type == 12 || weight_type == 13 || weight_type == 14) {
+        cpu_rows = output_size * 2 / 3;
+    } else if (weight_type == 23) {
+        cpu_rows = output_size * 3 / 5;
+    }
+    cpu_rows -= cpu_rows % 8;
+    const std::size_t gpu_rows = output_size - cpu_rows;
+    const std::size_t row_bytes = weight_bytes / output_size;
+    std::vector<float> cpu_output(batch_size * cpu_rows);
+    std::vector<float> gpu_output(batch_size * gpu_rows);
+    auto cpu_work = std::async(std::launch::async, [&] {
+        cpu_quant_matvec_batch8_rows_packed(weights, weight_type, input, input_size,
+                                            cpu_output.data(), cpu_rows,
+                                            hybrid_cpu_worker_count());
+    });
+
+    auto &workspace = matvec_workspace();
+    workspace.reserve_weights(gpu_rows * row_bytes);
+    workspace.reserve_input(batch_size * input_size);
+    workspace.reserve_output(batch_size * gpu_rows);
+    const auto *gpu_weights = static_cast<const std::uint8_t *>(weights) + cpu_rows * row_bytes;
+    hip_check(hipMemcpy(workspace.weights, gpu_weights, gpu_rows * row_bytes, hipMemcpyHostToDevice),
+              "hybrid cached batch8 weights");
+    hip_check(hipMemcpy(workspace.input, input, batch_size * input_size * sizeof(float), hipMemcpyHostToDevice),
+              "hybrid cached batch8 input");
+    launch_k_matvec_batch8(weight_type, workspace.weights, workspace.input, workspace.output,
+                           input_size, gpu_rows);
+    hip_check(hipGetLastError(), "hybrid cached batch8 GPU launch");
+    hip_check(hipMemcpy(gpu_output.data(), workspace.output,
+                        batch_size * gpu_rows * sizeof(float), hipMemcpyDeviceToHost),
+              "hybrid cached batch8 GPU output");
+    cpu_work.get();
+    for (std::size_t batch = 0; batch < batch_size; ++batch) {
+        std::copy_n(cpu_output.data() + batch * cpu_rows, cpu_rows,
+                    output + batch * output_size);
+        std::copy_n(gpu_output.data() + batch * gpu_rows, gpu_rows,
+                    output + batch * output_size + cpu_rows);
+    }
+}
+
 void *create_gated_delta_state() {
     constexpr std::size_t state_values = 48ULL * 128ULL * 128ULL;
     void *state = nullptr;
-    hip_check(hipMalloc(&state, state_values * sizeof(__half)), "hipMalloc gated-delta state");
-    hip_check(hipMemset(state, 0, state_values * sizeof(__half)), "hipMemset gated-delta state");
+    hip_check(hipMalloc(&state, state_values * sizeof(float)), "hipMalloc gated-delta state");
+    hip_check(hipMemset(state, 0, state_values * sizeof(float)), "hipMemset gated-delta state");
     return state;
 }
 
@@ -2455,11 +3981,7 @@ void upload_gated_delta_state(void *state, const float *host_state) {
         throw std::invalid_argument("gated-delta upload requires state and host data");
     }
     constexpr std::size_t state_values = 48ULL * 128ULL * 128ULL;
-    std::vector<__half> packed(state_values);
-    for (std::size_t index = 0; index < state_values; ++index) {
-        packed[index] = __float2half(host_state[index]);
-    }
-    hip_check(hipMemcpy(state, packed.data(), packed.size() * sizeof(__half), hipMemcpyHostToDevice),
+    hip_check(hipMemcpy(state, host_state, state_values * sizeof(float), hipMemcpyHostToDevice),
               "hipMemcpy gated-delta state upload");
 }
 
@@ -2468,12 +3990,8 @@ void download_gated_delta_state(const void *state, float *host_state) {
         throw std::invalid_argument("gated-delta download requires state and host data");
     }
     constexpr std::size_t state_values = 48ULL * 128ULL * 128ULL;
-    std::vector<__half> packed(state_values);
-    hip_check(hipMemcpy(packed.data(), state, packed.size() * sizeof(__half), hipMemcpyDeviceToHost),
+    hip_check(hipMemcpy(host_state, state, state_values * sizeof(float), hipMemcpyDeviceToHost),
               "hipMemcpy gated-delta state download");
-    for (std::size_t index = 0; index < state_values; ++index) {
-        host_state[index] = __half2float(packed[index]);
-    }
 }
 
 void execute_gated_delta_step(const float *queries, const float *keys,
@@ -2526,7 +4044,7 @@ void execute_gated_delta_step(const float *queries, const float *keys,
               "hipMemcpy gated-delta betas");
     hipLaunchKernelGGL(gated_delta_step_kernel, dim3(48), dim3(256), 0, nullptr,
                        workspace.queries, workspace.keys, workspace.values,
-                       workspace.decays, workspace.betas, static_cast<__half *>(state),
+                       workspace.decays, workspace.betas, static_cast<float *>(state),
                        workspace.output, 128);
     hip_check(hipGetLastError(), "gated-delta step launch");
     hip_check(hipMemcpy(output, workspace.output, vector_values * sizeof(float), hipMemcpyDeviceToHost),
@@ -2592,7 +4110,7 @@ void execute_gated_delta_step_batch8(const float *queries, const float *keys,
               "hipMemcpy gated-delta-b8 betas");
     hipLaunchKernelGGL(gated_delta_step_batch8_kernel, dim3(48), dim3(256), 0, nullptr,
                        workspace.queries, workspace.keys, workspace.values,
-                       workspace.decays, workspace.betas, static_cast<__half *>(state),
+                       workspace.decays, workspace.betas, static_cast<float *>(state),
                        workspace.output, 128, batch_count);
     hip_check(hipGetLastError(), "gated-delta-b8 step launch");
     hip_check(hipMemcpy(output, workspace.output, total_vectors * sizeof(float), hipMemcpyDeviceToHost),
@@ -2621,6 +4139,10 @@ void preload_n23q4_matrix(const void *weights, std::size_t input_size, std::size
         return;
     }
     cache.entries.emplace(weights, N23DraftCache::Entry{device, input_size, output_size});
+}
+
+bool has_n23q4_matrix(const void *weights) {
+    return n23_draft_cache().entries.count(weights) != 0;
 }
 
 void execute_n23q4_batch8_cached(const void *weights, const float *input,
@@ -2961,7 +4483,7 @@ Q4KBenchmarkResult benchmark_gated_delta_step(int iterations) {
     std::vector<float> values(vector_values);
     std::vector<float> decays(value_heads);
     std::vector<float> betas(value_heads);
-    std::vector<std::uint16_t> reference_state(state_values, 0);
+    std::vector<float> reference_state(state_values, 0.0F);
     std::vector<float> reference_output(vector_values);
     std::vector<float> output(vector_values);
     std::mt19937 generator(42);
@@ -2982,24 +4504,25 @@ Q4KBenchmarkResult benchmark_gated_delta_step(int iterations) {
             for (int row = 0; row < head_size; ++row) {
                 float sum = 0.0F;
                 for (int column = 0; column < head_size; ++column) {
-                    sum = std::fma(fp16_to_float(reference_state[state_offset + static_cast<std::size_t>(row) * head_size + column]),
+                    sum = std::fma(reference_state[state_offset + static_cast<std::size_t>(row) * head_size + column],
                                    keys[vector_offset + column], sum);
                 }
                 state_key[row] = sum;
             }
             for (int row = 0; row < head_size; ++row) {
-                const float update = (values[vector_offset + row] - state_key[row]) * betas[head];
+                const float update = (values[vector_offset + row] - decays[head] * state_key[row])
+                                   * betas[head];
                 for (int column = 0; column < head_size; ++column) {
                     const std::size_t offset = state_offset + static_cast<std::size_t>(row) * head_size + column;
-                    const float next = decays[head] * fp16_to_float(reference_state[offset])
+                    const float next = decays[head] * reference_state[offset]
                                      + update * keys[vector_offset + column];
-                    reference_state[offset] = float_to_fp16(next);
+                    reference_state[offset] = next;
                 }
             }
             for (int row = 0; row < head_size; ++row) {
                 float sum = 0.0F;
                 for (int column = 0; column < head_size; ++column) {
-                    sum = std::fma(fp16_to_float(reference_state[state_offset + static_cast<std::size_t>(row) * head_size + column]),
+                    sum = std::fma(reference_state[state_offset + static_cast<std::size_t>(row) * head_size + column],
                                    queries[vector_offset + column], sum);
                 }
                 reference_output[vector_offset + row] = sum;
@@ -3012,7 +4535,7 @@ Q4KBenchmarkResult benchmark_gated_delta_step(int iterations) {
     float *device_values = nullptr;
     float *device_decays = nullptr;
     float *device_betas = nullptr;
-    __half *device_states = nullptr;
+    float *device_states = nullptr;
     float *device_output = nullptr;
     hipEvent_t begin = nullptr;
     hipEvent_t end = nullptr;
@@ -3022,14 +4545,14 @@ Q4KBenchmarkResult benchmark_gated_delta_step(int iterations) {
         hip_check(hipMalloc(reinterpret_cast<void **>(&device_values), values.size() * sizeof(float)), "hipMalloc GDN values");
         hip_check(hipMalloc(reinterpret_cast<void **>(&device_decays), decays.size() * sizeof(float)), "hipMalloc GDN decays");
         hip_check(hipMalloc(reinterpret_cast<void **>(&device_betas), betas.size() * sizeof(float)), "hipMalloc GDN betas");
-        hip_check(hipMalloc(reinterpret_cast<void **>(&device_states), state_values * sizeof(__half)), "hipMalloc GDN states");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&device_states), state_values * sizeof(float)), "hipMalloc GDN states");
         hip_check(hipMalloc(reinterpret_cast<void **>(&device_output), output.size() * sizeof(float)), "hipMalloc GDN output");
         hip_check(hipMemcpy(device_queries, queries.data(), queries.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy GDN queries");
         hip_check(hipMemcpy(device_keys, keys.data(), keys.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy GDN keys");
         hip_check(hipMemcpy(device_values, values.data(), values.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy GDN values");
         hip_check(hipMemcpy(device_decays, decays.data(), decays.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy GDN decays");
         hip_check(hipMemcpy(device_betas, betas.data(), betas.size() * sizeof(float), hipMemcpyHostToDevice), "hipMemcpy GDN betas");
-        hip_check(hipMemset(device_states, 0, state_values * sizeof(__half)), "hipMemset GDN states");
+        hip_check(hipMemset(device_states, 0, state_values * sizeof(float)), "hipMemset GDN states");
         hip_check(hipEventCreate(&begin), "hipEventCreate GDN begin");
         hip_check(hipEventCreate(&end), "hipEventCreate GDN end");
 
@@ -3059,7 +4582,7 @@ Q4KBenchmarkResult benchmark_gated_delta_step(int iterations) {
 
         Q4KBenchmarkResult result;
         result.milliseconds = elapsed / static_cast<float>(iterations);
-        const std::size_t state_bytes = state_values * sizeof(__half);
+        const std::size_t state_bytes = state_values * sizeof(float);
         result.bandwidth_gbps = static_cast<float>(3 * state_bytes)
                               / (result.milliseconds * 1.0e6F);
         for (std::size_t index = 0; index < output.size(); ++index) {
@@ -3593,7 +5116,8 @@ Q4KBenchmarkResult benchmark_n23kv4_flash_batch8(std::size_t context_size,
         auto launch = [&] {
             hipLaunchKernelGGL(n23kv4_flash_partial_kernel, partial_grid, partial_block, 0, nullptr,
                                device_keys, device_values, device_queries, device_query_scales,
-                               device_partials, static_cast<int>(context_size), partitions);
+                               device_partials, static_cast<int>(context_size), static_cast<int>(context_size),
+                               static_cast<int>(context_size) - 1, partitions);
             hipLaunchKernelGGL(n23kv4_flash_reduce_kernel, reduce_grid, reduce_block, 0, nullptr,
                                device_partials, device_output, partitions);
         };
@@ -3680,17 +5204,19 @@ Q4KBenchmarkResult benchmark_n23kv4_flash_batch8(std::size_t context_size,
 
 // ─── Device-resident pipelined executor ───────────────────────────────────────
 
-__global__ void rms_norm_batch8_kernel(float *__restrict__ data,
+__global__ void rms_norm_batch8_kernel(const float *__restrict__ src,
+                                       float *__restrict__ dst,
                                        const float *__restrict__ weights,
                                        int width, float epsilon) {
     const int batch = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     extern __shared__ float shared[];
 
-    float *row = data + static_cast<std::size_t>(batch) * width;
+    const float *in_row = src + static_cast<std::size_t>(batch) * width;
+    float *out_row = dst + static_cast<std::size_t>(batch) * width;
     float local_sum = 0.0F;
     for (int i = tid; i < width; i += static_cast<int>(blockDim.x)) {
-        const float v = row[i];
+        const float v = in_row[i];
         local_sum = fmaf(v, v, local_sum);
     }
     shared[tid] = local_sum;
@@ -3701,7 +5227,7 @@ __global__ void rms_norm_batch8_kernel(float *__restrict__ data,
     }
     const float scale = rsqrtf(shared[0] / static_cast<float>(width) + epsilon);
     for (int i = tid; i < width; i += static_cast<int>(blockDim.x)) {
-        row[i] *= scale * weights[i];
+        out_row[i] = in_row[i] * (scale * weights[i]);
     }
 }
 
@@ -3724,6 +5250,18 @@ __global__ void vector_copy_kernel(float *__restrict__ dest,
     }
 }
 
+__global__ void scatter_hybrid_rows_kernel(const float *__restrict__ packed,
+                                           float *__restrict__ output,
+                                           int row_offset, int packed_rows, int output_rows) {
+    const int index = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                    + static_cast<int>(threadIdx.x);
+    if (index < 8 * packed_rows) {
+        const int batch = index / packed_rows;
+        const int row = index % packed_rows;
+        output[static_cast<std::size_t>(batch) * output_rows + row_offset + row] = packed[index];
+    }
+}
+
 __global__ void silu_multiply_batch8_kernel(float *__restrict__ gate,
                                             const float *__restrict__ up, int count) {
     const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
@@ -3734,13 +5272,67 @@ __global__ void silu_multiply_batch8_kernel(float *__restrict__ gate,
     }
 }
 
+struct AsyncWorker {
+    std::mutex mu;
+    std::condition_variable cv_start;
+    std::condition_variable cv_done;
+    std::function<void()> job;
+    bool done = true;
+    bool stop = false;
+    std::thread th;
+
+    AsyncWorker() {
+        th = std::thread([this] {
+            std::unique_lock<std::mutex> lock(mu);
+            while (!stop) {
+                cv_start.wait(lock, [this] { return stop || !done; });
+                if (stop) break;
+                auto current_job = std::move(job);
+                lock.unlock();
+                current_job();
+                lock.lock();
+                done = true;
+                cv_done.notify_all();
+            }
+        });
+    }
+
+    ~AsyncWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            stop = true;
+        }
+        cv_start.notify_all();
+        if (th.joinable()) th.join();
+    }
+
+    void submit(std::function<void()> f) {
+        std::unique_lock<std::mutex> lock(mu);
+        job = std::move(f);
+        done = false;
+        cv_start.notify_one();
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mu);
+        cv_done.wait(lock, [this] { return done; });
+    }
+};
+
 struct DevicePipeline {
     hipStream_t compute_stream = nullptr;
     hipStream_t transfer_stream = nullptr;
+    AsyncWorker async_worker;
 
     float *hidden = nullptr;
-    float *slots[4] = {};
+    float *slots[5] = {};
     float *norm_weights_device = nullptr;
+    float *hybrid_output = nullptr;
+    void *hybrid_weights = nullptr;
+    float *hybrid_host_input = nullptr;
+    float *hybrid_host_output = nullptr;
+    float *hybrid_host_output2 = nullptr;
+    float *hybrid_host_output3 = nullptr;
 
     void *weight_buf[2] = {};
     std::size_t weight_buf_capacity = 0;
@@ -3758,6 +5350,8 @@ struct DevicePipeline {
     std::size_t inline_prefetched_bytes = 0;
     hipEvent_t inline_done = nullptr;
     bool inline_done_valid = false;
+    hipEvent_t inline_consumed = nullptr;
+    bool inline_consumed_valid = false;
 
     std::size_t embedding_size = 0;
     std::size_t ffn_size = 0;
@@ -3767,11 +5361,18 @@ struct DevicePipeline {
         if (hidden) (void)hipFree(hidden);
         for (auto &s : slots) if (s) (void)hipFree(s);
         if (norm_weights_device) (void)hipFree(norm_weights_device);
+        if (hybrid_output) (void)hipFree(hybrid_output);
+        if (hybrid_weights) (void)hipFree(hybrid_weights);
+        if (hybrid_host_input) (void)hipHostFree(hybrid_host_input);
+        if (hybrid_host_output) (void)hipHostFree(hybrid_host_output);
+        if (hybrid_host_output2) (void)hipHostFree(hybrid_host_output2);
+        if (hybrid_host_output3) (void)hipHostFree(hybrid_host_output3);
         for (auto &w : weight_buf) if (w) (void)hipFree(w);
         for (auto &e : weight_consumed) if (e) (void)hipEventDestroy(e);
         for (auto &e : transfer_done) if (e) (void)hipEventDestroy(e);
         if (inline_buf) (void)hipFree(inline_buf);
         if (inline_done) (void)hipEventDestroy(inline_done);
+        if (inline_consumed) (void)hipEventDestroy(inline_consumed);
         if (compute_stream) (void)hipStreamDestroy(compute_stream);
         if (transfer_stream) (void)hipStreamDestroy(transfer_stream);
     }
@@ -3795,6 +5396,20 @@ DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t f
     }
     const std::size_t norm_bytes = std::max(embedding_size, ffn_size) * sizeof(float);
     hip_check(hipMalloc(reinterpret_cast<void **>(&p->norm_weights_device), norm_bytes), "pipeline norm");
+    const bool use_hybrid_rows = std::getenv("QWEN_NATIVE_HYBRID") != nullptr;
+    const bool use_hybrid_ffn = std::getenv("QWEN_NATIVE_HYBRID_FFN") != nullptr;
+    const bool use_cpu_gate = !std::getenv("QWEN_NATIVE_GPU_GATE");
+    if (use_hybrid_rows || use_hybrid_ffn || use_cpu_gate) {
+        const std::size_t hybrid_bytes = 8 * std::max(embedding_size, ffn_size) * sizeof(float);
+        hip_check(hipHostMalloc(reinterpret_cast<void **>(&p->hybrid_host_input), hybrid_bytes, hipHostMallocDefault),
+                  "pipeline pinned host input");
+        hip_check(hipHostMalloc(reinterpret_cast<void **>(&p->hybrid_host_output), hybrid_bytes, hipHostMallocDefault),
+                  "pipeline pinned host output");
+        hip_check(hipHostMalloc(reinterpret_cast<void **>(&p->hybrid_host_output2), hybrid_bytes, hipHostMallocDefault),
+                  "pipeline pinned host output2");
+        hip_check(hipHostMalloc(reinterpret_cast<void **>(&p->hybrid_host_output3), hybrid_bytes, hipHostMallocDefault),
+                  "pipeline pinned host output3");
+    }
 
     p->weight_buf_capacity = max_weight_bytes;
     for (auto &w : p->weight_buf) {
@@ -3806,10 +5421,11 @@ DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t f
     for (auto &e : p->transfer_done) {
         hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline transfer done event");
     }
-    const std::size_t inline_capacity = 36ULL * 1024 * 1024;
-    hip_check(hipMalloc(&p->inline_buf, inline_capacity), "pipeline inline buf");
-    p->inline_buf_capacity = inline_capacity;
+    hip_check(hipMalloc(&p->inline_buf, max_weight_bytes), "pipeline inline buf");
+    p->inline_buf_capacity = max_weight_bytes;
     hip_check(hipEventCreateWithFlags(&p->inline_done, hipEventDisableTiming), "pipeline inline event");
+    hip_check(hipEventCreateWithFlags(&p->inline_consumed, hipEventDisableTiming),
+              "pipeline inline consumed event");
     return p;
 }
 
@@ -3829,17 +5445,26 @@ void pipeline_download_hidden(DevicePipeline *pipeline, float *host, std::size_t
               "pipeline download hidden");
 }
 
+void pipeline_download_hidden_async(DevicePipeline *pipeline, float *host, std::size_t count) {
+    hip_check(hipMemcpyAsync(host, pipeline->hidden, count * sizeof(float), hipMemcpyDeviceToHost,
+                             pipeline->compute_stream),
+              "pipeline download hidden async");
+}
+
 void pipeline_rms_norm(DevicePipeline *pipeline, const float *norm_weights,
-                       std::size_t width, float epsilon) {
+                       std::size_t width, float epsilon,
+                       float *destination, const float *source) {
     hip_check(hipMemcpyAsync(pipeline->norm_weights_device, norm_weights,
                              width * sizeof(float), hipMemcpyHostToDevice,
                              pipeline->compute_stream),
               "pipeline upload norm weights");
     constexpr int threads = 256;
     const std::size_t shared = threads * sizeof(float);
+    const float *src = source ? source : pipeline->hidden;
+    float *dst = destination ? destination : pipeline->hidden;
     hipLaunchKernelGGL(rms_norm_batch8_kernel, dim3(8), dim3(threads), shared,
                        pipeline->compute_stream,
-                       pipeline->hidden, pipeline->norm_weights_device,
+                       src, dst, pipeline->norm_weights_device,
                        static_cast<int>(width), epsilon);
 }
 
@@ -3850,6 +5475,14 @@ void pipeline_residual_add(DevicePipeline *pipeline, int source_slot) {
     hipLaunchKernelGGL(vector_add_batch8_kernel, dim3(blocks), dim3(threads), 0,
                        pipeline->compute_stream,
                        pipeline->hidden, pipeline->slots[source_slot], count);
+}
+
+float *pipeline_slot_ptr(DevicePipeline *pipeline, int slot) {
+    return pipeline->slots[slot];
+}
+
+float *pipeline_hidden_ptr(DevicePipeline *pipeline) {
+    return pipeline->hidden;
 }
 
 void pipeline_save_hidden(DevicePipeline *pipeline, int slot, std::size_t count) {
@@ -3887,11 +5520,13 @@ void pipeline_download_slots3(DevicePipeline *pipeline,
 
 void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
                              std::uint32_t type, std::size_t input_size,
-                             std::size_t output_size, bool keep_resident, int output_slot) {
+                             std::size_t output_size, bool keep_resident, int output_slot,
+                             const float *input_buffer) {
     const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
     auto &cache = resident_weight_cache();
     const void *device_weights = cache.find_or_add(weights, weight_bytes, keep_resident);
     int used_buf = -1;
+    bool used_inline = false;
 
     if (!device_weights) {
         int found_buf = -1;
@@ -3904,7 +5539,7 @@ void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
         }
         if (found_buf >= 0) {
             if (pipeline->transfer_done_valid[found_buf]) {
-                hip_check(hipEventSynchronize(pipeline->transfer_done[found_buf]),
+                hip_check(hipStreamWaitEvent(pipeline->compute_stream, pipeline->transfer_done[found_buf], 0),
                           "pipeline wait prefetch buf");
                 pipeline->transfer_done_valid[found_buf] = false;
             }
@@ -3914,12 +5549,13 @@ void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
         } else if (pipeline->inline_prefetched_ptr == weights &&
                    pipeline->inline_prefetched_bytes == weight_bytes) {
             if (pipeline->inline_done_valid) {
-                hip_check(hipEventSynchronize(pipeline->inline_done),
+                hip_check(hipStreamWaitEvent(pipeline->compute_stream, pipeline->inline_done, 0),
                           "pipeline wait inline prefetch");
                 pipeline->inline_done_valid = false;
             }
             device_weights = pipeline->inline_buf;
             pipeline->inline_prefetched_ptr = nullptr;
+            used_inline = true;
         } else {
             int buf = -1;
             for (int b = 0; b < 2; ++b) {
@@ -3946,62 +5582,66 @@ void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
         }
     }
 
+    const float *in_act = input_buffer ? input_buffer : pipeline->hidden;
     float *out = pipeline->slots[output_slot];
     const dim3 grid(static_cast<unsigned>(output_size));
     const dim3 block(kWarpSize);
     switch (type) {
     case 8:
         hipLaunchKernelGGL(q8_0_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const Q8_0Block *>(device_weights), pipeline->hidden,
+                           static_cast<const Q8_0Block *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQ8Block),
                            static_cast<int>(output_size));
         break;
     case 11:
         hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const Q3KBlock *>(device_weights), pipeline->hidden,
+                           static_cast<const Q3KBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         break;
-    case 12:
-        hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const Q4KBlock *>(device_weights), pipeline->hidden,
+    case 12: {
+        const dim3 grid4(static_cast<unsigned>((output_size + 3) / 4));
+        const dim3 block4(kWarpSize, 4);
+        hipLaunchKernelGGL(q4k_matvec_batch8_kernel, grid4, block4, 0, pipeline->compute_stream,
+                           static_cast<const Q4KBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         break;
+    }
     case 13:
         hipLaunchKernelGGL(q5k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const Q5KBlock *>(device_weights), pipeline->hidden,
+                           static_cast<const Q5KBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         break;
     case 14:
         hipLaunchKernelGGL(q6k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const Q6KBlock *>(device_weights), pipeline->hidden,
+                           static_cast<const Q6KBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         break;
     case 20:
         hipLaunchKernelGGL(iq4nl_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const IQ4NLBlock *>(device_weights), pipeline->hidden,
+                           static_cast<const IQ4NLBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kIQ4NLBlock),
                            static_cast<int>(output_size));
         break;
     case 21:
-        hipLaunchKernelGGL(q3k_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const Q3KBlock *>(device_weights), pipeline->hidden,
+        hipLaunchKernelGGL(iq3s_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
+                           static_cast<const IQ3SBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
         break;
     case 23:
         hipLaunchKernelGGL(iq4xs_matvec_batch8_kernel, grid, block, 0, pipeline->compute_stream,
-                           static_cast<const IQ4XSBlock *>(device_weights), pipeline->hidden,
+                           static_cast<const IQ4XSBlock *>(device_weights), in_act,
                            out, static_cast<int>(input_size),
                            static_cast<int>(input_size / kQuantBlock),
                            static_cast<int>(output_size));
@@ -4014,6 +5654,335 @@ void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
                   "pipeline record weight consumed");
         pipeline->weight_consumed_valid[used_buf] = true;
     }
+    if (used_inline) {
+        hip_check(hipEventRecord(pipeline->inline_consumed, pipeline->compute_stream),
+                  "pipeline record inline consumed");
+        pipeline->inline_consumed_valid = true;
+    }
+}
+
+std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size) {
+    // Balance exact output-row shards from measured per-format throughput.
+    // Q4_K/Q5_K/IQ4_XS sustain about 24 GB/s, Q6_K about 19 GB/s, and
+    // streamed GPU rows about 10 GB/s on this host. Keep row counts aligned
+    // to the eight-row CPU SoA tiles.
+    std::size_t numerator = 1;
+    std::size_t denominator = 2;
+    if (type == 12 || type == 13 || type == 23) {
+        numerator = 7; denominator = 10;
+    } else if (type == 14) {
+        numerator = 2; denominator = 3;
+    } else if (type == 11 || type == 21) {
+        numerator = 1; denominator = 5;
+    } else if (type == 20) {
+        numerator = 2; denominator = 5;
+    }
+    if (const char *split = std::getenv("QWEN_NATIVE_SOA_SPLIT")) {
+        const int percentage = std::clamp(std::atoi(split), 10, 90);
+        if (type == 12 || type == 13 || type == 14 || type == 23) {
+            numerator = static_cast<std::size_t>(percentage);
+            denominator = 100;
+        }
+    }
+    std::size_t rows = output_size * numerator / denominator;
+    rows -= rows % 8;
+    return rows;
+}
+
+void pipeline_project_gpu_rows_pipelined(DevicePipeline *pipeline,
+                                         const void *weights, std::uint32_t type,
+                                         std::size_t input_size, std::size_t output_size,
+                                         std::size_t destination_row,
+                                         std::size_t destination_stride,
+                                         int destination_slot,
+                                         const float *input_buffer = nullptr) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
+    const std::size_t row_bytes = weight_bytes / output_size;
+    std::size_t target_chunk_bytes = 8ULL * 1024ULL * 1024ULL;
+    if (const char *requested = std::getenv("QWEN_NATIVE_GPU_CHUNK_MB")) {
+        const int mebibytes = std::clamp(std::atoi(requested), 1, 256);
+        target_chunk_bytes = static_cast<std::size_t>(mebibytes) * 1024ULL * 1024ULL;
+    }
+    std::size_t chunk_rows = std::max<std::size_t>(8, target_chunk_bytes / row_bytes);
+    chunk_rows -= chunk_rows % 8;
+    chunk_rows = std::min(chunk_rows, output_size);
+
+    // Hybrid mode does not issue matrix prefetches, but clear any stale
+    // speculative prefetch bookkeeping before borrowing the two staging
+    // buffers as a copy/compute pipeline.
+    if (pipeline->prefetched_host_ptr[0] || pipeline->prefetched_host_ptr[1]) {
+        hip_check(hipStreamSynchronize(pipeline->transfer_stream),
+                  "hybrid row pipeline drain stale prefetch");
+        pipeline->prefetched_host_ptr[0] = nullptr;
+        pipeline->prefetched_host_ptr[1] = nullptr;
+    }
+
+    const auto *source = static_cast<const std::uint8_t *>(weights);
+    const float *in_act = input_buffer ? input_buffer : pipeline->hidden;
+    for (std::size_t row = 0; row < output_size; row += chunk_rows) {
+        const std::size_t rows = std::min(chunk_rows, output_size - row);
+        const int buffer = pipeline->active_weight_buf;
+        pipeline->active_weight_buf = 1 - buffer;
+        if (pipeline->weight_consumed_valid[buffer]) {
+            hip_check(hipStreamWaitEvent(pipeline->transfer_stream,
+                                         pipeline->weight_consumed[buffer], 0),
+                      "hybrid row pipeline wait consumed");
+        }
+        hip_check(hipMemcpyAsync(pipeline->weight_buf[buffer], source + row * row_bytes,
+                                 rows * row_bytes, hipMemcpyHostToDevice,
+                                 pipeline->transfer_stream),
+                  "hybrid row pipeline upload");
+        hip_check(hipEventRecord(pipeline->transfer_done[buffer],
+                                 pipeline->transfer_stream),
+                  "hybrid row pipeline record transfer");
+        hip_check(hipStreamWaitEvent(pipeline->compute_stream,
+                                     pipeline->transfer_done[buffer], 0),
+                  "hybrid row pipeline compute wait");
+        launch_k_matvec_batch8(type, pipeline->weight_buf[buffer], in_act,
+                               pipeline->slots[4], input_size, rows,
+                               pipeline->compute_stream);
+        constexpr int threads = 256;
+        const int elements = static_cast<int>(8 * rows);
+        hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
+                           dim3((elements + threads - 1) / threads), dim3(threads),
+                           0, pipeline->compute_stream,
+                           pipeline->slots[4], pipeline->slots[destination_slot],
+                           static_cast<int>(destination_row + row),
+                           static_cast<int>(rows),
+                           static_cast<int>(destination_stride));
+        hip_check(hipGetLastError(), "hybrid row pipeline launch");
+        hip_check(hipEventRecord(pipeline->weight_consumed[buffer],
+                                 pipeline->compute_stream),
+                  "hybrid row pipeline record consumed");
+        pipeline->weight_consumed_valid[buffer] = true;
+    }
+}
+
+void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weights,
+                                    std::uint32_t type, std::size_t input_size,
+                                    std::size_t output_size, bool keep_resident,
+                                    int output_slot,
+                                    const float *input_buffer) {
+    const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
+    if (resident_weight_cache().find_or_add(weights, weight_bytes, keep_resident) != nullptr ||
+        pipeline->inline_prefetched_ptr == weights ||
+        pipeline->prefetched_host_ptr[0] == weights ||
+        pipeline->prefetched_host_ptr[1] == weights ||
+        output_size < 256 || type == 21) {
+        pipeline_project_batch8(pipeline, weights, type, input_size, output_size,
+                                keep_resident, output_slot, input_buffer);
+        return;
+    }
+
+    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size);
+    const std::size_t gpu_rows = output_size - cpu_rows;
+    const std::size_t row_bytes = weight_bytes / output_size;
+    if (gpu_rows * row_bytes > pipeline->max_weight_bytes) {
+        throw std::runtime_error("hybrid projection exceeds weight staging capacity");
+    }
+
+    const float *in_act = input_buffer ? input_buffer : pipeline->hidden;
+    hip_check(hipStreamSynchronize(pipeline->compute_stream),
+              "hybrid projection wait input");
+    hip_check(hipMemcpy(pipeline->hybrid_host_input, in_act,
+                        8 * input_size * sizeof(float), hipMemcpyDeviceToHost),
+              "hybrid projection download input");
+
+    pipeline->async_worker.submit([=] {
+        cpu_quant_matvec_batch8_rows_packed(weights, type,
+                                            pipeline->hybrid_host_input, input_size,
+                                            pipeline->hybrid_host_output, cpu_rows,
+                                            hybrid_cpu_worker_count());
+    });
+
+    const auto *gpu_weights = static_cast<const std::uint8_t *>(weights) + cpu_rows * row_bytes;
+    const bool pipeline_gpu_rows = std::getenv("QWEN_NATIVE_GPU_PIPELINE") != nullptr;
+    if (pipeline_gpu_rows) {
+        pipeline_project_gpu_rows_pipelined(pipeline, gpu_weights, type, input_size,
+                                            gpu_rows, cpu_rows, output_size, output_slot,
+                                            input_buffer);
+    } else {
+        pipeline_project_batch8(pipeline, gpu_weights, type, input_size, gpu_rows,
+                                false, 4, input_buffer);
+    }
+
+    hip_check(hipStreamSynchronize(pipeline->compute_stream),
+              "hybrid projection wait GPU rows");
+    pipeline->async_worker.wait();
+
+    for (int batch_index = 0; batch_index < 8; ++batch_index) {
+        hip_check(hipMemcpyAsync(pipeline->slots[output_slot]
+                                     + static_cast<std::size_t>(batch_index) * output_size,
+                                 pipeline->hybrid_host_output
+                                     + static_cast<std::size_t>(batch_index) * cpu_rows,
+                                 cpu_rows * sizeof(float), hipMemcpyHostToDevice,
+                                 pipeline->compute_stream),
+                  "hybrid projection upload CPU rows");
+    }
+    if (!pipeline_gpu_rows) {
+        constexpr int threads = 256;
+        const int elements = static_cast<int>(8 * gpu_rows);
+        hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
+                           dim3((elements + threads - 1) / threads), dim3(threads),
+                           0, pipeline->compute_stream,
+                           pipeline->slots[4], pipeline->slots[output_slot],
+                           static_cast<int>(cpu_rows), static_cast<int>(gpu_rows),
+                           static_cast<int>(output_size));
+        hip_check(hipGetLastError(), "hybrid projection scatter launch");
+    }
+}
+
+void pipeline_project_attention_qkv_hybrid(
+    DevicePipeline *pipeline,
+    const void *q_weights, std::uint32_t q_type, std::size_t q_size,
+    const void *k_weights, std::uint32_t k_type, std::size_t k_size,
+    const void *v_weights, std::uint32_t v_type, std::size_t v_size,
+    std::size_t input_size, bool keep_resident,
+    const float *input_buffer) {
+    const auto soa_supported = [](std::uint32_t type) {
+        return type == 12 || type == 13 || type == 14 || type == 23;
+    };
+    if (!soa_supported(q_type) || !soa_supported(k_type) || !soa_supported(v_type)) {
+        pipeline_project_batch8_hybrid(pipeline, q_weights, q_type, input_size,
+                                       q_size, keep_resident, 0, input_buffer);
+        pipeline_project_batch8_hybrid(pipeline, k_weights, k_type, input_size,
+                                       k_size, keep_resident, 1, input_buffer);
+        pipeline_project_batch8_hybrid(pipeline, v_weights, v_type, input_size,
+                                       v_size, keep_resident, 2, input_buffer);
+        return;
+    }
+
+    const std::size_t q_bytes = k_quant_weight_bytes(q_type, input_size, q_size);
+    const std::size_t k_bytes = k_quant_weight_bytes(k_type, input_size, k_size);
+    const std::size_t v_bytes = k_quant_weight_bytes(v_type, input_size, v_size);
+    auto &cache = resident_weight_cache();
+    const bool q_resident = cache.find_or_add(q_weights, q_bytes, keep_resident) != nullptr;
+    const bool k_resident = cache.find_or_add(k_weights, k_bytes, keep_resident) != nullptr;
+    const bool v_resident = cache.find_or_add(v_weights, v_bytes, keep_resident) != nullptr;
+    if (q_resident && k_resident && v_resident) {
+        pipeline_project_batch8(pipeline, q_weights, q_type, input_size, q_size,
+                                keep_resident, 0, input_buffer);
+        pipeline_project_batch8(pipeline, k_weights, k_type, input_size, k_size,
+                                keep_resident, 1, input_buffer);
+        pipeline_project_batch8(pipeline, v_weights, v_type, input_size, v_size,
+                                keep_resident, 2, input_buffer);
+        return;
+    }
+
+    const float *in_act = input_buffer ? input_buffer : pipeline->hidden;
+    hip_check(hipStreamSynchronize(pipeline->compute_stream),
+              "grouped attention QKV wait normalized input");
+    hip_check(hipMemcpy(pipeline->hybrid_host_input, in_act,
+                        8 * input_size * sizeof(float), hipMemcpyDeviceToHost),
+              "grouped attention QKV download input");
+    const std::size_t q_cpu_rows = q_resident ? 0 : hybrid_cpu_row_count(q_type, q_size);
+    const std::size_t k_cpu_rows = k_resident ? 0 : hybrid_cpu_row_count(k_type, k_size);
+    const std::size_t v_cpu_rows = v_resident ? 0 : hybrid_cpu_row_count(v_type, v_size);
+
+    const bool pipeline_gpu_rows = std::getenv("QWEN_NATIVE_GPU_PIPELINE") != nullptr;
+    const auto launch = [&](const void *weights, std::uint32_t type,
+                            std::size_t output_size, std::size_t weight_bytes,
+                            std::size_t cpu_rows, bool resident, int output_slot) {
+        if (resident) {
+            pipeline_project_batch8(pipeline, weights, type, input_size, output_size,
+                                    keep_resident, output_slot, input_buffer);
+            return;
+        }
+        const std::size_t gpu_rows = output_size - cpu_rows;
+        const std::size_t row_bytes = weight_bytes / output_size;
+        const auto *gpu_weights = static_cast<const std::uint8_t *>(weights)
+                                + cpu_rows * row_bytes;
+        if (pipeline_gpu_rows) {
+            pipeline_project_gpu_rows_pipelined(
+                pipeline, gpu_weights, type, input_size, gpu_rows,
+                cpu_rows, output_size, output_slot, input_buffer);
+        } else {
+            pipeline_project_batch8(pipeline, gpu_weights, type, input_size,
+                                    gpu_rows, false, 4, input_buffer);
+            constexpr int threads = 256;
+            const int elements = static_cast<int>(8 * gpu_rows);
+            hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
+                               dim3((elements + threads - 1) / threads), dim3(threads),
+                               0, pipeline->compute_stream,
+                               pipeline->slots[4], pipeline->slots[output_slot],
+                               static_cast<int>(cpu_rows), static_cast<int>(gpu_rows),
+                               static_cast<int>(output_size));
+            hip_check(hipGetLastError(), "grouped attention QKV scatter launch");
+        }
+    };
+    pipeline->async_worker.submit([=] {
+        if (!q_resident) {
+            cpu_quant_matvec_batch8_rows_packed(
+                q_weights, q_type, pipeline->hybrid_host_input, input_size,
+                pipeline->hybrid_host_output, q_cpu_rows,
+                hybrid_cpu_worker_count());
+        }
+        if (!k_resident) {
+            cpu_quant_matvec_batch8_rows_packed(
+                k_weights, k_type, pipeline->hybrid_host_input, input_size,
+                pipeline->hybrid_host_output2, k_cpu_rows,
+                hybrid_cpu_worker_count());
+        }
+        if (!v_resident) {
+            cpu_quant_matvec_batch8_rows_packed(
+                v_weights, v_type, pipeline->hybrid_host_input, input_size,
+                pipeline->hybrid_host_output3, v_cpu_rows,
+                hybrid_cpu_worker_count());
+        }
+    });
+
+    launch(q_weights, q_type, q_size, q_bytes, q_cpu_rows, q_resident, 0);
+    launch(k_weights, k_type, k_size, k_bytes, k_cpu_rows, k_resident, 1);
+    launch(v_weights, v_type, v_size, v_bytes, v_cpu_rows, v_resident, 2);
+
+    hip_check(hipStreamSynchronize(pipeline->compute_stream),
+              "grouped attention QKV wait GPU rows");
+    pipeline->async_worker.wait();
+
+    const auto upload = [&](const float *host, std::size_t cpu_rows,
+                            std::size_t output_size, int output_slot, bool resident) {
+        if (resident) return;
+        for (int batch = 0; batch < 8; ++batch) {
+            hip_check(hipMemcpyAsync(
+                          pipeline->slots[output_slot]
+                              + static_cast<std::size_t>(batch) * output_size,
+                          host + static_cast<std::size_t>(batch) * cpu_rows,
+                          cpu_rows * sizeof(float), hipMemcpyHostToDevice,
+                          pipeline->compute_stream),
+                      "grouped attention QKV upload CPU rows");
+        }
+    };
+    upload(pipeline->hybrid_host_output, q_cpu_rows, q_size, 0, q_resident);
+    upload(pipeline->hybrid_host_output2, k_cpu_rows, k_size, 1, k_resident);
+    upload(pipeline->hybrid_host_output3, v_cpu_rows, v_size, 2, v_resident);
+}
+
+void pipeline_project_recurrent_qkv_gate_cpu(DevicePipeline *pipeline,
+                                             const void *qkv_weights, std::uint32_t qkv_type,
+                                             std::size_t input_size, std::size_t qkv_size,
+                                             const void *gate_weights, std::uint32_t gate_type,
+                                             std::size_t gate_size, bool keep_resident,
+                                             const float *input_buffer) {
+    const float *in_act = input_buffer ? input_buffer : pipeline->hidden;
+    hip_check(hipStreamSynchronize(pipeline->compute_stream),
+              "CPU gate wait normalized input");
+    hip_check(hipMemcpy(pipeline->hybrid_host_input, in_act,
+                        8 * input_size * sizeof(float), hipMemcpyDeviceToHost),
+              "CPU gate download input");
+    pipeline->async_worker.submit([=] {
+        cpu_quant_matvec_batch8_rows_packed(gate_weights, gate_type,
+                                            pipeline->hybrid_host_input, input_size,
+                                            pipeline->hybrid_host_output, gate_size,
+                                            hybrid_cpu_worker_count());
+    });
+    pipeline_project_batch8(pipeline, qkv_weights, qkv_type, input_size, qkv_size,
+                            keep_resident, 0, in_act);
+    hip_check(hipStreamSynchronize(pipeline->compute_stream), "CPU gate wait QKV");
+    pipeline->async_worker.wait();
+    hip_check(hipMemcpyAsync(pipeline->slots[1], pipeline->hybrid_host_output,
+                             8 * gate_size * sizeof(float), hipMemcpyHostToDevice,
+                             pipeline->compute_stream),
+              "CPU gate upload output");
 }
 
 void pipeline_silu_multiply(DevicePipeline *pipeline, int gate_slot, int up_slot,
@@ -4057,6 +6026,18 @@ void pipeline_prefetch_weights(DevicePipeline *pipeline, const void *weights,
     pipeline->prefetched_bytes[buf] = weight_bytes;
 }
 
+void pipeline_prefetch_hybrid_weights(DevicePipeline *pipeline, const void *weights,
+                                      std::uint32_t type, std::size_t input_size,
+                                      std::size_t output_size) {
+    const std::size_t full_bytes = k_quant_weight_bytes(type, input_size, output_size);
+    if (resident_weight_cache().find_or_add(weights, full_bytes, false) != nullptr) return;
+    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size);
+    const std::size_t gpu_rows = output_size - cpu_rows;
+    const std::size_t row_bytes = full_bytes / output_size;
+    const auto *gpu_weights = static_cast<const std::uint8_t *>(weights) + cpu_rows * row_bytes;
+    pipeline_prefetch_weights(pipeline, gpu_weights, type, input_size, gpu_rows);
+}
+
 void pipeline_prefetch_inline(DevicePipeline *pipeline, const void *weights,
                               std::uint32_t type, std::size_t input_size,
                               std::size_t output_size) {
@@ -4066,6 +6047,11 @@ void pipeline_prefetch_inline(DevicePipeline *pipeline, const void *weights,
     }
     if (weight_bytes > pipeline->inline_buf_capacity) {
         return;
+    }
+    if (pipeline->inline_consumed_valid) {
+        hip_check(hipStreamWaitEvent(pipeline->transfer_stream, pipeline->inline_consumed, 0),
+                  "pipeline inline prefetch wait consumed");
+        pipeline->inline_consumed_valid = false;
     }
     hip_check(hipMemcpyAsync(pipeline->inline_buf, weights,
                              weight_bytes, hipMemcpyHostToDevice, pipeline->transfer_stream),
@@ -4083,8 +6069,9 @@ void pipeline_fused_ffn_batch8(DevicePipeline *pipeline, const float *norm_weigh
                                const void *up_weights, std::uint32_t up_type,
                                const void *down_weights, std::uint32_t down_type,
                                bool keep_gate_up_resident) {
-    // Prefetch down weight early (overlaps with save/norm/gate compute)
-    pipeline_prefetch_weights(pipeline, down_weights, down_type, ffn_size, embedding_size);
+    // Gate/up occupy the two rotating buffers. Keep down in the separately
+    // synchronized inline buffer so all three transfers can be pipelined.
+    pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
 
     // Save pre-FFN hidden for residual
     pipeline_save_hidden(pipeline, 3, 8 * embedding_size);
@@ -4120,6 +6107,174 @@ void pipeline_fused_ffn_batch8(DevicePipeline *pipeline, const float *norm_weigh
     pipeline_residual_add(pipeline, 2);
 }
 
+void pipeline_fused_ffn_batch8_hybrid_up(DevicePipeline *pipeline, const float *norm_weights,
+                                         std::size_t embedding_size, std::size_t ffn_size,
+                                         float epsilon,
+                                         const void *gate_weights, std::uint32_t gate_type,
+                                         const void *up_weights, std::uint32_t up_type,
+                                         const void *down_weights, std::uint32_t down_type,
+                                         bool keep_gate_resident) {
+    pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
+    pipeline_save_hidden(pipeline, 3, 8 * embedding_size);
+    pipeline_rms_norm(pipeline, norm_weights, embedding_size, epsilon);
+    hip_check(hipStreamSynchronize(pipeline->compute_stream),
+              "hybrid FFN wait normalized input");
+    hip_check(hipMemcpy(pipeline->hybrid_host_input, pipeline->hidden,
+                        8 * embedding_size * sizeof(float), hipMemcpyDeviceToHost),
+              "hybrid FFN download input");
+
+    pipeline->async_worker.submit([=] {
+        cpu_quant_matvec_batch8_rows(up_weights, up_type,
+                                     pipeline->hybrid_host_input, embedding_size,
+                                     pipeline->hybrid_host_output, ffn_size,
+                                     static_cast<int>(std::thread::hardware_concurrency()));
+    });
+    pipeline_project_batch8(pipeline, gate_weights, gate_type, embedding_size, ffn_size,
+                            keep_gate_resident, 0);
+    hip_check(hipStreamSynchronize(pipeline->compute_stream), "hybrid FFN wait gate");
+    pipeline->async_worker.wait();
+    hip_check(hipMemcpyAsync(pipeline->slots[1], pipeline->hybrid_host_output,
+                             8 * ffn_size * sizeof(float), hipMemcpyHostToDevice,
+                             pipeline->compute_stream),
+              "hybrid FFN upload up");
+    pipeline_silu_multiply(pipeline, 0, 1, 8 * ffn_size);
+    hip_check(hipMemcpyAsync(pipeline->hidden, pipeline->slots[0],
+                             8 * ffn_size * sizeof(float), hipMemcpyDeviceToDevice,
+                             pipeline->compute_stream),
+              "hybrid FFN move to hidden");
+    pipeline_project_batch8(pipeline, down_weights, down_type, ffn_size, embedding_size,
+                            false, 2);
+    hip_check(hipMemcpyAsync(pipeline->hidden, pipeline->slots[3],
+                             8 * embedding_size * sizeof(float), hipMemcpyDeviceToDevice,
+                             pipeline->compute_stream),
+              "hybrid FFN restore hidden");
+    pipeline_residual_add(pipeline, 2);
+}
+
+void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float *norm_weights,
+                                          std::size_t embedding_size, std::size_t ffn_size,
+                                          float epsilon,
+                                          const void *gate_weights, std::uint32_t gate_type,
+                                          const void *up_weights, std::uint32_t up_type,
+                                          const void *down_weights, std::uint32_t down_type,
+                                          bool keep_gate_up_resident) {
+    const auto soa_supported = [](std::uint32_t type) {
+        return type == 12 || type == 13 || type == 14 || type == 23;
+    };
+    const std::size_t gate_bytes = k_quant_weight_bytes(gate_type, embedding_size, ffn_size);
+    const std::size_t up_bytes = k_quant_weight_bytes(up_type, embedding_size, ffn_size);
+    const bool gate_resident = resident_weight_cache().find_or_add(
+        gate_weights, gate_bytes, keep_gate_up_resident) != nullptr;
+    const bool up_resident = resident_weight_cache().find_or_add(
+        up_weights, up_bytes, keep_gate_up_resident) != nullptr;
+
+    pipeline_rms_norm(pipeline, norm_weights, embedding_size, epsilon,
+                      pipeline->slots[3], pipeline->hidden);
+
+    if (std::getenv("QWEN_NATIVE_UNFUSED_FFN") || gate_resident || up_resident ||
+        !soa_supported(gate_type) || !soa_supported(up_type)) {
+        pipeline_project_batch8_hybrid(pipeline, gate_weights, gate_type,
+                                       embedding_size, ffn_size,
+                                       keep_gate_up_resident, 0, pipeline->slots[3]);
+        pipeline_project_batch8_hybrid(pipeline, up_weights, up_type,
+                                       embedding_size, ffn_size,
+                                       keep_gate_up_resident, 1, pipeline->slots[3]);
+        pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
+    } else {
+        // Gate and up consume the same normalized activation. Run their CPU
+        // shards in one worker-pool job and their GPU shards back-to-back so
+        // neither resource waits at the matrix boundary and the activation is
+        // downloaded only once.
+        hip_check(hipStreamSynchronize(pipeline->compute_stream),
+                  "fused SoA FFN wait normalized input");
+        hip_check(hipMemcpy(pipeline->hybrid_host_input, pipeline->slots[3],
+                            8 * embedding_size * sizeof(float), hipMemcpyDeviceToHost),
+                  "fused SoA FFN download input");
+
+        const std::size_t gate_cpu_rows = hybrid_cpu_row_count(gate_type, ffn_size);
+        const std::size_t up_cpu_rows = hybrid_cpu_row_count(up_type, ffn_size);
+        const std::size_t gate_gpu_rows = ffn_size - gate_cpu_rows;
+        const std::size_t up_gpu_rows = ffn_size - up_cpu_rows;
+        const std::size_t gate_row_bytes = gate_bytes / ffn_size;
+        const std::size_t up_row_bytes = up_bytes / ffn_size;
+
+        const bool pipeline_gpu_rows = std::getenv("QWEN_NATIVE_GPU_PIPELINE") != nullptr;
+        const auto launch_gpu_shard = [&](const void *weights, std::uint32_t type,
+                                          std::size_t cpu_rows, std::size_t gpu_rows,
+                                          std::size_t row_bytes, int output_slot) {
+            const auto *gpu_weights = static_cast<const std::uint8_t *>(weights)
+                                    + cpu_rows * row_bytes;
+            if (pipeline_gpu_rows) {
+                pipeline_project_gpu_rows_pipelined(
+                    pipeline, gpu_weights, type, embedding_size, gpu_rows,
+                    cpu_rows, ffn_size, output_slot, pipeline->slots[3]);
+            } else {
+                pipeline_project_batch8(pipeline, gpu_weights, type, embedding_size,
+                                        gpu_rows, false, 4, pipeline->slots[3]);
+                constexpr int threads = 256;
+                const int elements = static_cast<int>(8 * gpu_rows);
+                hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
+                                   dim3((elements + threads - 1) / threads), dim3(threads),
+                                   0, pipeline->compute_stream,
+                                   pipeline->slots[4], pipeline->slots[output_slot],
+                                   static_cast<int>(cpu_rows), static_cast<int>(gpu_rows),
+                                   static_cast<int>(ffn_size));
+                hip_check(hipGetLastError(), "fused SoA FFN scatter launch");
+            }
+        };
+        pipeline->async_worker.submit([=] {
+            cpu_quant_matvec_batch8_rows_packed(
+                gate_weights, gate_type, pipeline->hybrid_host_input, embedding_size,
+                pipeline->hybrid_host_output, gate_cpu_rows,
+                hybrid_cpu_worker_count());
+            cpu_quant_matvec_batch8_rows_packed(
+                up_weights, up_type, pipeline->hybrid_host_input, embedding_size,
+                pipeline->hybrid_host_output2, up_cpu_rows,
+                hybrid_cpu_worker_count());
+        });
+
+        launch_gpu_shard(gate_weights, gate_type, gate_cpu_rows, gate_gpu_rows,
+                         gate_row_bytes, 0);
+        launch_gpu_shard(up_weights, up_type, up_cpu_rows, up_gpu_rows,
+                         up_row_bytes, 1);
+        pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
+
+        hip_check(hipStreamSynchronize(pipeline->compute_stream),
+                  "fused SoA FFN wait GPU gate/up");
+        pipeline->async_worker.wait();
+
+        // CPU rows are packed as [batch][row]. Upload each result in one DMA
+        // and scatter it on-device instead of issuing eight small H2D copies.
+        // slots[4] is no longer needed by the completed GPU shards at this
+        // point and is large enough for the largest packed FFN shard.
+        const auto upload_cpu_rows = [&](const float *host,
+                                         std::size_t cpu_rows, int output_slot,
+                                         const char *label) {
+            if (cpu_rows == 0) return;
+            hip_check(hipMemcpyAsync(pipeline->slots[4], host,
+                                     8 * cpu_rows * sizeof(float), hipMemcpyHostToDevice,
+                                     pipeline->compute_stream), label);
+            constexpr int threads = 256;
+            const int elements = static_cast<int>(8 * cpu_rows);
+            hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
+                               dim3((elements + threads - 1) / threads), dim3(threads),
+                               0, pipeline->compute_stream,
+                               pipeline->slots[4], pipeline->slots[output_slot],
+                               0, static_cast<int>(cpu_rows), static_cast<int>(ffn_size));
+            hip_check(hipGetLastError(), "fused SoA FFN scatter CPU rows");
+        };
+        upload_cpu_rows(pipeline->hybrid_host_output, gate_cpu_rows, 0,
+                        "fused SoA FFN upload CPU gate rows");
+        upload_cpu_rows(pipeline->hybrid_host_output2, up_cpu_rows, 1,
+                        "fused SoA FFN upload CPU up rows");
+    }
+
+    pipeline_silu_multiply(pipeline, 0, 1, 8 * ffn_size);
+    pipeline_project_batch8_hybrid(pipeline, down_weights, down_type,
+                                   ffn_size, embedding_size, false, 2, pipeline->slots[0]);
+    pipeline_residual_add(pipeline, 2);
+}
+
 // ============================================================================
 // GPU attention for the batch-8 target verifier (short-context GQA)
 // ============================================================================
@@ -4135,7 +6290,24 @@ struct AttentionDeviceState {
     int active_tokens = 0;
     int global_position = 0;
 
+    // FP16 is kept for short-context scalar/pipeline equivalence tests. Long
+    // contexts use the authoritative device-resident N23KV4 history below.
     __half *kv_cache = nullptr;
+    bool use_n23kv4 = false;
+    bool use_q8_long_cache = true;
+    bool use_mixed_n23k_cache = false;
+    bool use_q4_cache = false;
+    // Long-context target KV keeps both K and V in native Q8_0 blocks.
+    // N23KV4 kernels remain available for measured experiments, but are not
+    // used for correctness-critical target verification.
+    N23KV4Group *kv4_cache = nullptr;
+    Q8_0Block *q8_key_cache = nullptr;
+    Q8_0Block *q8_value_cache = nullptr;
+    float *kv4_staging = nullptr;
+    std::int8_t *kv4_queries = nullptr;
+    float *kv4_query_scales = nullptr;
+    float *kv4_partials = nullptr;
+    int kv4_max_partitions = 32;
     float *q_norm_weights = nullptr;
     float *k_norm_weights = nullptr;
     float *attn_output = nullptr;
@@ -4143,6 +6315,13 @@ struct AttentionDeviceState {
 
     ~AttentionDeviceState() {
         if (kv_cache) (void)hipFree(kv_cache);
+        if (kv4_cache) (void)hipFree(kv4_cache);
+        if (q8_key_cache) (void)hipFree(q8_key_cache);
+        if (q8_value_cache) (void)hipFree(q8_value_cache);
+        if (kv4_staging) (void)hipFree(kv4_staging);
+        if (kv4_queries) (void)hipFree(kv4_queries);
+        if (kv4_query_scales) (void)hipFree(kv4_query_scales);
+        if (kv4_partials) (void)hipFree(kv4_partials);
         if (q_norm_weights) (void)hipFree(q_norm_weights);
         if (k_norm_weights) (void)hipFree(k_norm_weights);
         if (attn_output) (void)hipFree(attn_output);
@@ -4187,6 +6366,8 @@ __global__ void attn_prep_kernel(const float *__restrict__ q_slot,
     __syncthreads();
 
     for (int qh = 0; qh < kHeads; ++qh) {
+        // q_proj is viewed as [heads, 2 * head_size] by Qwen3.5, then
+        // chunked on the final axis: [q0, gate0, q1, gate1, ...].
         const float *q_head = q_row + qh * 2 * kHeadSize;
         float *out_q = q_out + (static_cast<std::size_t>(batch) * kHeads + qh) * kHeadSize;
         float *out_gate = gate_out + (static_cast<std::size_t>(batch) * kHeads + qh) * kHeadSize;
@@ -4247,6 +6428,191 @@ __global__ void attn_prep_kernel(const float *__restrict__ q_slot,
             kv_cache[v_offset + d] = __float2half(v_head[d]);
         }
     }
+}
+
+// Long-context preparation keeps normalized/rotated Q in FP32 for the
+// existing pipeline but quantizes K/V into independent 32-value N23KV4 groups.
+// Per-group scales bound the error while reducing a 128K, 16-layer KV cache
+// from 8 GiB FP16 to 2.25 GiB.
+__global__ void attn_prep_kv4_kernel(const float *__restrict__ q_slot,
+                                      const float *__restrict__ k_slot,
+                                      const float *__restrict__ v_slot,
+                                      const float *__restrict__ q_norm_w,
+                                      const float *__restrict__ k_norm_w,
+                                      const float *__restrict__ rope_freqs,
+                                      float *__restrict__ kv_staging,
+                                      float *__restrict__ q_out,
+                                      float *__restrict__ gate_out,
+                                      int rope_base_position, float epsilon) {
+    constexpr int kHeads = 24;
+    constexpr int kKvHeads = 4;
+    constexpr int kHeadSize = 256;
+    constexpr int kRotaryPairs = 32;
+    constexpr int kQWidth = 2 * kHeads * kHeadSize;
+    constexpr int kKvWidth = kKvHeads * kHeadSize;
+    const int batch = static_cast<int>(blockIdx.x);
+    const int position = rope_base_position + batch;
+    const int tid = static_cast<int>(threadIdx.x);
+    const float *q_row = q_slot + static_cast<std::size_t>(batch) * kQWidth;
+    const float *k_row = k_slot + static_cast<std::size_t>(batch) * kKvWidth;
+    const float *v_row = v_slot + static_cast<std::size_t>(batch) * kKvWidth;
+    __shared__ float rope_cos[kRotaryPairs];
+    __shared__ float rope_sin[kRotaryPairs];
+    if (tid < kRotaryPairs) {
+        const float theta = static_cast<float>(position) * rope_freqs[tid];
+        rope_cos[tid] = cosf(theta);
+        rope_sin[tid] = sinf(theta);
+    }
+    __syncthreads();
+
+    for (int qh = 0; qh < kHeads; ++qh) {
+        const float *q_head = q_row + qh * 2 * kHeadSize;
+        float *out_q = q_out + (static_cast<std::size_t>(batch) * kHeads + qh) * kHeadSize;
+        float *out_gate = gate_out + (static_cast<std::size_t>(batch) * kHeads + qh) * kHeadSize;
+        float sum_sq = 0.0F;
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            sum_sq += q_head[d] * q_head[d];
+        }
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down(sum_sq, offset, kWarpSize);
+        const float q_rms = rsqrtf(__shfl(sum_sq, 0, kWarpSize) / static_cast<float>(kHeadSize) + epsilon);
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            const float normed = q_head[d] * q_rms * q_norm_w[d];
+            if (d < kRotaryPairs) {
+                const float right = q_head[d + kRotaryPairs] * q_rms * q_norm_w[d + kRotaryPairs];
+                out_q[d] = normed * rope_cos[d] - right * rope_sin[d];
+                out_q[d + kRotaryPairs] = normed * rope_sin[d] + right * rope_cos[d];
+            } else if (d >= 2 * kRotaryPairs) {
+                out_q[d] = normed;
+            }
+            out_gate[d] = q_head[kHeadSize + d];
+        }
+    }
+
+    for (int kvh = 0; kvh < kKvHeads; ++kvh) {
+        const float *k_head = k_row + kvh * kHeadSize;
+        float *staged_key = kv_staging + (static_cast<std::size_t>(batch) * 2 * kKvHeads + kvh) * kHeadSize;
+        float *staged_value = kv_staging + (static_cast<std::size_t>(batch) * 2 * kKvHeads + kKvHeads + kvh) * kHeadSize;
+        float sum_sq = 0.0F;
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            sum_sq += k_head[d] * k_head[d];
+        }
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down(sum_sq, offset, kWarpSize);
+        const float k_rms = rsqrtf(__shfl(sum_sq, 0, kWarpSize) / static_cast<float>(kHeadSize) + epsilon);
+        const float *v_head = v_row + kvh * kHeadSize;
+        for (int d = tid; d < kHeadSize; d += static_cast<int>(blockDim.x)) {
+            const float normed = k_head[d] * k_rms * k_norm_w[d];
+            if (d < kRotaryPairs) {
+                const float right = k_head[d + kRotaryPairs] * k_rms * k_norm_w[d + kRotaryPairs];
+                staged_key[d] = normed * rope_cos[d] - right * rope_sin[d];
+                staged_key[d + kRotaryPairs] = normed * rope_sin[d] + right * rope_cos[d];
+            } else if (d >= 2 * kRotaryPairs) {
+                staged_key[d] = normed;
+            }
+            staged_value[d] = v_head[d];
+        }
+    }
+}
+
+__global__ void kv4_quantize_queries_kernel(const float *__restrict__ queries,
+                                             std::int8_t *__restrict__ quantized,
+                                             float *__restrict__ scales) {
+    constexpr int kHeadSize = 256;
+    constexpr int kGroups = 8;
+    const int batch = static_cast<int>(blockIdx.x);
+    const int head = static_cast<int>(blockIdx.y);
+    const int group = static_cast<int>(blockIdx.z);
+    const int tid = static_cast<int>(threadIdx.x);
+    const float value = queries[(static_cast<std::size_t>(batch) * 24 + head) * kHeadSize
+                                + group * 32 + tid];
+    __shared__ float maximum[32];
+    maximum[tid] = fabsf(value);
+    __syncthreads();
+    for (int offset = 16; offset > 0; offset /= 2) {
+        if (tid < offset) maximum[tid] = fmaxf(maximum[tid], maximum[tid + offset]);
+        __syncthreads();
+    }
+    const float scale = maximum[0] > 0.0F ? maximum[0] / 127.0F : 1.0F;
+    const int q = static_cast<int>(rintf(value / scale));
+    quantized[((static_cast<std::size_t>(batch) * 24 + head) * kGroups + group) * 32 + tid]
+        = static_cast<std::int8_t>(max(-127, min(127, q)));
+    if (tid == 0) scales[(static_cast<std::size_t>(batch) * 24 + head) * kGroups + group] = scale;
+}
+
+__global__ void kv4_quantize_cache_kernel(const float *__restrict__ staging,
+                                           N23KV4Group *__restrict__ cache,
+                                           int max_context, int write_offset, int kind) {
+    constexpr int kKvHeads = 4;
+    constexpr int kHeadSize = 256;
+    constexpr int kGroups = 8;
+    const int batch = static_cast<int>(blockIdx.x);
+    const int packed = static_cast<int>(blockIdx.y);
+    const int head = packed / kGroups;
+    const int group = packed % kGroups;
+    const int tid = static_cast<int>(threadIdx.x);
+    const float value = staging[(static_cast<std::size_t>(batch) * 2 * kKvHeads
+                                 + kind * kKvHeads + head) * kHeadSize + group * 32 + tid];
+    __shared__ float maximum[32];
+    maximum[tid] = fabsf(value);
+    __syncthreads();
+    for (int offset = 16; offset > 0; offset /= 2) {
+        if (tid < offset) maximum[tid] = fmaxf(maximum[tid], maximum[tid + offset]);
+        __syncthreads();
+    }
+    const float scale = maximum[0] > 0.0F ? maximum[0] / 7.0F : 1.0F;
+    auto *destination = cache + (static_cast<std::size_t>(head) * max_context + write_offset + batch)
+                                * kGroups + group;
+    if (tid == 0) *reinterpret_cast<__half *>(&destination->scale) = __float2half(scale);
+    if (tid < 16) {
+        const float first_value = staging[(static_cast<std::size_t>(batch) * 2 * kKvHeads
+                                           + kind * kKvHeads + head) * kHeadSize + group * 32 + 2 * tid];
+        const float second_value = staging[(static_cast<std::size_t>(batch) * 2 * kKvHeads
+                                            + kind * kKvHeads + head) * kHeadSize + group * 32 + 2 * tid + 1];
+        const int lo = max(-8, min(7, static_cast<int>(rintf(first_value / scale)))) & 0x0f;
+        const int hi = max(-8, min(7, static_cast<int>(rintf(second_value / scale)))) & 0x0f;
+        destination->quants[tid] = static_cast<std::uint8_t>(lo | (hi << 4));
+    }
+}
+
+__global__ void q8_quantize_cache_kernel(const float *__restrict__ staging,
+                                          Q8_0Block *__restrict__ cache,
+                                          int max_context, int write_offset, int kind) {
+    constexpr int kKvHeads = 4;
+    constexpr int kHeadSize = 256;
+    constexpr int kGroups = 8;
+    const int batch = static_cast<int>(blockIdx.x);
+    const int packed = static_cast<int>(blockIdx.y);
+    const int head = packed / kGroups;
+    const int group = packed % kGroups;
+    const int tid = static_cast<int>(threadIdx.x);
+    const float value = staging[(static_cast<std::size_t>(batch) * 2 * kKvHeads
+                                 + kind * kKvHeads + head) * kHeadSize + group * 32 + tid];
+    __shared__ float maximum[32];
+    maximum[tid] = fabsf(value);
+    __syncthreads();
+    for (int offset = 16; offset > 0; offset /= 2) {
+        if (tid < offset) maximum[tid] = fmaxf(maximum[tid], maximum[tid + offset]);
+        __syncthreads();
+    }
+    const float scale = maximum[0] > 0.0F ? maximum[0] / 127.0F : 1.0F;
+    auto *destination = cache + (static_cast<std::size_t>(head) * max_context + write_offset + batch)
+                                * kGroups + group;
+    if (tid == 0) *reinterpret_cast<__half *>(&destination->d) = __float2half(scale);
+    destination->qs[tid] = static_cast<std::int8_t>(
+        max(-127, min(127, static_cast<int>(rintf(value / scale)))));
+}
+
+__global__ void kv4_apply_gate_kernel(const float *__restrict__ attention,
+                                      const float *__restrict__ gates,
+                                      float *__restrict__ output) {
+    constexpr int kHeads = 24;
+    constexpr int kHeadSize = 256;
+    const int batch = static_cast<int>(blockIdx.x);
+    const int head = static_cast<int>(blockIdx.y);
+    const int dim = static_cast<int>(threadIdx.x);
+    const std::size_t index = (static_cast<std::size_t>(batch) * kHeads + head) * kHeadSize + dim;
+    output[index] = attention[index] / (1.0F + expf(-gates[index]));
 }
 
 __global__ void attn_score_kernel(const float *__restrict__ queries,
@@ -4348,10 +6714,60 @@ AttentionDeviceState *create_attention_device_state(int num_layers, int max_cont
     constexpr int kHeads = AttentionDeviceState::kHeads;
     constexpr int kRotaryPairs = AttentionDeviceState::kRotaryDims / 2;
 
-    const std::size_t kv_per_layer = 2ULL * kKvHeads * max_context * kHeadSize;
-    const std::size_t kv_bytes = num_layers * kv_per_layer * sizeof(__half);
-    hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv_cache), kv_bytes), "attn kv cache");
-    hip_check(hipMemset(s->kv_cache, 0, kv_bytes), "attn kv cache zero");
+    constexpr int kGroupsPerHead = kHeadSize / 32;
+    // Above 4K, FP16 KV alone would consume 8 GiB at 128K. N23KV4 makes the
+    // complete history fit on the 8 GiB device while retaining all positions.
+    s->use_n23kv4 = max_context > 4096;
+    if (s->use_n23kv4) {
+        const char *kv_mode = std::getenv("QWEN_NATIVE_KV");
+        s->use_q4_cache = kv_mode && std::strcmp(kv_mode, "q4") == 0;
+        s->use_mixed_n23k_cache = kv_mode && std::strcmp(kv_mode, "n23k") == 0;
+        s->use_q8_long_cache = !kv_mode || (std::strcmp(kv_mode, "n23") != 0
+                                            && !s->use_mixed_n23k_cache && !s->use_q4_cache);
+        const std::size_t groups_per_layer = static_cast<std::size_t>(kKvHeads) * max_context * kGroupsPerHead;
+        if (s->use_q4_cache) {
+            const std::size_t kv_bytes = static_cast<std::size_t>(num_layers) * 2 * groups_per_layer
+                                       * sizeof(N23KV4Group);
+            hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_cache), kv_bytes), "attn Q4 KV cache");
+            hip_check(hipMemset(s->kv4_cache, 0, kv_bytes), "attn Q4 KV cache zero");
+        } else if (s->use_q8_long_cache) {
+            const std::size_t kv_bytes = static_cast<std::size_t>(num_layers) * groups_per_layer
+                                       * sizeof(Q8_0Block);
+            hip_check(hipMalloc(reinterpret_cast<void **>(&s->q8_key_cache), kv_bytes), "attn Q8 key cache");
+            hip_check(hipMemset(s->q8_key_cache, 0, kv_bytes), "attn Q8 key cache zero");
+            hip_check(hipMalloc(reinterpret_cast<void **>(&s->q8_value_cache), kv_bytes), "attn Q8 value cache");
+            hip_check(hipMemset(s->q8_value_cache, 0, kv_bytes), "attn Q8 value cache zero");
+        } else if (s->use_mixed_n23k_cache) {
+            const std::size_t key_bytes = static_cast<std::size_t>(num_layers) * groups_per_layer
+                                        * sizeof(N23KV4Group);
+            const std::size_t value_bytes = static_cast<std::size_t>(num_layers) * groups_per_layer
+                                          * sizeof(Q8_0Block);
+            hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_cache), key_bytes), "attn N23 key cache");
+            hip_check(hipMemset(s->kv4_cache, 0, key_bytes), "attn N23 key cache zero");
+            hip_check(hipMalloc(reinterpret_cast<void **>(&s->q8_value_cache), value_bytes), "attn Q8 value cache");
+            hip_check(hipMemset(s->q8_value_cache, 0, value_bytes), "attn Q8 value cache zero");
+        } else {
+            const std::size_t kv_bytes = static_cast<std::size_t>(num_layers) * 2 * groups_per_layer
+                                       * sizeof(N23KV4Group);
+            hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_cache), kv_bytes), "attn N23KV4 cache");
+            hip_check(hipMemset(s->kv4_cache, 0, kv_bytes), "attn N23KV4 cache zero");
+        }
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_staging),
+                             2ULL * 8 * kKvHeads * kHeadSize * sizeof(float)), "attn N23KV4 staging");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_queries),
+                             8ULL * kHeads * kHeadSize * sizeof(std::int8_t)), "attn N23KV4 queries");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_query_scales),
+                             8ULL * kHeads * kGroupsPerHead * sizeof(float)), "attn N23KV4 query scales");
+        constexpr std::size_t partial_stride = 258;
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv4_partials),
+                             8ULL * kHeads * s->kv4_max_partitions * partial_stride * sizeof(float)),
+                  "attn N23KV4 partials");
+    } else {
+        const std::size_t kv_per_layer = 2ULL * kKvHeads * max_context * kHeadSize;
+        const std::size_t kv_bytes = num_layers * kv_per_layer * sizeof(__half);
+        hip_check(hipMalloc(reinterpret_cast<void **>(&s->kv_cache), kv_bytes), "attn kv cache");
+        hip_check(hipMemset(s->kv_cache, 0, kv_bytes), "attn kv cache zero");
+    }
 
     hip_check(hipMalloc(reinterpret_cast<void **>(&s->q_norm_weights), kHeadSize * sizeof(float)), "attn q norm");
     hip_check(hipMalloc(reinterpret_cast<void **>(&s->k_norm_weights), kHeadSize * sizeof(float)), "attn k norm");
@@ -4383,6 +6799,91 @@ void attention_reset(AttentionDeviceState *state) {
     state->global_position = 0;
 }
 
+void attention_upload_history(AttentionDeviceState *state, int layer_index,
+                              const std::uint16_t *keys, const std::uint16_t *values,
+                              std::size_t token_count) {
+    if (!state || (state->use_n23kv4 && token_count != 0) || layer_index < 0 || layer_index >= 16 ||
+        token_count > static_cast<std::size_t>(state->max_context) ||
+        (token_count != 0 && (!keys || !values))) {
+        throw std::invalid_argument("invalid attention history upload");
+    }
+    if (token_count == 0) return;
+    constexpr std::size_t kKvHeads = AttentionDeviceState::kKvHeads;
+    constexpr std::size_t kHeadSize = AttentionDeviceState::kHeadSize;
+    constexpr std::size_t kKvWidth = kKvHeads * kHeadSize;
+    std::vector<__half> packed(2 * kKvHeads * token_count * kHeadSize);
+    for (std::size_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
+        for (std::size_t token = 0; token < token_count; ++token) {
+            const std::size_t source = token * kKvWidth + kv_head * kHeadSize;
+            const std::size_t destination = (kv_head * token_count + token) * kHeadSize;
+            std::memcpy(packed.data() + destination, keys + source, kHeadSize * sizeof(__half));
+            std::memcpy(packed.data() + kKvHeads * token_count * kHeadSize + destination,
+                        values + source, kHeadSize * sizeof(__half));
+        }
+    }
+    const std::size_t layer_offset = static_cast<std::size_t>(layer_index) * 2ULL
+        * kKvHeads * state->max_context * kHeadSize;
+    __half *destination = state->kv_cache + layer_offset;
+    for (std::size_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
+        const std::size_t packed_offset = kv_head * token_count * kHeadSize;
+        const std::size_t device_offset = kv_head * static_cast<std::size_t>(state->max_context) * kHeadSize;
+        hip_check(hipMemcpy(destination + device_offset, packed.data() + packed_offset,
+                            token_count * kHeadSize * sizeof(__half), hipMemcpyHostToDevice),
+                  "attention history key upload");
+        hip_check(hipMemcpy(destination + kKvHeads * static_cast<std::size_t>(state->max_context) * kHeadSize
+                            + device_offset,
+                            packed.data() + kKvHeads * token_count * kHeadSize + packed_offset,
+                            token_count * kHeadSize * sizeof(__half), hipMemcpyHostToDevice),
+                  "attention history value upload");
+    }
+}
+
+void attention_download_history(const AttentionDeviceState *state, int layer_index,
+                                std::uint16_t *keys, std::uint16_t *values,
+                                std::size_t token_count) {
+    if (!state || state->use_n23kv4 || !keys || !values || layer_index < 0 || layer_index >= 16 ||
+        token_count > static_cast<std::size_t>(state->active_tokens)) {
+        throw std::invalid_argument("invalid attention history download");
+    }
+    constexpr std::size_t kKvHeads = AttentionDeviceState::kKvHeads;
+    constexpr std::size_t kHeadSize = AttentionDeviceState::kHeadSize;
+    constexpr std::size_t kKvWidth = kKvHeads * kHeadSize;
+    std::vector<__half> packed(2 * kKvHeads * token_count * kHeadSize);
+    const std::size_t layer_offset = static_cast<std::size_t>(layer_index) * 2ULL
+        * kKvHeads * state->max_context * kHeadSize;
+    const __half *source = state->kv_cache + layer_offset;
+    for (std::size_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
+        const std::size_t packed_offset = kv_head * token_count * kHeadSize;
+        const std::size_t device_offset = kv_head * static_cast<std::size_t>(state->max_context) * kHeadSize;
+        hip_check(hipMemcpy(packed.data() + packed_offset, source + device_offset,
+                            token_count * kHeadSize * sizeof(__half), hipMemcpyDeviceToHost),
+                  "attention history key download");
+        hip_check(hipMemcpy(packed.data() + kKvHeads * token_count * kHeadSize + packed_offset,
+                            source + kKvHeads * static_cast<std::size_t>(state->max_context) * kHeadSize
+                            + device_offset,
+                            token_count * kHeadSize * sizeof(__half), hipMemcpyDeviceToHost),
+                  "attention history value download");
+    }
+    for (std::size_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
+        for (std::size_t token = 0; token < token_count; ++token) {
+            const std::size_t destination = token * kKvWidth + kv_head * kHeadSize;
+            const std::size_t packed_offset = (kv_head * token_count + token) * kHeadSize;
+            std::memcpy(keys + destination, packed.data() + packed_offset, kHeadSize * sizeof(__half));
+            std::memcpy(values + destination,
+                        packed.data() + kKvHeads * token_count * kHeadSize + packed_offset,
+                        kHeadSize * sizeof(__half));
+        }
+    }
+}
+
+void attention_set_history_length(AttentionDeviceState *state, int token_count) {
+    if (!state || token_count < 0 || token_count > state->max_context) {
+        throw std::invalid_argument("invalid attention history length");
+    }
+    state->active_tokens = token_count;
+    state->global_position = token_count;
+}
+
 static void attention_shift_all_layers(AttentionDeviceState *state, hipStream_t stream) {
     constexpr int kKvHeads = AttentionDeviceState::kKvHeads;
     constexpr int kHeadSize = AttentionDeviceState::kHeadSize;
@@ -4412,18 +6913,23 @@ static void attention_shift_all_layers(AttentionDeviceState *state, hipStream_t 
 void pipeline_attention_batch8(DevicePipeline *pipeline, AttentionDeviceState *attn,
                                int layer_index,
                                const float *q_norm_weights, const float *k_norm_weights,
-                               float epsilon) {
+                               float epsilon, int batch_count) {
+    if (batch_count < 1 || batch_count > 8) {
+        throw std::invalid_argument("pipeline attention batch count must be in [1, 8]");
+    }
     constexpr int kHeads = AttentionDeviceState::kHeads;
     constexpr int kKvHeads = AttentionDeviceState::kKvHeads;
     constexpr int kHeadSize = AttentionDeviceState::kHeadSize;
 
-    if (layer_index == 0 && attn->active_tokens + 8 > attn->max_context) {
+    if (layer_index == 0 && attn->active_tokens + batch_count > attn->max_context) {
+        if (attn->use_n23kv4) {
+            throw std::runtime_error("N23KV4 attention reached its declared context capacity");
+        }
         attention_shift_all_layers(attn, pipeline->compute_stream);
     }
 
     const int write_offset = attn->active_tokens;
     const int rope_base = attn->global_position;
-    const int context_size = write_offset + 8;
 
     hip_check(hipMemcpyAsync(attn->q_norm_weights, q_norm_weights,
                              kHeadSize * sizeof(float), hipMemcpyHostToDevice,
@@ -4432,22 +6938,183 @@ void pipeline_attention_batch8(DevicePipeline *pipeline, AttentionDeviceState *a
                              kHeadSize * sizeof(float), hipMemcpyHostToDevice,
                              pipeline->compute_stream), "attn upload k norm");
 
+    float *q_buf = attn->attn_output;
+    float *gate_buf = attn->attn_output + 8ULL * kHeads * kHeadSize;
+    if (attn->use_n23kv4) {
+        hipLaunchKernelGGL(attn_prep_kv4_kernel, dim3(batch_count), dim3(kWarpSize), 0,
+                           pipeline->compute_stream,
+                           pipeline->slots[0], pipeline->slots[1], pipeline->slots[2],
+                           attn->q_norm_weights, attn->k_norm_weights, attn->rope_cos,
+                           attn->kv4_staging, q_buf, gate_buf, rope_base, epsilon);
+        hip_check(hipGetLastError(), "attn N23KV4 preparation launch");
+        const std::size_t layer_groups = static_cast<std::size_t>(kKvHeads) * attn->max_context * 8;
+        const int context_size = write_offset + batch_count;
+        int partitions = std::max(1, std::min(attn->kv4_max_partitions,
+                                              (context_size + 2047) / 2048));
+        if (const char *requested = std::getenv("QWEN_NATIVE_Q8_PARTITIONS")) {
+            partitions = std::clamp(std::atoi(requested), 1, attn->kv4_max_partitions);
+        }
+        if (attn->use_q4_cache) {
+            auto *layer_cache = attn->kv4_cache + static_cast<std::size_t>(layer_index) * 2 * layer_groups;
+            auto *layer_keys = layer_cache;
+            auto *layer_values = layer_cache + layer_groups;
+            hipLaunchKernelGGL(kv4_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                               pipeline->compute_stream, attn->kv4_staging, layer_keys,
+                               attn->max_context, write_offset, 0);
+            hip_check(hipGetLastError(), "attn Q4 key quantization launch");
+            hipLaunchKernelGGL(kv4_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                               pipeline->compute_stream, attn->kv4_staging, layer_values,
+                               attn->max_context, write_offset, 1);
+            hip_check(hipGetLastError(), "attn Q4 value quantization launch");
+            hipLaunchKernelGGL(kv4_quantize_queries_kernel, dim3(batch_count, kHeads, 8), dim3(32), 0,
+                               pipeline->compute_stream, q_buf, attn->kv4_queries, attn->kv4_query_scales);
+            hip_check(hipGetLastError(), "attn Q4 query quantization launch");
+            const char *q4_tiled = std::getenv("QWEN_NATIVE_Q4_TILED");
+            if (q4_tiled && std::strcmp(q4_tiled, "gqa48") == 0) {
+                hipLaunchKernelGGL(n23kv4_flash_gqa48_tile16_kernel,
+                                   dim3(partitions, kKvHeads), dim3(192), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values,
+                                   attn->kv4_queries, attn->kv4_query_scales, attn->kv4_partials,
+                                   context_size, attn->max_context, write_offset, partitions);
+                hip_check(hipGetLastError(), "attn Q4 flash gqa48 launch");
+            } else if (q4_tiled && std::strcmp(q4_tiled, "gqa24") == 0) {
+                hipLaunchKernelGGL(n23kv4_flash_gqa24_tile16_kernel,
+                                   dim3(partitions, kKvHeads * 2), dim3(192), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values,
+                                   attn->kv4_queries, attn->kv4_query_scales, attn->kv4_partials,
+                                   context_size, attn->max_context, write_offset, partitions);
+                hip_check(hipGetLastError(), "attn Q4 flash gqa24 launch");
+            } else {
+                hipLaunchKernelGGL(n23kv4_flash_warp16_kernel,
+                                   dim3(kKvHeads * 3, partitions), dim3(512), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values,
+                                   attn->kv4_queries, attn->kv4_query_scales, attn->kv4_partials,
+                                   context_size, attn->max_context, write_offset, partitions);
+                hip_check(hipGetLastError(), "attn Q4 flash warp16 launch");
+            }
+        } else if (attn->use_q8_long_cache) {
+            auto *layer_keys = attn->q8_key_cache + static_cast<std::size_t>(layer_index) * layer_groups;
+            auto *layer_values = attn->q8_value_cache + static_cast<std::size_t>(layer_index) * layer_groups;
+            hipLaunchKernelGGL(q8_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                               pipeline->compute_stream, attn->kv4_staging, layer_keys,
+                               attn->max_context, write_offset, 0);
+            hip_check(hipGetLastError(), "attn Q8 key quantization launch");
+            hipLaunchKernelGGL(q8_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                               pipeline->compute_stream, attn->kv4_staging, layer_values,
+                               attn->max_context, write_offset, 1);
+            hip_check(hipGetLastError(), "attn Q8 value quantization launch");
+            const char *q8_tiled = std::getenv("QWEN_NATIVE_Q8_TILED");
+            if (q8_tiled && std::strcmp(q8_tiled, "warp16lds") == 0) {
+                hipLaunchKernelGGL(q8kv_flash_partial_warp16_lds_kernel,
+                                   dim3(partitions, kKvHeads * 3), dim3(512), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else if (q8_tiled && std::strcmp(q8_tiled, "warp12") == 0) {
+                hipLaunchKernelGGL(q8kv_flash_partial_warp_kernel,
+                                   dim3(partitions, kKvHeads * 4), dim3(384), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else if (q8_tiled && std::strcmp(q8_tiled, "warp16") == 0) {
+                hipLaunchKernelGGL(q8kv_flash_partial_warp_kernel,
+                                   dim3(partitions, kKvHeads * 3), dim3(512), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else if (q8_tiled && std::strcmp(q8_tiled, "warp24") == 0) {
+                hipLaunchKernelGGL(q8kv_flash_partial_warp_kernel,
+                                   dim3(partitions, kKvHeads * 2), dim3(768), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else if (q8_tiled && std::strcmp(q8_tiled, "warp") == 0) {
+                hipLaunchKernelGGL(q8kv_flash_partial_warp_kernel,
+                                   dim3(partitions, kKvHeads * 6), dim3(256), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else if (q8_tiled && std::strcmp(q8_tiled, "24") == 0) {
+                hipLaunchKernelGGL(q8kv_flash_partial_tiled24_kernel,
+                                   dim3(partitions, kKvHeads * 2), dim3(256), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else if (q8_tiled) {
+                hipLaunchKernelGGL(q8kv_flash_partial_tiled8_kernel,
+                                   dim3(partitions, kKvHeads * 6), dim3(256), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            } else {
+                hipLaunchKernelGGL(q8kv_flash_partial_kernel,
+                                   dim3(partitions, kKvHeads * 6), dim3(256), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, q_buf,
+                                   attn->kv4_partials, context_size, attn->max_context,
+                                   write_offset, partitions);
+            }
+            hip_check(hipGetLastError(), "attn Q8 flash partial launch");
+        } else {
+            hipLaunchKernelGGL(kv4_quantize_queries_kernel, dim3(batch_count, kHeads, 8), dim3(32), 0,
+                               pipeline->compute_stream, q_buf, attn->kv4_queries, attn->kv4_query_scales);
+            hip_check(hipGetLastError(), "attn N23KV4 query quantization launch");
+            if (attn->use_mixed_n23k_cache) {
+                auto *layer_keys = attn->kv4_cache + static_cast<std::size_t>(layer_index) * layer_groups;
+                auto *layer_values = attn->q8_value_cache + static_cast<std::size_t>(layer_index) * layer_groups;
+                hipLaunchKernelGGL(kv4_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                                   pipeline->compute_stream, attn->kv4_staging, layer_keys,
+                                   attn->max_context, write_offset, 0);
+                hip_check(hipGetLastError(), "attn N23 key quantization launch");
+                hipLaunchKernelGGL(q8_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                                   pipeline->compute_stream, attn->kv4_staging, layer_values,
+                                   attn->max_context, write_offset, 1);
+                hip_check(hipGetLastError(), "attn Q8 value quantization launch");
+                hipLaunchKernelGGL(n23k_q8v_flash_partial_kernel,
+                                   dim3(partitions, batch_count * kHeads), dim3(256), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, attn->kv4_queries,
+                                   attn->kv4_query_scales, attn->kv4_partials,
+                                   context_size, attn->max_context, write_offset, partitions);
+                hip_check(hipGetLastError(), "attn N23K/Q8V flash partial launch");
+            } else {
+                auto *layer_cache = attn->kv4_cache + static_cast<std::size_t>(layer_index) * 2 * layer_groups;
+                auto *layer_keys = layer_cache;
+                auto *layer_values = layer_cache + layer_groups;
+                hipLaunchKernelGGL(kv4_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                                   pipeline->compute_stream, attn->kv4_staging, layer_keys,
+                                   attn->max_context, write_offset, 0);
+                hip_check(hipGetLastError(), "attn N23KV4 key quantization launch");
+                hipLaunchKernelGGL(kv4_quantize_cache_kernel, dim3(batch_count, kKvHeads * 8), dim3(32), 0,
+                                   pipeline->compute_stream, attn->kv4_staging, layer_values,
+                                   attn->max_context, write_offset, 1);
+                hip_check(hipGetLastError(), "attn N23KV4 value quantization launch");
+                hipLaunchKernelGGL(n23kv4_flash_partial_kernel, dim3(partitions, kKvHeads * 6), dim3(256), 0,
+                                   pipeline->compute_stream, layer_keys, layer_values, attn->kv4_queries,
+                                   attn->kv4_query_scales, attn->kv4_partials,
+                                   context_size, attn->max_context, write_offset, partitions);
+                hip_check(hipGetLastError(), "attn N23KV4 flash partial launch");
+            }
+        }
+        hipLaunchKernelGGL(n23kv4_flash_reduce_kernel, dim3(batch_count * kHeads), dim3(256), 0,
+                           pipeline->compute_stream, attn->kv4_partials, pipeline->slots[0], partitions);
+        hip_check(hipGetLastError(), "attn N23KV4 flash reduction launch");
+        hipLaunchKernelGGL(kv4_apply_gate_kernel, dim3(batch_count, kHeads), dim3(256), 0,
+                           pipeline->compute_stream, pipeline->slots[0], gate_buf, pipeline->slots[0]);
+        hip_check(hipGetLastError(), "attn N23KV4 gate launch");
+        return;
+    }
+
     const std::size_t layer_kv_offset = static_cast<std::size_t>(layer_index) * 2ULL
         * kKvHeads * attn->max_context * kHeadSize;
     __half *layer_kv = attn->kv_cache + layer_kv_offset;
-
-    float *q_buf = attn->attn_output;
-    float *gate_buf = attn->attn_output + 8ULL * kHeads * kHeadSize;
-
-    hipLaunchKernelGGL(attn_prep_kernel, dim3(8), dim3(kWarpSize), 0, pipeline->compute_stream,
+    hipLaunchKernelGGL(attn_prep_kernel, dim3(batch_count), dim3(kWarpSize), 0, pipeline->compute_stream,
                        pipeline->slots[0], pipeline->slots[1], pipeline->slots[2],
                        attn->q_norm_weights, attn->k_norm_weights,
                        attn->rope_cos,
                        layer_kv, q_buf, gate_buf,
                        attn->max_context, write_offset, rope_base, epsilon);
 
-    const std::size_t smem_bytes = static_cast<std::size_t>(context_size) * sizeof(float);
-    hipLaunchKernelGGL(attn_score_kernel, dim3(8, kHeads), dim3(256), smem_bytes,
+    const std::size_t smem_bytes = static_cast<std::size_t>(write_offset + batch_count) * sizeof(float);
+    hipLaunchKernelGGL(attn_score_kernel, dim3(batch_count, kHeads), dim3(256), smem_bytes,
                        pipeline->compute_stream,
                        q_buf, gate_buf, layer_kv, pipeline->slots[0],
                        write_offset, attn->max_context);
@@ -4480,6 +7147,14 @@ struct RecurrentDeviceState {
     float *gdn_output = nullptr;
     float *decays = nullptr;
     float *betas = nullptr;
+
+    // Compact transactional record for the last verifier batch. Replaying the
+    // recurrent update factors is far cheaper than rerunning all 64 layers.
+    float *rollback_qkv = nullptr;
+    float *rollback_keys = nullptr;
+    float *rollback_values = nullptr;
+    float *rollback_decays = nullptr;
+    float *rollback_betas = nullptr;
 };
 
 RecurrentDeviceState *create_recurrent_device_state(int num_layers, int qkv_width,
@@ -4527,6 +7202,15 @@ RecurrentDeviceState *create_recurrent_device_state(int num_layers, int qkv_widt
     hip_check(hipMalloc(reinterpret_cast<void **>(&s->decays), db_bytes), "recurrent decays");
     hip_check(hipMalloc(reinterpret_cast<void **>(&s->betas), db_bytes), "recurrent betas");
 
+    const std::size_t rollback_qkv_bytes = static_cast<std::size_t>(num_layers) * 8 * qkv_width * sizeof(float);
+    const std::size_t rollback_vector_bytes = static_cast<std::size_t>(num_layers) * 8 * recurrent_width * sizeof(float);
+    const std::size_t rollback_db_bytes = static_cast<std::size_t>(num_layers) * 8 * value_heads * sizeof(float);
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->rollback_qkv), rollback_qkv_bytes), "recurrent rollback qkv");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->rollback_keys), rollback_vector_bytes), "recurrent rollback keys");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->rollback_values), rollback_vector_bytes), "recurrent rollback values");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->rollback_decays), rollback_db_bytes), "recurrent rollback decays");
+    hip_check(hipMalloc(reinterpret_cast<void **>(&s->rollback_betas), rollback_db_bytes), "recurrent rollback betas");
+
     return s;
 }
 
@@ -4545,6 +7229,11 @@ void destroy_recurrent_device_state(RecurrentDeviceState *s) {
     if (s->gdn_output) (void)hipFree(s->gdn_output);
     if (s->decays) (void)hipFree(s->decays);
     if (s->betas) (void)hipFree(s->betas);
+    if (s->rollback_qkv) (void)hipFree(s->rollback_qkv);
+    if (s->rollback_keys) (void)hipFree(s->rollback_keys);
+    if (s->rollback_values) (void)hipFree(s->rollback_values);
+    if (s->rollback_decays) (void)hipFree(s->rollback_decays);
+    if (s->rollback_betas) (void)hipFree(s->rollback_betas);
     delete s;
 }
 
@@ -4571,13 +7260,49 @@ void recurrent_reset_conv_states(RecurrentDeviceState *s) {
     }
 }
 
+void recurrent_upload_convolution_state(RecurrentDeviceState *state, int layer_index,
+                                        const float *history, std::size_t value_count) {
+    if (!state || !history || layer_index < 0 || layer_index >= state->num_layers ||
+        value_count != 3ULL * static_cast<std::size_t>(state->qkv_width)) {
+        throw std::invalid_argument("invalid recurrent convolution upload");
+    }
+    hip_check(hipMemcpy(state->conv_states[layer_index], history,
+                        value_count * sizeof(float), hipMemcpyHostToDevice),
+              "recurrent convolution upload");
+}
+
+void recurrent_download_convolution_state(const RecurrentDeviceState *state, int layer_index,
+                                          float *history, std::size_t value_count) {
+    if (!state || !history || layer_index < 0 || layer_index >= state->num_layers ||
+        value_count != 3ULL * static_cast<std::size_t>(state->qkv_width)) {
+        throw std::invalid_argument("invalid recurrent convolution download");
+    }
+    hip_check(hipMemcpy(history, state->conv_states[layer_index],
+                        value_count * sizeof(float), hipMemcpyDeviceToHost),
+              "recurrent convolution download");
+}
+
 void pipeline_recurrent_batch8(DevicePipeline *pipeline, RecurrentDeviceState *recurrent,
-                               int layer_index, void *gdn_state, float epsilon) {
+                               int layer_index, void *gdn_state, float epsilon, int batch_count,
+                               const float *normalized_hidden, float *output_buffer) {
+    if (batch_count < 1 || batch_count > 8) {
+        throw std::invalid_argument("pipeline recurrent batch count must be in [1, 8]");
+    }
     const int qkv_width = recurrent->qkv_width;
     const int recurrent_width = recurrent->recurrent_width;
     const int value_heads = recurrent->value_heads;
     const int head_size = recurrent->head_size;
     const int actual_key_heads = (qkv_width - value_heads * head_size) / (2 * head_size);
+
+    // Preserve the projected QKV input before convolution mutates the shared
+    // pipeline slots. Prefix commit uses this only to rebuild conv history.
+    const std::size_t qkv_layer_stride = 8ULL * qkv_width;
+    hip_check(hipMemcpyAsync(recurrent->rollback_qkv
+                                 + static_cast<std::size_t>(layer_index) * qkv_layer_stride,
+                             pipeline->slots[0],
+                             static_cast<std::size_t>(batch_count) * qkv_width * sizeof(float),
+                             hipMemcpyDeviceToDevice, pipeline->compute_stream),
+              "capture recurrent rollback qkv");
 
     // Conv1d kernel: process QKV from slot[0], write queries/keys/values
     {
@@ -4589,7 +7314,7 @@ void pipeline_recurrent_batch8(DevicePipeline *pipeline, RecurrentDeviceState *r
                            recurrent->conv_states[layer_index],
                            recurrent->conv_weights[layer_index],
                            recurrent->queries, recurrent->keys, recurrent->values,
-                           qkv_width, actual_key_heads, value_heads, head_size);
+                           qkv_width, actual_key_heads, value_heads, head_size, batch_count);
         hip_check(hipGetLastError(), "recurrent conv1d launch");
     }
 
@@ -4598,40 +7323,98 @@ void pipeline_recurrent_batch8(DevicePipeline *pipeline, RecurrentDeviceState *r
     hipLaunchKernelGGL(recurrent_l2_norm_batch8_kernel, dim3(value_heads), dim3(128),
                        0, pipeline->compute_stream,
                        recurrent->queries, recurrent->keys,
-                       recurrent_width, head_size, epsilon);
+                       recurrent_width, head_size, epsilon, batch_count);
     hip_check(hipGetLastError(), "recurrent l2_norm launch");
+
+    const std::size_t vector_layer_stride = 8ULL * recurrent_width;
+    const std::size_t captured_vector_bytes = static_cast<std::size_t>(batch_count)
+                                            * recurrent_width * sizeof(float);
+    hip_check(hipMemcpyAsync(recurrent->rollback_keys
+                                 + static_cast<std::size_t>(layer_index) * vector_layer_stride,
+                             recurrent->keys, captured_vector_bytes,
+                             hipMemcpyDeviceToDevice, pipeline->compute_stream),
+              "capture recurrent rollback keys");
+    hip_check(hipMemcpyAsync(recurrent->rollback_values
+                                 + static_cast<std::size_t>(layer_index) * vector_layer_stride,
+                             recurrent->values, captured_vector_bytes,
+                             hipMemcpyDeviceToDevice, pipeline->compute_stream),
+              "capture recurrent rollback values");
+
+    const float *norm_hid = normalized_hidden ? normalized_hidden : pipeline->hidden;
+    float *out_buf = output_buffer ? output_buffer : pipeline->hidden;
 
     // Decay/beta from hidden state
     hipLaunchKernelGGL(recurrent_decay_beta_batch8_kernel, dim3(value_heads), dim3(256),
                        0, pipeline->compute_stream,
-                       pipeline->hidden,
+                       norm_hid,
                        recurrent->beta_weights[layer_index],
                        recurrent->alpha_weights[layer_index],
                        recurrent->dt_bias[layer_index],
                        recurrent->a_weights[layer_index],
                        recurrent->decays, recurrent->betas,
-                       recurrent->embedding_size);
+                       recurrent->embedding_size, batch_count);
     hip_check(hipGetLastError(), "recurrent decay_beta launch");
 
+    const std::size_t db_layer_stride = 8ULL * value_heads;
+    const std::size_t captured_db_bytes = static_cast<std::size_t>(batch_count)
+                                        * value_heads * sizeof(float);
+    hip_check(hipMemcpyAsync(recurrent->rollback_decays
+                                 + static_cast<std::size_t>(layer_index) * db_layer_stride,
+                             recurrent->decays, captured_db_bytes,
+                             hipMemcpyDeviceToDevice, pipeline->compute_stream),
+              "capture recurrent rollback decays");
+    hip_check(hipMemcpyAsync(recurrent->rollback_betas
+                                 + static_cast<std::size_t>(layer_index) * db_layer_stride,
+                             recurrent->betas, captured_db_bytes,
+                             hipMemcpyDeviceToDevice, pipeline->compute_stream),
+              "capture recurrent rollback betas");
 
     // Gated delta step on device (no memcpy!)
     hipLaunchKernelGGL(gated_delta_step_batch8_kernel, dim3(48), dim3(256),
                        0, pipeline->compute_stream,
                        recurrent->queries, recurrent->keys, recurrent->values,
                        recurrent->decays, recurrent->betas,
-                       static_cast<__half *>(gdn_state),
-                       recurrent->gdn_output, head_size, 8);
+                       static_cast<float *>(gdn_state),
+                       recurrent->gdn_output, head_size, batch_count);
     hip_check(hipGetLastError(), "recurrent gdn launch");
 
 
-    // SSM norm + silu(gate) → pipeline hidden
+    // SSM norm + silu(gate) → pipeline output buffer
     hipLaunchKernelGGL(recurrent_ssm_norm_gate_batch8_kernel, dim3(value_heads), dim3(128),
                        0, pipeline->compute_stream,
                        recurrent->gdn_output, pipeline->slots[1],
                        recurrent->norm_weights[layer_index],
-                       pipeline->hidden,
-                       recurrent_width, value_heads, head_size, epsilon);
+                       out_buf,
+                       recurrent_width, value_heads, head_size, epsilon, batch_count);
     hip_check(hipGetLastError(), "recurrent ssm_norm_gate launch");
+}
+
+void recurrent_commit_captured_prefix(RecurrentDeviceState *state, int layer_index,
+                                      void *gdn_state, int committed_tokens) {
+    if (!state || !gdn_state || layer_index < 0 || layer_index >= state->num_layers ||
+        committed_tokens < 1 || committed_tokens > 8) {
+        throw std::invalid_argument("invalid captured recurrent prefix commit");
+    }
+    constexpr int threads = 256;
+    const int conv_blocks = (state->qkv_width + threads - 1) / threads;
+    const std::size_t qkv_offset = static_cast<std::size_t>(layer_index) * 8 * state->qkv_width;
+    hipLaunchKernelGGL(recurrent_conv_commit_prefix_kernel, dim3(conv_blocks), dim3(threads),
+                       0, nullptr,
+                       state->rollback_qkv + qkv_offset,
+                       state->conv_states[layer_index], state->qkv_width, committed_tokens);
+    hip_check(hipGetLastError(), "recurrent captured conv commit launch");
+
+    const std::size_t vector_offset = static_cast<std::size_t>(layer_index)
+                                    * 8 * state->recurrent_width;
+    const std::size_t db_offset = static_cast<std::size_t>(layer_index) * 8 * state->value_heads;
+    hipLaunchKernelGGL(recurrent_gdn_commit_prefix_kernel, dim3(state->value_heads), dim3(256),
+                       0, nullptr,
+                       state->rollback_keys + vector_offset,
+                       state->rollback_values + vector_offset,
+                       state->rollback_decays + db_offset,
+                       state->rollback_betas + db_offset,
+                       static_cast<float *>(gdn_state), state->head_size, committed_tokens);
+    hip_check(hipGetLastError(), "recurrent captured GDN commit launch");
 }
 
 } // namespace qwen_native
