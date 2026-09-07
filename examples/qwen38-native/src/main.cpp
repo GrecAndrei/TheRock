@@ -853,7 +853,7 @@ public:
         }
 
         constexpr std::size_t max_ffn_weight = (kFfn / 32) * kEmbedding * 34;
-        pipeline_ = qwen_native::create_device_pipeline(kEmbedding, kFfn, max_ffn_weight);
+        pipeline_ = qwen_native::create_device_pipeline(kEmbedding, kFfn, max_ffn_weight, context_capacity_);
 
         constexpr int kQkvWidth = 2 * kRecurrentKeyHeads * kRecurrentHeadSize +
                                   kRecurrentValueHeads * kRecurrentHeadSize;
@@ -1564,7 +1564,41 @@ private:
         }
         pipeline_state_current_ = true;
     }
-
+public:
+    // Fast prefill for large batches (512 tokens/call) with weight reuse and no DFlash
+    BatchStepResult step_batch_large(const std::vector<uint32_t> &tokens) {
+        if (tokens.empty() || tokens.size() > 1024) throw std::invalid_argument("prefill batch must be in [1,1024]");
+        // For large prefill, keep weights resident across the 64 sub-batches of the 512 chunk
+        // to cut PCIe 64×. Preload the first 8 layers' QKV to warm the cache.
+        if (tokens.size() > 64) {
+            for (int layer = 0; layer < 8; ++layer) {
+                const std::string prefix = "blk." + std::to_string(layer) + ".";
+                if ((layer+1)%4==0) {
+                    const auto &q = tensor(prefix+"attn_q.weight"); qwen_native::preload_resident_k_matrix(tensor_data(mapping_,model_,q), q.type, kEmbedding, 2*kAttentionHeads*kAttentionHeadSize);
+                } else {
+                    const auto &qkv = tensor(prefix+"attn_qkv.weight"); qwen_native::preload_resident_k_matrix(tensor_data(mapping_,model_,qkv), qkv.type, kEmbedding, 2*kRecurrentKeyHeads*kRecurrentHeadSize + kRecurrentValueHeads*kRecurrentHeadSize);
+                }
+            }
+        }
+        BatchStepResult result;
+        for (size_t offset = 0; offset < tokens.size(); offset += 8) {
+            size_t valid = std::min<size_t>(8, tokens.size() - offset);
+            std::array<uint32_t,8> batch{}; batch.fill(248070);
+            std::copy_n(tokens.begin()+offset, valid, batch.begin());
+            auto sub = step_batch8_pipelined(batch, valid, false);
+            result.recurrent_seconds += sub.recurrent_seconds;
+            result.attention_seconds += sub.attention_seconds;
+            result.ffn_seconds += sub.ffn_seconds;
+            result.output_seconds += sub.output_seconds;
+            result.seconds += sub.seconds;
+            if (offset + valid == tokens.size()) {
+                result.next_tokens = sub.next_tokens;
+                result.top_logits = sub.top_logits;
+            }
+        }
+        return result;
+    }
+private:
     void synchronize_host_state() {
         if (!pipeline_state_current_) return;
         for (std::size_t layer = 0; layer < attention_.size(); ++layer) {
@@ -3823,20 +3857,21 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
 
         const auto prefill_started = std::chrono::steady_clock::now();
         std::uint32_t anchor = 0;
-        // Fast prefill: first 129k without DFlash capture/injection (window is 2048)
+        // Fast prefill: first 129k without DFlash, batched as 512 to cut 16k steps -> 252 steps
         constexpr std::size_t dflash_window = 2048;
+        constexpr std::size_t prefill_batch = 512;
         const std::size_t fast_end = prompt.size() > dflash_window ? prompt.size() - dflash_window : 0;
-        for (std::size_t begin = 0; begin < fast_end; begin += 8) {
-            const std::size_t valid = std::min<std::size_t>(8, fast_end - begin);
-            std::array<std::uint32_t, 8> batch{};
-            batch.fill(248070);
-            std::copy_n(prompt.begin() + begin, valid, batch.begin());
-            const auto result = target.step_batch8_pipelined(batch, valid, false);
-            anchor = result.next_tokens[valid - 1];
+        for (std::size_t begin = 0; begin < fast_end; begin += prefill_batch) {
+            const std::size_t valid = std::min<std::size_t>(prefill_batch, fast_end - begin);
+            std::vector<uint32_t> chunk(prompt.begin() + begin, prompt.begin() + begin + valid);
+            const auto result = target.step_batch_large(chunk);
+            // For large batch, the last sub-batch has valid = min(8, remaining) and next_tokens[valid-1] is the true anchor
+            const std::size_t last_sub_valid = valid % 8 == 0 ? 8 : valid % 8;
+            anchor = result.next_tokens[last_sub_valid - 1];
             if ((begin + valid) % 8192 == 0) {
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - prefill_started).count();
-                std::cerr << "  [run " << run << " prefill " << begin + valid << '/' << prompt.size() << " (fast, no DFlash), " << std::fixed << std::setprecision(1) << elapsed << "s]\n";
+                std::cerr << "  [run " << run << " prefill " << begin + valid << '/' << prompt.size() << " (fast 512, no DFlash), " << std::fixed << std::setprecision(1) << elapsed << "s]\n";
             }
         }
         for (std::size_t begin = fast_end; begin < prompt.size(); begin += 8) {

@@ -22,6 +22,17 @@ void cpu_quant_matvec_batch8_rows_packed_dual(
     std::size_t gate_rows, const void *up_weights, std::uint32_t up_type,
     float *up_output, std::size_t up_rows, const float *input,
     std::size_t input_size, int thread_count);
+// Fused QKV triple for attention (saves 2 barriers per attention layer, 32 per decode)
+void cpu_quant_matvec_batch8_rows_packed_triple(
+    const void *q_weights, std::uint32_t q_type, float *q_output, std::size_t q_rows,
+    const void *k_weights, std::uint32_t k_type, float *k_output, std::size_t k_rows,
+    const void *v_weights, std::uint32_t v_type, float *v_output, std::size_t v_rows,
+    const float *input, std::size_t input_size, int thread_count);
+// Large batch (up to 512) for prefill
+void cpu_quant_matvec_batch_large(const void *weights, std::uint32_t type,
+                                   const float *input, std::size_t input_size,
+                                   float *output, std::size_t row_count, std::size_t batch_size,
+                                   int thread_count);
 void clear_cpu_packed_matrix_cache();
 std::size_t cpu_packed_matrix_cache_bytes();
 

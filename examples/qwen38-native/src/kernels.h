@@ -122,7 +122,7 @@ void execute_n23q4_batch8_cached(const void *weights, const float *input,
 // kernel execution using two streams and double-buffered weight staging.
 struct DevicePipeline;
 DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t ffn_size,
-                                       std::size_t max_weight_bytes);
+                                       std::size_t max_weight_bytes, std::size_t max_context = 4096);
 void destroy_device_pipeline(DevicePipeline *pipeline);
 
 // Upload/download the batch-8 hidden state (8 × embedding_size floats).
@@ -156,6 +156,13 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
                                     std::size_t output_size, bool keep_resident,
                                     int output_slot,
                                     const float *input_buffer = nullptr);
+void pipeline_project_batch_large(DevicePipeline *pipeline, const void *weights,
+                                   std::uint32_t type, std::size_t input_size,
+                                   std::size_t output_size, std::size_t batch_size,
+                                   bool keep_resident, int output_slot,
+                                   const float *input_buffer = nullptr);
+std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size);
+std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size, std::size_t max_context);
 void pipeline_project_attention_qkv_hybrid(
     DevicePipeline *pipeline,
     const void *q_weights, std::uint32_t q_type, std::size_t q_size,
