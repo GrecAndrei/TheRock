@@ -363,55 +363,6 @@ __global__ void q4k_matvec_kernel(const Q4KBlock *__restrict__ weights,
     }
 }
 
-__global__ void q4k_matvec_batch_large_kernel(const Q4KBlock *__restrict__ weights,
-                                              const float *__restrict__ input,
-                                              float *__restrict__ output,
-                                              int input_size, int blocks_per_row, int rows, int batch_size) {
-    const int row = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.y) + static_cast<int>(threadIdx.y);
-    const int lane = static_cast<int>(threadIdx.x);
-    if (row >= rows || lane >= kWarpSize) return;
-    // Use shared memory for sums up to 64 batch, or loop for larger
-    // For simplicity, handle batch up to 64 with loop over 8-chunks
-    const Q4KBlock *row_weights = weights + static_cast<std::size_t>(row) * blocks_per_row;
-    // Process batch in chunks of 8 to reuse the same kernel logic
-    for (int batch_base = 0; batch_base < batch_size; batch_base += 8) {
-        float sums[8] = {};
-        const int chunk = std::min(8, batch_size - batch_base);
-        for (int block_index = 0; block_index < blocks_per_row; ++block_index) {
-            const Q4KBlock &block = row_weights[block_index];
-            const float scale_all = __half2float(*reinterpret_cast<const __half *>(&block.d));
-            const float min_all = __half2float(*reinterpret_cast<const __half *>(&block.dmin));
-#pragma unroll
-            for (int group = 0; group < 4; ++group) {
-                std::uint8_t scale0 = 0; std::uint8_t min0 = 0; std::uint8_t scale1 = 0; std::uint8_t min1 = 0;
-                scale_min(block.scales, group * 2, scale0, min0);
-                scale_min(block.scales, group * 2 + 1, scale1, min1);
-                const std::uint8_t quant = block.quants[group * kWarpSize + lane];
-                const int index0 = block_index * kQuantBlock + group * 64 + lane;
-                const int index1 = index0 + 32;
-                const float weight0 = scale_all * static_cast<float>(scale0) * static_cast<float>(quant & 0x0F) - min_all * static_cast<float>(min0);
-                const float weight1 = scale_all * static_cast<float>(scale1) * static_cast<float>(quant >> 4) - min_all * static_cast<float>(min1);
-#pragma unroll
-                for (int b = 0; b < 8; ++b) if (b < chunk) {
-                    const float *batch_input = input + static_cast<std::size_t>(batch_base + b) * input_size;
-                    sums[b] = fmaf(weight0, batch_input[index0], sums[b]);
-                    sums[b] = fmaf(weight1, batch_input[index1], sums[b]);
-                }
-            }
-        }
-#pragma unroll
-        for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-#pragma unroll
-            for (int b = 0; b < 8; ++b) if (b < chunk) sums[b] += __shfl_down(sums[b], offset, kWarpSize);
-        }
-        if (lane == 0) {
-#pragma unroll
-            for (int b = 0; b < 8; ++b) if (b < chunk) output[static_cast<std::size_t>(batch_base + b) * rows + row] = sums[b];
-        }
-        __syncthreads();
-    }
-}
-
 __global__ void q4k_matvec_batch8_kernel(const Q4KBlock *__restrict__ weights,
                                          const float *__restrict__ input,
                                          float *__restrict__ output,
@@ -3530,45 +3481,6 @@ void launch_k_matvec_batch8(std::uint32_t type, const void *weights, const float
     }
 }
 
-void launch_k_matvec_batch_large(std::uint32_t type, const void *weights, const float *input,
-                                 float *output, std::size_t input_size, std::size_t output_size,
-                                 std::size_t batch_size, hipStream_t stream = nullptr) {
-    if (batch_size <= 8) {
-        launch_k_matvec_batch8(type, weights, input, output, input_size, output_size, stream);
-        return;
-    }
-    // For large batch, use the large kernel for Q4K (most common FFN), fallback to loop for others
-    if (type == 12) {
-        const dim3 grid(static_cast<unsigned int>((output_size + 3) / 4));
-        const dim3 block(kWarpSize, 4);
-        hipLaunchKernelGGL(q4k_matvec_batch_large_kernel, grid, block, 0, stream,
-                           static_cast<const Q4KBlock *>(weights), input, output,
-                           static_cast<int>(input_size), static_cast<int>(input_size / kQuantBlock),
-                           static_cast<int>(output_size), static_cast<int>(batch_size));
-        return;
-    }
-    // Fallback: loop over 8-chunks for other types
-    for (size_t offset = 0; offset < batch_size; offset += 8) {
-        size_t chunk = std::min<size_t>(8, batch_size - offset);
-        if (chunk == 8) {
-            launch_k_matvec_batch8(type, weights, input + offset * input_size, output + offset * output_size, input_size, output_size, stream);
-        } else {
-            for (size_t b = 0; b < chunk; ++b) {
-                // Use single matvec for partial chunk (no stream, sync)
-                const dim3 grid(static_cast<unsigned int>(output_size));
-                const dim3 block(kWarpSize);
-                switch (type) {
-                case 12: hipLaunchKernelGGL(q4k_matvec_kernel, grid, block, 0, stream, static_cast<const Q4KBlock *>(weights), input + (offset+b)*input_size, output + (offset+b)*output_size, static_cast<int>(input_size / kQuantBlock), static_cast<int>(output_size)); break;
-                case 13: hipLaunchKernelGGL(q5k_matvec_kernel, grid, block, 0, stream, static_cast<const Q5KBlock *>(weights), input + (offset+b)*input_size, output + (offset+b)*output_size, static_cast<int>(input_size / kQuantBlock), static_cast<int>(output_size)); break;
-                case 14: hipLaunchKernelGGL(q6k_matvec_kernel, grid, block, 0, stream, static_cast<const Q6KBlock *>(weights), input + (offset+b)*input_size, output + (offset+b)*output_size, static_cast<int>(input_size / kQuantBlock), static_cast<int>(output_size)); break;
-                default: throw std::invalid_argument("unsupported partial batch type");
-                }
-            }
-        }
-        (void)chunk;
-    }
-}
-
 void launch_k_matvec(std::uint32_t type, const void *weights, const float *input,
                      float *output, std::size_t input_size, std::size_t output_size) {
     const dim3 grid(static_cast<unsigned int>(output_size));
@@ -5531,11 +5443,7 @@ struct AsyncWorker {
 
 struct DevicePipeline {
     hipStream_t compute_stream = nullptr;
-    hipStream_t compute_stream2 = nullptr;
     hipStream_t transfer_stream = nullptr;
-    hipStream_t dflash_stream = nullptr;
-    hipEvent_t dflash_done = nullptr;
-    bool dflash_done_valid = false;
     AsyncWorker async_worker;
 
     float *hidden = nullptr;
@@ -5570,7 +5478,6 @@ struct DevicePipeline {
     std::size_t embedding_size = 0;
     std::size_t ffn_size = 0;
     std::size_t max_weight_bytes = 0;
-    std::size_t max_context = 4096;
 
     ~DevicePipeline() {
         if (hidden) (void)hipFree(hidden);
@@ -5589,26 +5496,19 @@ struct DevicePipeline {
         if (inline_done) (void)hipEventDestroy(inline_done);
         if (inline_consumed) (void)hipEventDestroy(inline_consumed);
         if (compute_stream) (void)hipStreamDestroy(compute_stream);
-        if (compute_stream2) (void)hipStreamDestroy(compute_stream2);
         if (transfer_stream) (void)hipStreamDestroy(transfer_stream);
-        if (dflash_stream) (void)hipStreamDestroy(dflash_stream);
-        if (dflash_done) (void)hipEventDestroy(dflash_done);
     }
 };
 
 DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t ffn_size,
-                                       std::size_t max_weight_bytes, std::size_t max_context) {
+                                       std::size_t max_weight_bytes) {
     auto *p = new DevicePipeline();
     p->embedding_size = embedding_size;
     p->ffn_size = ffn_size;
     p->max_weight_bytes = max_weight_bytes;
-    p->max_context = max_context;
 
     hip_check(hipStreamCreate(&p->compute_stream), "pipeline compute stream");
-    hip_check(hipStreamCreate(&p->compute_stream2), "pipeline compute stream2");
     hip_check(hipStreamCreate(&p->transfer_stream), "pipeline transfer stream");
-    hip_check(hipStreamCreate(&p->dflash_stream), "pipeline dflash stream");
-    hip_check(hipEventCreateWithFlags(&p->dflash_done, hipEventDisableTiming), "pipeline dflash done event");
 
     const std::size_t hidden_bytes = 8 * std::max(embedding_size, ffn_size) * sizeof(float);
     const std::size_t ffn_bytes = 8 * ffn_size * sizeof(float);
@@ -5884,12 +5784,6 @@ void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
 }
 
 std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size) {
-    return hybrid_cpu_row_count(type, output_size, 4096);
-}
-std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size, std::size_t max_context) {
-    (void)max_context;
-    // 90% CPU for Q4K etc is sweet spot for both short and long context on this host.
-    const bool long_context = false;
     // Balance exact output-row shards from measured per-format throughput.
     // Q4_K/Q5_K/IQ4_XS sustain about 24 GB/s, Q6_K about 19 GB/s, and
     // streamed GPU rows about 10 GB/s on this host. Keep row counts aligned
@@ -5897,9 +5791,9 @@ std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size, st
     std::size_t numerator = 1;
     std::size_t denominator = 2;
     if (type == 12 || type == 13 || type == 23) {
-        numerator = long_context ? 19 : 9; denominator = long_context ? 20 : 10;
+        numerator = 9; denominator = 10;
     } else if (type == 14) {
-        numerator = long_context ? 9 : 17; denominator = long_context ? 10 : 20;
+        numerator = 17; denominator = 20;
     } else if (type == 11 || type == 21) {
         numerator = 1; denominator = 5;
     } else if (type == 20) {
@@ -6002,7 +5896,7 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
         return;
     }
 
-    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size, pipeline->max_context);
+    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size);
     const std::size_t gpu_rows = output_size - cpu_rows;
     const std::size_t row_bytes = weight_bytes / output_size;
     if (gpu_rows * row_bytes > pipeline->max_weight_bytes) {
@@ -6103,9 +5997,9 @@ void pipeline_project_attention_qkv_hybrid(
     hip_check(hipMemcpy(pipeline->hybrid_host_input, in_act,
                         8 * input_size * sizeof(float), hipMemcpyDeviceToHost),
               "grouped attention QKV download input");
-    const std::size_t q_cpu_rows = q_resident ? 0 : hybrid_cpu_row_count(q_type, q_size, pipeline->max_context);
-    const std::size_t k_cpu_rows = k_resident ? 0 : hybrid_cpu_row_count(k_type, k_size, pipeline->max_context);
-    const std::size_t v_cpu_rows = v_resident ? 0 : hybrid_cpu_row_count(v_type, v_size, pipeline->max_context);
+    const std::size_t q_cpu_rows = q_resident ? 0 : hybrid_cpu_row_count(q_type, q_size);
+    const std::size_t k_cpu_rows = k_resident ? 0 : hybrid_cpu_row_count(k_type, k_size);
+    const std::size_t v_cpu_rows = v_resident ? 0 : hybrid_cpu_row_count(v_type, v_size);
 
     const bool pipeline_gpu_rows = !std::getenv("QWEN_NATIVE_GPU_PIPELINE") || std::string(std::getenv("QWEN_NATIVE_GPU_PIPELINE")) != "0";
     const auto launch = [&](const void *weights, std::uint32_t type,
@@ -6185,41 +6079,6 @@ void pipeline_project_attention_qkv_hybrid(
     upload(pipeline->hybrid_host_output3, v_cpu_rows, v_size, 2, v_resident);
 }
 
-void pipeline_project_batch_large(DevicePipeline *pipeline, const void *weights,
-                                   std::uint32_t type, std::size_t input_size,
-                                   std::size_t output_size, std::size_t batch_size,
-                                   bool keep_resident, int output_slot,
-                                   const float *input_buffer) {
-    const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
-    auto &cache = resident_weight_cache();
-    const void *device_weights = cache.find_or_add(weights, weight_bytes, keep_resident);
-    const float *in_act = input_buffer ? input_buffer : pipeline->hidden;
-    float *out = pipeline->slots[output_slot];
-    if (device_weights) {
-        launch_k_matvec_batch_large(type, device_weights, in_act, out, input_size, output_size, batch_size, pipeline->compute_stream);
-        return;
-    }
-    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size, pipeline->max_context);
-    const std::size_t gpu_rows = output_size - cpu_rows;
-    if (cpu_rows == 0 || gpu_rows == 0) {
-        for (size_t offset = 0; offset < batch_size; offset += 8) {
-            pipeline_project_batch8_hybrid(pipeline, weights, type, input_size, output_size, keep_resident, output_slot, in_act + offset * input_size);
-        }
-        return;
-    }
-    // For large prefill batch, do CPU for all 512 at once with single barrier, and GPU for all 512 at once
-    // This is still a placeholder that loops over 8, but with single CPU barrier vs 64 barriers for 512/8
-    // True large-batch would use launch_k_matvec_batch_large for GPU as well, but we keep per-8 for now for correctness
-    pipeline->async_worker.submit([=] {
-        cpu_quant_matvec_batch_large(weights, type, in_act, input_size, pipeline->hybrid_host_output, cpu_rows, batch_size, hybrid_cpu_worker_count());
-    });
-    for (size_t offset = 0; offset < batch_size; offset += 8) {
-        pipeline_project_batch8_hybrid(pipeline, weights, type, input_size, output_size, keep_resident, output_slot, in_act + offset * input_size);
-        // Need to handle output offset: pipeline_project_batch8_hybrid writes to slots[output_slot] with batch 8, need to shift
-        // For simplicity, just use the batch8 path directly for now
-    }
-}
-
 void pipeline_project_recurrent_qkv_gate_cpu(DevicePipeline *pipeline,
                                              const void *qkv_weights, std::uint32_t qkv_type,
                                              std::size_t input_size, std::size_t qkv_size,
@@ -6294,7 +6153,7 @@ void pipeline_prefetch_hybrid_weights(DevicePipeline *pipeline, const void *weig
                                       std::size_t output_size) {
     const std::size_t full_bytes = k_quant_weight_bytes(type, input_size, output_size);
     if (resident_weight_cache().find_or_add(weights, full_bytes, false) != nullptr) return;
-    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size, pipeline->max_context);
+    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size);
     const std::size_t gpu_rows = output_size - cpu_rows;
     const std::size_t row_bytes = full_bytes / output_size;
     const auto *gpu_weights = static_cast<const std::uint8_t *>(weights) + cpu_rows * row_bytes;
@@ -6454,8 +6313,8 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
                             8 * embedding_size * sizeof(float), hipMemcpyDeviceToHost),
                   "fused SoA FFN download input");
 
-        const std::size_t gate_cpu_rows = hybrid_cpu_row_count(gate_type, ffn_size, pipeline->max_context);
-        const std::size_t up_cpu_rows = hybrid_cpu_row_count(up_type, ffn_size, pipeline->max_context);
+        const std::size_t gate_cpu_rows = hybrid_cpu_row_count(gate_type, ffn_size);
+        const std::size_t up_cpu_rows = hybrid_cpu_row_count(up_type, ffn_size);
         const std::size_t gate_gpu_rows = ffn_size - gate_cpu_rows;
         const std::size_t up_gpu_rows = ffn_size - up_cpu_rows;
         const std::size_t gate_row_bytes = gate_bytes / ffn_size;
@@ -6464,19 +6323,13 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
         const bool pipeline_gpu_rows = !std::getenv("QWEN_NATIVE_GPU_PIPELINE") || std::string(std::getenv("QWEN_NATIVE_GPU_PIPELINE")) != "0";
         const auto launch_gpu_shard = [&](const void *weights, std::uint32_t type,
                                           std::size_t cpu_rows, std::size_t gpu_rows,
-                                          std::size_t row_bytes, int output_slot,
-                                          hipStream_t stream) {
+                                          std::size_t row_bytes, int output_slot) {
             const auto *gpu_weights = static_cast<const std::uint8_t *>(weights)
                                     + cpu_rows * row_bytes;
             if (pipeline_gpu_rows) {
-                // Use provided stream for pipelined path; need to handle transfer sync per stream
-                // For now, reuse the same pipelined helper but override stream via temporary swap
-                hipStream_t saved = pipeline->compute_stream;
-                pipeline->compute_stream = stream;
                 pipeline_project_gpu_rows_pipelined(
                     pipeline, gpu_weights, type, embedding_size, gpu_rows,
                     cpu_rows, ffn_size, output_slot, pipeline->slots[3]);
-                pipeline->compute_stream = saved;
             } else {
                 pipeline_project_batch8(pipeline, gpu_weights, type, embedding_size,
                                         gpu_rows, false, 4, pipeline->slots[3]);
@@ -6484,7 +6337,7 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
                 const int elements = static_cast<int>(8 * gpu_rows);
                 hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
                                    dim3((elements + threads - 1) / threads), dim3(threads),
-                                   0, stream,
+                                   0, pipeline->compute_stream,
                                    pipeline->slots[4], pipeline->slots[output_slot],
                                    static_cast<int>(cpu_rows), static_cast<int>(gpu_rows),
                                    static_cast<int>(ffn_size));
@@ -6500,15 +6353,13 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
         });
 
         launch_gpu_shard(gate_weights, gate_type, gate_cpu_rows, gate_gpu_rows,
-                         gate_row_bytes, 0, pipeline->compute_stream);
+                         gate_row_bytes, 0);
         launch_gpu_shard(up_weights, up_type, up_cpu_rows, up_gpu_rows,
-                         up_row_bytes, 1, pipeline->compute_stream2);
+                         up_row_bytes, 1);
         pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
 
         hip_check(hipStreamSynchronize(pipeline->compute_stream),
-                  "fused SoA FFN wait GPU gate");
-        hip_check(hipStreamSynchronize(pipeline->compute_stream2),
-                  "fused SoA FFN wait GPU up");
+                  "fused SoA FFN wait GPU gate/up");
         pipeline->async_worker.wait();
 
         // CPU rows are packed as [batch][row]. Upload each result in one DMA
