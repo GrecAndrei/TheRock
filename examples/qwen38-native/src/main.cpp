@@ -1270,7 +1270,8 @@ public:
     }
 
     BatchStepResult step_batch8_pipelined(const std::array<std::uint32_t, 8> &tokens,
-                                           std::size_t valid_tokens = 8) {
+                                           std::size_t valid_tokens = 8,
+                                           bool capture_dflash = true) {
         synchronize_pipeline_state();
         if (valid_tokens == 0 || valid_tokens > tokens.size()) {
             throw std::invalid_argument("pipelined target batch must contain [1, 8] valid tokens");
@@ -1488,7 +1489,7 @@ public:
             case 61: dflash_feature = 4; break;
             default: break;
             }
-            if (dflash_feature >= 0) {
+            if (capture_dflash && dflash_feature >= 0) {
                 qwen_native::pipeline_download_hidden_async(
                     pipeline_, batch_dflash_features_[dflash_feature].data(), hidden_count);
             }
@@ -3822,13 +3823,29 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
 
         const auto prefill_started = std::chrono::steady_clock::now();
         std::uint32_t anchor = 0;
-        for (std::size_t begin = 0; begin < prompt.size(); begin += 8) {
+        // Fast prefill: first 129k without DFlash capture/injection (window is 2048)
+        constexpr std::size_t dflash_window = 2048;
+        const std::size_t fast_end = prompt.size() > dflash_window ? prompt.size() - dflash_window : 0;
+        for (std::size_t begin = 0; begin < fast_end; begin += 8) {
+            const std::size_t valid = std::min<std::size_t>(8, fast_end - begin);
+            std::array<std::uint32_t, 8> batch{};
+            batch.fill(248070);
+            std::copy_n(prompt.begin() + begin, valid, batch.begin());
+            const auto result = target.step_batch8_pipelined(batch, valid, false);
+            anchor = result.next_tokens[valid - 1];
+            if ((begin + valid) % 8192 == 0) {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - prefill_started).count();
+                std::cerr << "  [run " << run << " prefill " << begin + valid << '/' << prompt.size() << " (fast, no DFlash), " << std::fixed << std::setprecision(1) << elapsed << "s]\n";
+            }
+        }
+        for (std::size_t begin = fast_end; begin < prompt.size(); begin += 8) {
             const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
             std::array<std::uint32_t, 8> batch{};
             batch.fill(248070);
             std::copy_n(prompt.begin() + begin, valid, batch.begin());
             const std::size_t position = target.active_tokens();
-            const auto result = target.step_batch8_pipelined(batch, valid);
+            const auto result = target.step_batch8_pipelined(batch, valid, true);
             std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
             for (std::size_t index = 0; index < valid; ++index) {
                 injection_features[index] = target.batch_dflash_features(index);
