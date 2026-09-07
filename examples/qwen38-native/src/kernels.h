@@ -87,6 +87,11 @@ void execute_k_matvec_hybrid_cached_batch8(const void *weights, std::uint32_t we
                                            const float *input, std::size_t input_size,
                                            float *output, std::size_t output_size,
                                            bool keep_resident);
+// GPU top-16: matvec + device-side reduction, downloads only 16*8 indices/scores.
+void execute_k_matvec_cached_batch8_top16(const void *weights, std::uint32_t weight_type,
+                                           const float *input, std::size_t input_size,
+                                           int *out_indices, float *out_scores,
+                                           std::size_t output_size, bool keep_resident);
 
 // Persistent FP16 gated-delta state for the 48 x 128 x 128 recurrent target
 // heads.  The scalar reference keeps an FP32 mirror; the batched verifier uses

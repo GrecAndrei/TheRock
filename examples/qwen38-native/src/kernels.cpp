@@ -141,8 +141,13 @@ struct MatvecWorkspace {
     std::size_t input_capacity = 0;
     float *output = nullptr;
     std::size_t output_capacity = 0;
+    int *topk_indices = nullptr;
+    float *topk_scores = nullptr;
+    std::size_t topk_capacity = 0;
 
     ~MatvecWorkspace() {
+        if (topk_scores) (void) hipFree(topk_scores);
+        if (topk_indices) (void) hipFree(topk_indices);
         if (output) (void) hipFree(output);
         if (input) (void) hipFree(input);
         if (weights) (void) hipFree(weights);
@@ -185,6 +190,22 @@ struct MatvecWorkspace {
         }
         hip_check(hipMalloc(reinterpret_cast<void **>(&output), values * sizeof(float)), "hipMalloc native matvec output staging");
         output_capacity = values;
+    }
+
+    void reserve_topk(std::size_t entries) {
+        if (entries <= topk_capacity) return;
+        if (topk_indices) {
+            hip_check(hipFree(topk_indices), "hipFree native matvec topk indices");
+            topk_indices = nullptr;
+        }
+        if (topk_scores) {
+            hip_check(hipFree(topk_scores), "hipFree native matvec topk scores");
+            topk_scores = nullptr;
+        }
+        topk_capacity = 0;
+        hip_check(hipMalloc(reinterpret_cast<void **>(&topk_indices), entries * sizeof(int)), "hipMalloc native matvec topk indices");
+        hip_check(hipMalloc(reinterpret_cast<void **>(&topk_scores), entries * sizeof(float)), "hipMalloc native matvec topk scores");
+        topk_capacity = entries;
     }
 };
 
@@ -627,6 +648,74 @@ __global__ void silu_multiply_kernel(const float *__restrict__ gate,
     if (index < elements) {
         const float value = gate[index];
         output[index] = (value / (1.0F + expf(-value))) * up[index];
+    }
+}
+
+// GPU top-16 reduction for output.head logits: each block handles one of the
+// 8 batch positions. Each thread scans its strided vocab slice maintaining a
+// local 16-element heap, then block-shared merge yields global top-16.
+// Downloads 128 floats + 128 ints (640 bytes) instead of 8*248k floats (~8 MB).
+__global__ void logits_top16_kernel(const float *__restrict__ logits,
+                                    int vocab, int *__restrict__ out_indices,
+                                    float *__restrict__ out_scores) {
+    const int batch = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int threads = static_cast<int>(blockDim.x);
+    const float *row = logits + static_cast<std::size_t>(batch) * vocab;
+    // Local top-16 per thread in registers (score, idx), sorted descending.
+    float local_scores[16];
+    int local_indices[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) { local_scores[k] = -1e30f; local_indices[k] = -1; }
+    for (int i = tid; i < vocab; i += threads) {
+        float v = row[i];
+        if (v > local_scores[15]) {
+            int p = 15;
+            while (p > 0 && v > local_scores[p-1]) {
+                local_scores[p] = local_scores[p-1];
+                local_indices[p] = local_indices[p-1];
+                --p;
+            }
+            local_scores[p] = v;
+            local_indices[p] = i;
+        }
+    }
+    // Shared merge area: 256*16 = 4096 entries per block (if 256 threads)
+    __shared__ float shared_scores[256*16];
+    __shared__ int shared_indices[256*16];
+    const int base = tid * 16;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        shared_scores[base + k] = local_scores[k];
+        shared_indices[base + k] = local_indices[k];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float global_scores[16];
+        int global_indices[16];
+#pragma unroll
+        for (int k = 0; k < 16; ++k) { global_scores[k] = -1e30f; global_indices[k] = -1; }
+        const int total = threads * 16;
+        for (int i = 0; i < total; ++i) {
+            float v = shared_scores[i];
+            int idx = shared_indices[i];
+            if (idx < 0) continue;
+            if (v > global_scores[15]) {
+                int p = 15;
+                while (p > 0 && v > global_scores[p-1]) {
+                    global_scores[p] = global_scores[p-1];
+                    global_indices[p] = global_indices[p-1];
+                    --p;
+                }
+                global_scores[p] = v;
+                global_indices[p] = idx;
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            out_indices[static_cast<std::size_t>(batch) * 16 + k] = global_indices[k];
+            out_scores[static_cast<std::size_t>(batch) * 16 + k] = global_scores[k];
+        }
     }
 }
 
@@ -3909,6 +3998,39 @@ void execute_k_matvec_cached_batch8(const void *weights, std::uint32_t weight_ty
               "hipMemcpy native cached batch8 matvec output");
 }
 
+void execute_k_matvec_cached_batch8_top16(const void *weights, std::uint32_t weight_type,
+                                           const float *input, std::size_t input_size,
+                                           int *out_indices, float *out_scores,
+                                           std::size_t output_size, bool keep_resident) {
+    constexpr std::size_t batch_size = 8;
+    constexpr int kTopK = 16;
+    const std::size_t weight_bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &workspace = matvec_workspace();
+    const void *device_weights = resident_weight_cache().find_or_add(weights, weight_bytes, keep_resident);
+    if (!device_weights) {
+        workspace.reserve_weights(weight_bytes);
+        hip_check(hipMemcpy(workspace.weights, weights, weight_bytes, hipMemcpyHostToDevice),
+                  "hipMemcpy native cached top16 matvec weights");
+        device_weights = workspace.weights;
+    }
+    workspace.reserve_input(batch_size * input_size);
+    workspace.reserve_output(batch_size * output_size);
+    workspace.reserve_topk(batch_size * kTopK);
+    hip_check(hipMemcpy(workspace.input, input, batch_size * input_size * sizeof(float), hipMemcpyHostToDevice),
+              "hipMemcpy native cached top16 matvec input");
+    launch_k_matvec_batch8(weight_type, device_weights, workspace.input, workspace.output,
+                           input_size, output_size);
+    hip_check(hipGetLastError(), "native cached top16 matvec launch");
+    hipLaunchKernelGGL(logits_top16_kernel, dim3(batch_size), dim3(256), 0, nullptr,
+                       workspace.output, static_cast<int>(output_size),
+                       workspace.topk_indices, workspace.topk_scores);
+    hip_check(hipGetLastError(), "logits top16 kernel launch");
+    hip_check(hipMemcpy(out_indices, workspace.topk_indices, batch_size * kTopK * sizeof(int), hipMemcpyDeviceToHost),
+              "hipMemcpy top16 indices");
+    hip_check(hipMemcpy(out_scores, workspace.topk_scores, batch_size * kTopK * sizeof(float), hipMemcpyDeviceToHost),
+              "hipMemcpy top16 scores");
+}
+
 void execute_k_matvec_hybrid_cached_batch8(const void *weights, std::uint32_t weight_type,
                                            const float *input, std::size_t input_size,
                                            float *output, std::size_t output_size,
@@ -5669,9 +5791,9 @@ std::size_t hybrid_cpu_row_count(std::uint32_t type, std::size_t output_size) {
     std::size_t numerator = 1;
     std::size_t denominator = 2;
     if (type == 12 || type == 13 || type == 23) {
-        numerator = 7; denominator = 10;
+        numerator = 9; denominator = 10;
     } else if (type == 14) {
-        numerator = 2; denominator = 3;
+        numerator = 17; denominator = 20;
     } else if (type == 11 || type == 21) {
         numerator = 1; denominator = 5;
     } else if (type == 20) {
@@ -5796,7 +5918,7 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
     });
 
     const auto *gpu_weights = static_cast<const std::uint8_t *>(weights) + cpu_rows * row_bytes;
-    const bool pipeline_gpu_rows = std::getenv("QWEN_NATIVE_GPU_PIPELINE") != nullptr;
+    const bool pipeline_gpu_rows = !std::getenv("QWEN_NATIVE_GPU_PIPELINE") || std::string(std::getenv("QWEN_NATIVE_GPU_PIPELINE")) != "0";
     if (pipeline_gpu_rows) {
         pipeline_project_gpu_rows_pipelined(pipeline, gpu_weights, type, input_size,
                                             gpu_rows, cpu_rows, output_size, output_slot,
@@ -5879,7 +6001,7 @@ void pipeline_project_attention_qkv_hybrid(
     const std::size_t k_cpu_rows = k_resident ? 0 : hybrid_cpu_row_count(k_type, k_size);
     const std::size_t v_cpu_rows = v_resident ? 0 : hybrid_cpu_row_count(v_type, v_size);
 
-    const bool pipeline_gpu_rows = std::getenv("QWEN_NATIVE_GPU_PIPELINE") != nullptr;
+    const bool pipeline_gpu_rows = !std::getenv("QWEN_NATIVE_GPU_PIPELINE") || std::string(std::getenv("QWEN_NATIVE_GPU_PIPELINE")) != "0";
     const auto launch = [&](const void *weights, std::uint32_t type,
                             std::size_t output_size, std::size_t weight_bytes,
                             std::size_t cpu_rows, bool resident, int output_slot) {
@@ -6198,7 +6320,7 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
         const std::size_t gate_row_bytes = gate_bytes / ffn_size;
         const std::size_t up_row_bytes = up_bytes / ffn_size;
 
-        const bool pipeline_gpu_rows = std::getenv("QWEN_NATIVE_GPU_PIPELINE") != nullptr;
+        const bool pipeline_gpu_rows = !std::getenv("QWEN_NATIVE_GPU_PIPELINE") || std::string(std::getenv("QWEN_NATIVE_GPU_PIPELINE")) != "0";
         const auto launch_gpu_shard = [&](const void *weights, std::uint32_t type,
                                           std::size_t cpu_rows, std::size_t gpu_rows,
                                           std::size_t row_bytes, int output_slot) {
@@ -6223,13 +6345,10 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
             }
         };
         pipeline->async_worker.submit([=] {
-            cpu_quant_matvec_batch8_rows_packed(
-                gate_weights, gate_type, pipeline->hybrid_host_input, embedding_size,
-                pipeline->hybrid_host_output, gate_cpu_rows,
-                hybrid_cpu_worker_count());
-            cpu_quant_matvec_batch8_rows_packed(
-                up_weights, up_type, pipeline->hybrid_host_input, embedding_size,
-                pipeline->hybrid_host_output2, up_cpu_rows,
+            cpu_quant_matvec_batch8_rows_packed_dual(
+                gate_weights, gate_type, pipeline->hybrid_host_output, gate_cpu_rows,
+                up_weights, up_type, pipeline->hybrid_host_output2, up_cpu_rows,
+                pipeline->hybrid_host_input, embedding_size,
                 hybrid_cpu_worker_count());
         });
 

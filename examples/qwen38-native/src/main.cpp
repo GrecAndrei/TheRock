@@ -1027,6 +1027,17 @@ public:
     std::vector<float> dflash_output_logits_batch8(const std::vector<float> &hidden) const {
         return projection_batch8("output.weight", hidden);
     }
+    void dflash_output_top16_batch8(const std::vector<float> &hidden,
+                                    int *out_indices, float *out_scores) const {
+        const auto &tensor = require_tensor(model_, "output.weight");
+        if (hidden.size() != 8 * kEmbedding) {
+            throw std::runtime_error("DFlash top16 hidden has wrong size");
+        }
+        qwen_native::execute_k_matvec_cached_batch8_top16(
+            tensor_data(mapping_, model_, tensor), tensor.type,
+            hidden.data(), kEmbedding, out_indices, out_scores,
+            static_cast<std::size_t>(tensor.dimensions[1]), false);
+    }
 
     ~NativeTargetSession() {
         if (pipeline_) {
@@ -2352,21 +2363,41 @@ public:
         }
         const auto layers_done = std::chrono::steady_clock::now();
         hidden = rms_norm(hidden, f32_vector("output_norm.weight", 5120), 5120, 1.0e-6F);
-        const auto logits = target.dflash_output_logits_batch8(hidden);
-        const auto logits_done = std::chrono::steady_clock::now();
-        const std::size_t vocab = logits.size() / 8;
-        if (std::getenv("QWEN_NATIVE_TRACE")) {
-            std::cerr << "  [dflash top-1 per pos:";
-            for (int pos = 0; pos < 8; ++pos) {
-                const float *begin = logits.data() + pos * vocab;
-                const auto best = std::max_element(begin, begin + vocab);
-                std::cerr << ' ' << std::distance(begin, best);
+        const bool use_gpu_topk = !std::getenv("QWEN_NATIVE_GPU_TOPK") || std::string(std::getenv("QWEN_NATIVE_GPU_TOPK")) != "0";
+        std::array<std::uint32_t, 7> result{};
+        auto logits_done = layers_done;
+        std::vector<float> fallback_logits;
+        int top_indices[8 * 16];
+        float top_scores[8 * 16];
+        if (use_gpu_topk) {
+            target.dflash_output_top16_batch8(hidden, top_indices, top_scores);
+            logits_done = std::chrono::steady_clock::now();
+            if (std::getenv("QWEN_NATIVE_TRACE")) {
+                std::cerr << "  [dflash top-1 per pos:";
+                for (int pos = 0; pos < 8; ++pos) std::cerr << ' ' << top_indices[pos * 16];
+                std::cerr << "]\n";
             }
-            std::cerr << "]\n";
+        } else {
+            fallback_logits = target.dflash_output_logits_batch8(hidden);
+            logits_done = std::chrono::steady_clock::now();
+            const std::size_t vocab = fallback_logits.size() / 8;
+            if (std::getenv("QWEN_NATIVE_TRACE")) {
+                std::cerr << "  [dflash top-1 per pos:";
+                for (int pos = 0; pos < 8; ++pos) {
+                    const float *begin = fallback_logits.data() + pos * vocab;
+                    const auto best = std::max_element(begin, begin + vocab);
+                    std::cerr << ' ' << std::distance(begin, best);
+                }
+                std::cerr << "]\n";
+            }
         }
         const auto selector_hidden = projection_batch8("selector_hidden.weight", hidden);
         const auto sel_done = std::chrono::steady_clock::now();
-        const auto result = select(anchor, logits, selector_hidden);
+        if (use_gpu_topk) {
+            result = select_from_topk(anchor, top_indices, top_scores, selector_hidden);
+        } else {
+            result = select(anchor, fallback_logits, selector_hidden);
+        }
         const auto end_done = std::chrono::steady_clock::now();
         if (std::getenv("QWEN_NATIVE_DFLASH_DEBUG")) {
             std::cerr << "    [dflash breakdown: layers="
@@ -2597,6 +2628,69 @@ private:
                 candidates[pos][item] = heap[item].token;
                 last_candidates_[pos - 1][item] = heap[item].token;
                 unary[pos][item] = heap[item].score;
+            }
+        }
+        std::array<std::uint32_t, 7> result{};
+        std::array<std::vector<float>, top_k> predecessors{};
+        predecessors[0] = dequantize_selector_row("selector_predecessor.weight", anchor);
+        std::size_t predecessor = 0;
+        for (std::size_t pos = 1; pos < block; ++pos) {
+            std::array<std::vector<float>, top_k> successors{};
+            for (std::size_t current = 0; current < top_k; ++current) {
+                successors[current] = dequantize_selector_row("selector_successor.weight", candidates[pos][current]);
+            }
+            const float *hidden = selector_hidden.data() + pos * 256;
+            static const float selector_scale = [] {
+                if (const char *env = std::getenv("QWEN_NATIVE_SELECTOR_WEIGHT")) {
+                    return std::stof(env);
+                }
+                return 1.0F;
+            }();
+            std::array<float, top_k> scores{};
+            for (std::size_t current = 0; current < top_k; ++current) {
+                float transition = 0.0F;
+                const auto &previous = predecessors[predecessor];
+                for (std::size_t rank = 0; rank < 256; ++rank) {
+                    transition = std::fma(successors[current][rank], previous[rank] * hidden[rank], transition);
+                }
+                scores[current] = unary[pos][current] + selector_scale * transition;
+            }
+            if (std::getenv("QWEN_NATIVE_DFLASH_DEBUG") && pos == 1) {
+                std::cerr << "    [dflash pos1 debug: ";
+                for (std::size_t c = 0; c < 3; ++c) {
+                    std::cerr << "c" << c << " tok=" << candidates[pos][c]
+                              << " u=" << unary[pos][c] << " s=" << scores[c] << " | ";
+                }
+                std::cerr << "]\n";
+            }
+            predecessor = static_cast<std::size_t>(std::distance(scores.begin(),
+                std::max_element(scores.begin(), scores.end())));
+            result[pos - 1] = candidates[pos][predecessor];
+            if (pos + 1 < block) {
+                for (std::size_t item = 0; item < top_k; ++item) {
+                    predecessors[item] = dequantize_selector_row("selector_predecessor.weight",
+                                                                  candidates[pos][item]);
+                }
+            }
+        }
+        return result;
+    }
+
+    std::array<std::uint32_t, 7> select_from_topk(std::uint32_t anchor,
+                                                  const int *top_indices,
+                                                  const float *top_scores,
+                                                  const std::vector<float> &selector_hidden) const {
+        constexpr std::size_t block = 8;
+        constexpr std::size_t top_k = 16;
+        std::array<std::array<std::uint32_t, top_k>, 8> candidates{};
+        std::array<std::array<float, top_k>, 8> unary{};
+        for (std::size_t pos = 1; pos < block; ++pos) {
+            for (std::size_t k = 0; k < top_k; ++k) {
+                const int idx = top_indices[pos * top_k + k];
+                const float score = top_scores[pos * top_k + k];
+                candidates[pos][k] = static_cast<std::uint32_t>(idx < 0 ? 0 : idx);
+                last_candidates_[pos - 1][k] = candidates[pos][k];
+                unary[pos][k] = score;
             }
         }
         std::array<std::uint32_t, 7> result{};

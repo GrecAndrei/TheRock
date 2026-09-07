@@ -15,6 +15,13 @@ void cpu_quant_matvec_batch8_rows_packed(const void *weights, std::uint32_t type
                                          const float *input, std::size_t input_size,
                                          float *output, std::size_t row_count,
                                          int thread_count);
+// Fused Gate+Up: computes both matrices from the same batch-8 input in a single
+// thread-pool barrier (saves 64 barriers per 64-layer decode step).
+void cpu_quant_matvec_batch8_rows_packed_dual(
+    const void *gate_weights, std::uint32_t gate_type, float *gate_output,
+    std::size_t gate_rows, const void *up_weights, std::uint32_t up_type,
+    float *up_output, std::size_t up_rows, const float *input,
+    std::size_t input_size, int thread_count);
 void clear_cpu_packed_matrix_cache();
 std::size_t cpu_packed_matrix_cache_bytes();
 

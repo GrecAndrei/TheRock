@@ -830,6 +830,75 @@ void cpu_quant_matvec_batch8_rows_packed(const void *weights, std::uint32_t type
     }
 }
 
+void cpu_quant_matvec_batch8_rows_packed_dual(
+    const void *gate_weights, std::uint32_t gate_type, float *gate_output,
+    std::size_t gate_rows, const void *up_weights, std::uint32_t up_type,
+    float *up_output, std::size_t up_rows, const float *input,
+    std::size_t input_size, int thread_count) {
+    if (!gate_weights || !up_weights || !input || !gate_output || !up_output ||
+        input_size == 0 || gate_rows == 0 || up_rows == 0) {
+        throw std::invalid_argument("invalid dual CPU quant matvec arguments");
+    }
+    const bool gate_soa = gate_type == 12 || gate_type == 13 || gate_type == 14 || gate_type == 23;
+    const bool up_soa = up_type == 12 || up_type == 13 || up_type == 14 || up_type == 23;
+    if (gate_soa && up_soa) {
+        const auto &gate_entry = packed_matrix_cache().find_or_pack(
+            gate_weights, gate_type, input_size, gate_rows);
+        const auto &up_entry = packed_matrix_cache().find_or_pack(
+            up_weights, up_type, input_size, up_rows);
+        const std::size_t total_tiles = gate_entry.tile_count + up_entry.tile_count;
+        // One barrier for both matrices instead of two (saves 64 barriers per decode step).
+        row_thread_pool().run(total_tiles, thread_count, [&](std::size_t tile_index) {
+            if (tile_index < gate_entry.tile_count) {
+                if (gate_type == 12) {
+                    const auto &tiles = std::get<std::vector<Q4KSoATile8>>(gate_entry.storage);
+                    compute_q4k_soa_tile(tiles.data(), tile_index, input, input_size,
+                                         gate_entry.blocks_per_row, gate_output, gate_rows);
+                } else if (gate_type == 13) {
+                    const auto &tiles = std::get<std::vector<Q5KSoATile8>>(gate_entry.storage);
+                    compute_q5k_soa_tile(tiles.data(), tile_index, input, input_size,
+                                         gate_entry.blocks_per_row, gate_output, gate_rows);
+                } else if (gate_type == 14) {
+                    const auto &tiles = std::get<std::vector<Q6KSoATile8>>(gate_entry.storage);
+                    compute_q6k_soa_tile(tiles.data(), tile_index, input, input_size,
+                                         gate_entry.blocks_per_row, gate_output, gate_rows);
+                } else {
+                    const auto &tiles = std::get<std::vector<IQ4XSSoATile8>>(gate_entry.storage);
+                    compute_iq4xs_soa_tile(tiles.data(), tile_index, input, input_size,
+                                           gate_entry.blocks_per_row, gate_output, gate_rows);
+                }
+            } else {
+                const std::size_t up_tile = tile_index - gate_entry.tile_count;
+                if (up_type == 12) {
+                    const auto &tiles = std::get<std::vector<Q4KSoATile8>>(up_entry.storage);
+                    compute_q4k_soa_tile(tiles.data(), up_tile, input, input_size,
+                                         up_entry.blocks_per_row, up_output, up_rows);
+                } else if (up_type == 13) {
+                    const auto &tiles = std::get<std::vector<Q5KSoATile8>>(up_entry.storage);
+                    compute_q5k_soa_tile(tiles.data(), up_tile, input, input_size,
+                                         up_entry.blocks_per_row, up_output, up_rows);
+                } else if (up_type == 14) {
+                    const auto &tiles = std::get<std::vector<Q6KSoATile8>>(up_entry.storage);
+                    compute_q6k_soa_tile(tiles.data(), up_tile, input, input_size,
+                                         up_entry.blocks_per_row, up_output, up_rows);
+                } else {
+                    const auto &tiles = std::get<std::vector<IQ4XSSoATile8>>(up_entry.storage);
+                    compute_iq4xs_soa_tile(tiles.data(), up_tile, input, input_size,
+                                           up_entry.blocks_per_row, up_output, up_rows);
+                }
+            }
+        });
+        return;
+    }
+    // Mixed SoA/generic: fall back to two calls but keep single outer barrier via
+    // manual thread pool splitting is non-trivial; sequential is still correct and
+    // rare (e.g. Q3_K). The outer caller will handle overlap with GPU, so just run sequentially.
+    cpu_quant_matvec_batch8_rows_packed(gate_weights, gate_type, input, input_size,
+                                        gate_output, gate_rows, thread_count);
+    cpu_quant_matvec_batch8_rows_packed(up_weights, up_type, input, input_size,
+                                        up_output, up_rows, thread_count);
+}
+
 void clear_cpu_packed_matrix_cache() {
     packed_matrix_cache().clear();
 }
