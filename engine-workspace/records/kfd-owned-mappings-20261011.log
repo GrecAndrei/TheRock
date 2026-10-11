@@ -1,0 +1,8 @@
+physical node=1 gpu_id=40264 gfx=100302 CWSR=11157504 control=16384 debug=32768
+repetition 1: AQL queue creation and doorbell mapping passed
+repetition 1: queue destroyed before all mappings freed
+repetition 2: AQL queue creation and doorbell mapping passed
+repetition 2: queue destroyed before all mappings freed
+repetition 3: AQL queue creation and doorbell mapping passed
+repetition 3: queue destroyed before all mappings freed
+queue lifecycle passed; no kernels submitted, no inference TPS measured

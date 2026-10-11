@@ -1,0 +1,28 @@
+{
+  "captured_date": "2026-10-11",
+  "kyanite": {
+    "path": "sources/kyanite",
+    "upstream": "https://github.com/GrecAndrei/rocmtry.git",
+    "upstream_main": "867ea43cfb67db9782b17814020a24593d9e4508",
+    "branch": "engine/rx6650xt-10tps",
+    "local_commit_prefix": "329a56a",
+    "imports_commit_prefix": "e836679"
+  },
+  "llama_dflash_reference": {
+    "path": "references/llama.cpp",
+    "commit": "5ecbe1ac17ec0484c5b44af0bd580cdc9c428ed4"
+  },
+  "llama_upstream_reference": {
+    "path": "references/llama-upstream",
+    "upstream": "https://github.com/ggml-org/llama.cpp.git",
+    "commit": "966baae76b578d5d3dd4c179a75a35c80ff75577"
+  },
+  "native_baseline": {
+    "path": "sources/native-baseline",
+    "original_repository_head": "ef774ed4d411f8e3fb41014a923939d2e4de866d",
+    "contains_preserved_uncommitted_source": true,
+    "initial_file_hash_manifest": "results/setup/provenance.json",
+    "fresh_binary_sha256": "6b451bd3babc7e8a83f5669841f120ded5194a597912c16518675a5203f5b928"
+  },
+  "goal_tps_demonstrated": false
+}

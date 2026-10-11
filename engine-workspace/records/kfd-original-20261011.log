@@ -1,0 +1,8 @@
+physical topology: node=1 gpu_id=40264 gfx=100302 simds=64 wave=32 render=Some(129)
+KFD negotiation passed; acquiring /dev/dri/renderD129
+physical VM acquisition passed
+GTT allocate/map/readback/guards/unmap/free repetition 1 passed
+GTT allocate/map/readback/guards/unmap/free repetition 2 passed
+GTT allocate/map/readback/guards/unmap/free repetition 3 passed
+three memory lifecycle probes: 193.409µs total (CPU boundary wall time, not GPU throughput)
+hardware foundation probe FAILED: Queue(Queue(Backend { operation: Create, source: BackendError { kind: OperatingSystem, operation: "AMDKFD_IOC_CREATE_QUEUE", raw_os_error: Some(22), detail: "Invalid argument (os error 22)" } }))

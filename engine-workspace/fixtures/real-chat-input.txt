@@ -1,0 +1,3 @@
+/think
+Explain how a CPU and an 8 GB GPU can cooperate to run a model whose quantized weights occupy 16 GB. Cover memory placement, PCIe transfers, and one practical scheduling trade-off. Keep the explanation around 150 words.
+/quit

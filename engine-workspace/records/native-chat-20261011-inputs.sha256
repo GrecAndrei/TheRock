@@ -1,0 +1,4 @@
+6b451bd3babc7e8a83f5669841f120ded5194a597912c16518675a5203f5b928  engine-workspace/build/native-hip/qwen38-native
+322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482  /home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf
+18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594  /home/alex/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+6eced93f413b7ee25774ad75397178edb0e29b4e2604dedfed24f12c307b048d  engine-workspace/fixtures/real-chat-input.txt
