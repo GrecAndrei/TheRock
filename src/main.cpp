@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -547,10 +548,15 @@ public:
             close(descriptor_);
             throw std::runtime_error("cannot mmap model");
         }
-        if (hipHostRegister(data_, size_, hipHostRegisterReadOnly | hipHostRegisterMapped) != hipSuccess) {
-            std::cerr << "  [warning: hipHostRegister failed, PCIe transfers will be slower]\n";
-        } else {
-            registered_ = true;
+        // The model mmap is a reclaimable source, not a second permanent RAM
+        // copy beside CPU packs and GPU residency. Whole-file registration
+        // retains 16+ GiB before the hybrid cache is even constructed.
+        if (qwen_native::environment_flag_enabled("QWEN_NATIVE_PIN_MODEL")) {
+            if (hipHostRegister(data_, size_, hipHostRegisterReadOnly | hipHostRegisterMapped) != hipSuccess) {
+                std::cerr << "  [warning: model host registration failed]\n";
+            } else {
+                registered_ = true;
+            }
         }
     }
 
@@ -1525,7 +1531,8 @@ public:
     // Teacher-forced layer-major prefill: each packed matrix is staged once
     // for the complete chunk, while recurrence/causal KV updates remain in
     // original token order. This is not whole-model batch-eight repetition.
-    void prefill_layer_major(const std::uint32_t *tokens, std::size_t count) {
+    void prefill_layer_major(const std::uint32_t *tokens, std::size_t count,
+                            std::array<std::vector<float>, 5> *captured = nullptr) {
         if (!tokens || count == 0 || count > 512 || count > context_capacity_ - active_tokens_) {
             throw std::invalid_argument("layer-major prefill requires 1–512 tokens within capacity");
         }
@@ -1541,6 +1548,10 @@ public:
         BatchStepResult profile;
         const std::size_t padded_count = (count + 7) / 8 * 8;
         std::vector<float> hidden(padded_count * kEmbedding);
+        if (captured) {
+            for (auto &feature : *captured) feature.assign(count * kEmbedding, 0.0F);
+            for (auto &feature : batch_dflash_features_) feature.assign(8 * kEmbedding, 0.0F);
+        }
         for (std::size_t begin = 0; begin < count; begin += 8) {
             std::array<std::uint32_t, 8> batch{};
             std::copy_n(tokens + begin, std::min<std::size_t>(8, count - begin), batch.begin());
@@ -1578,8 +1589,17 @@ public:
                 }
                 float *batch_hidden = hidden.data() + begin * kEmbedding;
                 qwen_native::pipeline_upload_hidden(pipeline_, batch_hidden, 8 * kEmbedding);
-                execute_layer_batch8(layer, valid, false, profile, true, false);
+                execute_layer_batch8(layer, valid, captured != nullptr, profile, true, false);
                 qwen_native::pipeline_download_hidden(pipeline_, batch_hidden, 8 * kEmbedding);
+                if (captured) {
+                    constexpr std::array<int, 5> taps{5, 19, 33, 47, 61};
+                    const auto tap = std::find(taps.begin(), taps.end(), layer);
+                    if (tap != taps.end()) {
+                        const auto index = static_cast<std::size_t>(tap - taps.begin());
+                        std::copy_n(batch_dflash_features_[index].data(), valid * kEmbedding,
+                                    (*captured)[index].data() + begin * kEmbedding);
+                    }
+                }
             }
             // All work using staged weights has completed before scope release.
             qwen_native::attention_set_history_length(attn_device_, static_cast<int>(base));
@@ -3057,6 +3077,80 @@ private:
     mutable std::array<std::array<std::uint32_t, 16>, 7> last_candidates_{};
 };
 
+std::size_t configured_prefill_chunk(std::size_t fallback = 512) {
+    const char *requested = std::getenv("QWEN_NATIVE_PREFILL_CHUNK");
+    if (!requested) return fallback;
+    const std::string value(requested);
+    std::size_t consumed = 0;
+    const auto chunk = std::stoul(value, &consumed);
+    if (consumed != value.size() || chunk < 8 || chunk > 512 || chunk % 8 != 0) {
+        throw std::invalid_argument("PREFILL_CHUNK must be a multiple of eight in [8, 512]");
+    }
+    return chunk;
+}
+
+std::uint32_t prefill_prompt(NativeTargetSession &target, NativeDflashEncoder &dflash,
+                            const std::vector<std::uint32_t> &prompt,
+                            std::size_t chunk,
+                            const std::function<void(std::size_t)> &progress = {}) {
+    if (prompt.empty() || chunk < 8 || chunk > 512 || chunk % 8 != 0 ||
+        prompt.size() > target.context_capacity() - target.active_tokens()) {
+        throw std::invalid_argument("invalid physical prompt or prefill chunk");
+    }
+    constexpr std::size_t width = 5120;
+    constexpr std::size_t window = 2048;
+    const std::size_t base = target.active_tokens();
+    const std::size_t feature_begin = prompt.size() > window ? prompt.size() - window : 0;
+    // Leave the final 1–8 positions for the single vocabulary prediction.
+    const std::size_t prefix_end = (prompt.size() - 1) / 8 * 8;
+    std::uint32_t anchor = 0;
+    for (std::size_t begin = 0; begin < prompt.size();) {
+        const bool final_batch = begin >= prefix_end;
+        const bool capture = begin >= feature_begin;
+        std::size_t end = final_batch ? prompt.size() : prefix_end;
+        if (!capture) end = std::min(end, feature_begin);
+        const auto valid = std::min(final_batch ? std::size_t{8} : chunk, end - begin);
+        const auto position = target.active_tokens();
+        if (!final_batch && chunk > 8) {
+            std::array<std::vector<float>, 5> captured;
+            target.prefill_layer_major(prompt.data() + begin, valid, capture ? &captured : nullptr);
+            if (capture) {
+                for (std::size_t offset = 0; offset < valid; offset += 8) {
+                    const auto count = std::min<std::size_t>(8, valid - offset);
+                    std::array<std::array<std::vector<float>, 5>, 8> features{};
+                    for (std::size_t batch = 0; batch < count; ++batch) {
+                        for (std::size_t tap = 0; tap < 5; ++tap) {
+                            const auto first = captured[tap].begin() + (offset + batch) * width;
+                            features[batch][tap].assign(first, first + width);
+                        }
+                    }
+                    dflash.inject_batch(features, count, position + offset);
+                }
+            }
+        } else {
+            std::array<std::uint32_t, 8> batch{};
+            batch.fill(248070);
+            std::copy_n(prompt.begin() + begin, valid, batch.begin());
+            const auto result = target.step_batch8_pipelined(batch, valid, capture, final_batch);
+            if (capture) {
+                std::array<std::array<std::vector<float>, 5>, 8> features{};
+                for (std::size_t index = 0; index < valid; ++index) {
+                    features[index] = target.batch_dflash_features(index);
+                }
+                dflash.inject_batch(features, valid, position);
+            }
+            if (final_batch) anchor = result.next_tokens[valid - 1];
+        }
+        begin += valid;
+        if (progress) progress(begin);
+    }
+    if (target.active_tokens() != base + prompt.size() ||
+        dflash.injected_token_count() != std::min<std::size_t>(target.active_tokens(), window)) {
+        throw std::runtime_error("prefill lost physical target history or DFlash window alignment");
+    }
+    return anchor;
+}
+
 void mtp_test(const std::string &path, std::size_t context_capacity,
               std::uint32_t first_token, int steps,
               std::size_t resident_weight_budget) {
@@ -3249,6 +3343,7 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
         std::array<std::uint32_t, 8> predictions{};
         std::array<float, 8> logits{};
         std::array<std::vector<float>, 5> features;
+        std::array<std::vector<float>, 5> prefill_features;
         double seconds = 0.0;
     };
     const auto execute = [&](bool layer_major) {
@@ -3260,25 +3355,39 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
         qwen_native::ScopedEnvironment kv_mode("QWEN_NATIVE_KV", compare_engine_variants ? "q8" : nullptr);
         qwen_native::clear_resident_weight_cache();
         NativeTargetSession session(path, context_capacity, resident_weight_budget);
+        Result result;
         const auto microbatch_prefill = [&](std::size_t begin, std::size_t end) {
             for (; begin < end; begin += 8) {
                 const auto valid = std::min<std::size_t>(8, end - begin);
                 std::array<std::uint32_t, 8> batch{};
                 std::copy_n(prompt.begin() + begin, valid, batch.begin());
-                (void)session.step_batch8_pipelined(batch, valid, false, false);
+                (void)session.step_batch8_pipelined(batch, valid, true, false);
+                if (begin >= prefix_tokens) {
+                    for (std::size_t index = 0; index < valid; ++index) {
+                        const auto features = session.batch_dflash_features(index);
+                        for (std::size_t tap = 0; tap < 5; ++tap) {
+                            result.prefill_features[tap].insert(result.prefill_features[tap].end(),
+                                features[tap].begin(), features[tap].end());
+                        }
+                    }
+                }
             }
         };
         microbatch_prefill(0, prefix_tokens);
         const auto started = std::chrono::steady_clock::now();
         if (layer_major && !compare_engine_variants) {
             for (std::size_t begin = prefix_tokens; begin < prompt.size(); begin += 512) {
+                std::array<std::vector<float>, 5> features;
                 session.prefill_layer_major(prompt.data() + begin,
-                    std::min<std::size_t>(512, prompt.size() - begin));
+                    std::min<std::size_t>(512, prompt.size() - begin), &features);
+                for (std::size_t tap = 0; tap < 5; ++tap) {
+                    result.prefill_features[tap].insert(result.prefill_features[tap].end(),
+                        features[tap].begin(), features[tap].end());
+                }
             }
         } else {
             microbatch_prefill(prefix_tokens, prompt.size());
         }
-        Result result;
         result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (session.active_tokens() != prompt.size()) {
             throw std::runtime_error("layer-major prefill lost prompt positions");
@@ -3308,7 +3417,8 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
         }
     }
     const double relative_rmse = std::sqrt(squared_error / std::max(squared_reference, 1.0e-30));
-    const bool exact = reference.features == optimized.features && reference.logits == optimized.logits;
+    const bool exact = reference.features == optimized.features && reference.logits == optimized.logits &&
+                       reference.prefill_features == optimized.prefill_features;
     std::cout << (compare_engine_variants
                     ? "native engine variant parity test (not generation throughput)\n"
                     : "native layer-major prefill test (not generation throughput)\n")
@@ -3318,6 +3428,8 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
               << optimized.seconds << '\n'
               << "  predictions: " << (tokens_match ? "match" : "MISMATCH") << '\n'
               << "  bit-exact logits/features: " << (exact ? "yes" : "no") << '\n'
+              << "  all prompt feature taps: "
+              << (reference.prefill_features == optimized.prefill_features ? "match" : "MISMATCH") << '\n'
               << "  feature relative RMSE: " << relative_rmse << '\n';
     // Layer-major comparison requires all-GPU parity. Engine-variant mode
     // holds CPU/GPU row routing fixed and also requires exact logits/features;
@@ -4255,6 +4367,63 @@ BenchmarkDecodeStats benchmark_decode_tokens(NativeTargetSession &target,
     return stats;
 }
 
+void benchmark_prefill_corpus(const std::string &target_path, const std::string &dflash_path,
+                             const std::string &token_path, std::size_t count,
+                             std::size_t context_capacity, std::size_t chunk,
+                             std::size_t resident_weight_budget) {
+    if (count == 0 || count > 131072 || context_capacity < count + 24 ||
+        context_capacity > 262144 || chunk < 8 || chunk > 512 || chunk % 8 != 0) {
+        throw std::invalid_argument("prefill-corpus needs real tokens, 24 spare positions, "
+                                    "and a multiple-of-eight chunk in [8, 512]");
+    }
+    std::ifstream input(token_path);
+    if (!input) throw std::runtime_error("cannot open frozen prompt token file");
+    std::vector<std::uint32_t> prompt;
+    prompt.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        std::uint64_t token = 0;
+        if (!(input >> token) || token > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("frozen prompt is truncated or has an invalid token ID");
+        }
+        prompt.push_back(static_cast<std::uint32_t>(token));
+    }
+    const auto initialized = std::chrono::steady_clock::now();
+    NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
+    NativeDflashEncoder dflash(dflash_path);
+    dflash.preload_all_quantized();
+    const qwen_native::GgufFile model(target_path);
+    Tokenizer tokenizer(model);
+    const double initialization_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - initialized).count();
+    const auto started = std::chrono::steady_clock::now();
+    auto anchor = prefill_prompt(target, dflash, prompt, chunk, [&](std::size_t committed) {
+        if (committed % 512 == 0 || committed == count) {
+            std::cerr << "physical prefill " << committed << '/' << count << '\n';
+        }
+    });
+    const double prefill_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const auto decoded = benchmark_decode_tokens(target, dflash, tokenizer, anchor, 16);
+    std::cout << "{\"diagnostic\":\"real_corpus_prefill\",\"prompt_tokens\":" << count
+              << ",\"prompt_fnv64\":" << token_hash(prompt)
+              << ",\"context_capacity\":" << context_capacity << ",\"chunk\":" << chunk
+              << ",\"initialization_seconds\":" << std::setprecision(9) << initialization_seconds
+              << ",\"prefill_seconds\":" << prefill_seconds
+              << ",\"prefill_tokens_per_second\":" << count / prefill_seconds
+              << ",\"decode_seconds\":" << decoded.seconds
+              << ",\"committed_outputs\":" << decoded.generated
+              << ",\"ended_early\":" << (decoded.ended_early ? "true" : "false")
+              << ",\"target_active_tokens\":" << target.active_tokens()
+              << ",\"draft_window_tokens\":" << dflash.injected_token_count()
+              << ",\"cpu_packed_bytes\":" << qwen_native::cpu_packed_matrix_cache_bytes()
+              << ",\"goal_certified\":false,\"generated_ids\":[";
+    for (std::size_t index = 0; index < decoded.tokens.size(); ++index) {
+        if (index) std::cout << ',';
+        std::cout << decoded.tokens[index];
+    }
+    std::cout << "]}\n";
+}
+
 void benchmark_128k(const std::string &target_path, const std::string &dflash_path,
                     const std::string &output_path, std::size_t resident_weight_budget,
                     int runs, const std::string &prompt_path,
@@ -4268,15 +4437,7 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
     constexpr std::size_t context_capacity =
         prompt_token_count + warmup_token_count + output_token_count;
     if (runs < 1) throw std::invalid_argument("128K benchmark RUNS must be positive");
-    std::size_t prefill_chunk = 8;
-    if (const char *requested = std::getenv("QWEN_NATIVE_PREFILL_CHUNK")) {
-        const std::string value(requested);
-        std::size_t consumed = 0;
-        prefill_chunk = std::stoul(value, &consumed);
-        if (consumed != value.size() || prefill_chunk < 8 || prefill_chunk > 512 || prefill_chunk % 8) {
-            throw std::invalid_argument("PREFILL_CHUNK must be a multiple of 8 in [8, 512]");
-        }
-    }
+    const std::size_t prefill_chunk = configured_prefill_chunk();
 
     const qwen_native::GgufFile model(target_path);
     Tokenizer tokenizer(model);
@@ -4359,6 +4520,7 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
             << ",\"QWEN_NATIVE_GPU_TOPK\":\"" << environment("QWEN_NATIVE_GPU_TOPK", "1") << "\""
             << ",\"QWEN_NATIVE_GPU_PIPELINE\":\"" << environment("QWEN_NATIVE_GPU_PIPELINE", "1") << "\""
             << ",\"QWEN_NATIVE_ASYNC_ACTIVATIONS\":\"" << environment("QWEN_NATIVE_ASYNC_ACTIVATIONS", "0") << "\""
+            << ",\"QWEN_NATIVE_PIN_MODEL\":\"" << environment("QWEN_NATIVE_PIN_MODEL", "0") << "\""
             << ",\"prefill_profile_enabled\":"
             << (qwen_native::environment_flag_enabled("QWEN_NATIVE_PREFILL_PROFILE") ? "true" : "false")
             << ",\"QWEN_NATIVE_DRAFT_N23\":\"" << environment("QWEN_NATIVE_DRAFT_N23", "0") << "\""
@@ -4390,49 +4552,16 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
             std::chrono::steady_clock::now() - initialization_started).count();
 
         const auto prefill_started = std::chrono::steady_clock::now();
-        std::uint32_t anchor = 0;
-        // Target history is physically populated in full. Only the drafter's
-        // own sliding window permits omitting its feature injection here.
-        constexpr std::size_t dflash_window = 2048;
-        const std::size_t fast_end = prompt.size() > dflash_window ? prompt.size() - dflash_window : 0;
-        for (std::size_t begin = 0; begin < fast_end; begin += prefill_chunk) {
-            const std::size_t valid = std::min(prefill_chunk, fast_end - begin);
-            if (prefill_chunk > 8) {
-                target.prefill_layer_major(prompt.data() + begin, valid);
-            } else {
-                std::array<std::uint32_t, 8> batch{};
-                batch.fill(248070);
-                std::copy_n(prompt.begin() + begin, valid, batch.begin());
-                (void)target.step_batch8_pipelined(batch, valid, false, false);
-            }
-            if ((begin + valid) % 8192 == 0) {
+        std::uint32_t anchor = prefill_prompt(target, dflash, prompt, prefill_chunk,
+            [&](std::size_t committed) {
+            if (committed % 8192 == 0 || committed == prompt.size()) {
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - prefill_started).count();
-                std::cerr << "  [run " << run << " prefill " << begin + valid << '/' << prompt.size() << " (chunk " << prefill_chunk << ", no DFlash), " << std::fixed << std::setprecision(1) << elapsed << "s]\n";
-            }
-        }
-        for (std::size_t begin = fast_end; begin < prompt.size(); begin += 8) {
-            const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
-            std::array<std::uint32_t, 8> batch{};
-            batch.fill(248070);
-            std::copy_n(prompt.begin() + begin, valid, batch.begin());
-            const std::size_t position = target.active_tokens();
-            const bool last_batch = begin + valid == prompt.size();
-            const auto result = target.step_batch8_pipelined(batch, valid, true, last_batch);
-            std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
-            for (std::size_t index = 0; index < valid; ++index) {
-                injection_features[index] = target.batch_dflash_features(index);
-            }
-            dflash.inject_batch(injection_features, valid, position);
-            anchor = result.next_tokens[valid - 1];
-            if ((begin + valid) % 8192 == 0) {
-                const double elapsed = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - prefill_started).count();
-                std::cerr << "  [run " << run << " prefill " << begin + valid << '/'
-                          << prompt.size() << ", " << std::fixed << std::setprecision(1)
+                std::cerr << "  [run " << run << " prefill " << committed << '/'
+                          << prompt.size() << " (chunk " << prefill_chunk << "), " << std::fixed << std::setprecision(1)
                           << elapsed << "s]\n";
             }
-        }
+        });
         const double ttft_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prefill_started).count();
         if (target.active_tokens() != prompt_token_count) {
@@ -4524,6 +4653,7 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
 
 void chat(const std::string &target_path, const std::string &dflash_path,
           std::size_t context_capacity, std::size_t resident_weight_budget) {
+    const auto prefill_chunk = configured_prefill_chunk();
     NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
     NativeDflashEncoder dflash(dflash_path);
     dflash.preload_all_quantized();
@@ -4602,20 +4732,7 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         const auto prefill_started = std::chrono::steady_clock::now();
         std::uint32_t anchor = 0;
         if (context_capacity > NativeTargetSession::pipeline_attention_capacity()) {
-            for (std::size_t begin = 0; begin < prompt.size(); begin += 8) {
-                const std::size_t valid = std::min<std::size_t>(8, prompt.size() - begin);
-                std::array<std::uint32_t, 8> batch{};
-                batch.fill(248070);
-                std::copy_n(prompt.begin() + begin, valid, batch.begin());
-                const std::size_t position = target.active_tokens();
-                const auto result = target.step_batch8_pipelined(batch, valid);
-                std::array<std::array<std::vector<float>, 5>, 8> injection_features{};
-                for (std::size_t index = 0; index < valid; ++index) {
-                    injection_features[index] = target.batch_dflash_features(index);
-                }
-                dflash.inject_batch(injection_features, valid, position);
-                anchor = result.next_tokens[valid - 1];
-            }
+            anchor = prefill_prompt(target, dflash, prompt, prefill_chunk);
         } else {
             NativeTargetSession::StepResult anchor_result{};
             for (const auto token : prompt) {
@@ -4627,7 +4744,9 @@ void chat(const std::string &target_path, const std::string &dflash_path,
         const double prefill_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prefill_started).count();
         std::cerr << "  [prefill " << prompt.size() << " tok, "
-                  << std::fixed << std::setprecision(1) << prefill_seconds << "s]\n";
+                  << std::fixed << std::setprecision(1) << prefill_seconds << "s, "
+                  << static_cast<double>(prompt.size()) / prefill_seconds
+                  << " physical prompt tok/s, chunk " << prefill_chunk << "]\n";
 
         std::cerr << "\033[1;34mAssistant:\033[0m " << std::flush;
         const auto gen_started = std::chrono::steady_clock::now();
@@ -4811,6 +4930,7 @@ void usage(const char *program) {
               << "  " << program << " tokenize-file MODEL.gguf TEXT.txt\n"
               << "  " << program << " prompt-test TARGET.gguf TEXT [TOKENS]\n"
               << "  " << program << " chat TARGET.gguf DFLASH.gguf [CONTEXT] [RESIDENT_GIB]\n"
+              << "  " << program << " prefill-corpus TARGET.gguf DFLASH.gguf PROMPT.tokens COUNT CONTEXT CHUNK [RESIDENT_GIB]\n"
               << "  " << program << " benchmark-128k TARGET.gguf DFLASH.gguf OUTPUT.jsonl [RESIDENT_GIB] [RUNS] [PROMPT.txt] [REQUIRED_TPS]\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
               << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
@@ -4938,6 +5058,18 @@ int main(int argc, char **argv) {
             benchmark_128k(argv[2], argv[3], argv[4],
                            static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0),
                            runs, argc >= 8 ? argv[7] : "", required_tps);
+            return EXIT_SUCCESS;
+        }
+        if ((argc == 8 || argc == 9) && std::string(argv[1]) == "prefill-corpus") {
+            const double gib = argc == 9 ? std::stod(argv[8]) : 1.0;
+            if (!std::isfinite(gib) || gib < 0.0 || gib > 2.0) {
+                throw std::invalid_argument("prefill-corpus RESIDENT_GIB must be finite and in [0, 2]");
+            }
+            benchmark_prefill_corpus(argv[2], argv[3], argv[4],
+                static_cast<std::size_t>(std::stoull(argv[5])),
+                static_cast<std::size_t>(std::stoull(argv[6])),
+                static_cast<std::size_t>(std::stoull(argv[7])),
+                static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0));
             return EXIT_SUCCESS;
         }
         if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "chat") {
