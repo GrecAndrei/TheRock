@@ -39,3 +39,20 @@ result is produced by workspace setup or host tests.
 The copied historical probe is evidence of memory bringup and queue failure,
 not kernel correctness. The old native baseline remains incomplete; this
 contract does not retroactively certify it.
+
+## Expanded model/head experimentation, authorized 2026-10-11
+
+The user explicitly permits changing the DFlash head, drafter and target model.
+The original-checkpoint track above remains a reproducible comparison, not a
+restriction on new research. Keep original assets intact. Use versioned model
+variants or separate patches rather than overwriting the only model copy.
+Record variant hashes, quantization, parameter/layer changes, training data and
+head settings; changed-model performance is reported under that identity.
+
+Drafter/head changes with exact greedy target verification can preserve the
+original target's output. Prove that on independent prompts and committed IDs,
+including rollback and all accepted-prefix lengths. A target-model change needs
+separate quality evaluation: reasoning/math/code/retrieval fixtures, known
+failures and comparison against the original. Faster but degraded output cannot
+be represented as an unchanged-model speedup. Physically processed context,
+committed-token accounting and real request timing remain honestly labelled.

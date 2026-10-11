@@ -1,0 +1,15 @@
+Test project /home/alex/TheRock-qwen38/engine-workspace/build/native-engine
+    Start 1: qwen38-cpu-self-test
+1/5 Test #1: qwen38-cpu-self-test .............   Passed    0.18 sec
+    Start 2: qwen38-runtime-options-test
+2/5 Test #2: qwen38-runtime-options-test ......   Passed    0.02 sec
+    Start 3: qwen38-draft-metrics-test
+3/5 Test #3: qwen38-draft-metrics-test ........   Passed    0.02 sec
+    Start 4: qwen38-attention-tile-test
+4/5 Test #4: qwen38-attention-tile-test .......   Passed    0.02 sec
+    Start 5: qwen38-single-job-worker-test
+5/5 Test #5: qwen38-single-job-worker-test ....   Passed    0.02 sec
+
+100% tests passed out of 5
+
+Total Test time (real) =   0.26 sec

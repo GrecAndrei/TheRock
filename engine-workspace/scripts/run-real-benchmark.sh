@@ -7,13 +7,15 @@ if [[ ! "$label" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     exit 2
 fi
 outputs=${2:-256}
+prompt_path=${3:-$workspace_dir/fixtures/real-benchmark-prompt.txt}
+prompt_path=$(realpath -- "$prompt_path")
 binary=${QWEN_NATIVE_DIAGNOSTIC_BINARY:-$workspace_dir/build/native-engine/qwen38-native}
 trial_dir=$(mktemp -d "$workspace_dir/results/decode-${label}-XXXXXX")
 cp "$binary" "$trial_dir/executable"
 tar -C "$workspace_dir/sources/native-engine" --exclude=.git --exclude=__pycache__ \
-    --exclude='*.pyc' -cf "$trial_dir/source.tar" src CMakeLists.txt
+    --exclude='*.pyc' -cf "$trial_dir/source.tar" src tests CMakeLists.txt benchmark_driver.py
 sha256sum "$trial_dir/executable" "$trial_dir/source.tar" \
-    "$workspace_dir/fixtures/real-benchmark-prompt.txt" | tee "$trial_dir/inputs.sha256"
+    "$prompt_path" | tee "$trial_dir/inputs.sha256"
 controls=(
     QWEN_NATIVE_HYBRID=1 QWEN_NATIVE_CPU_THREADS=20 QWEN_NATIVE_DEVICE_CHECKPOINT=1
     QWEN_NATIVE_CPU_Q6_PREDECODE=1 QWEN_NATIVE_CPU_IQ4_TILE_GEMM=0
@@ -22,6 +24,7 @@ controls=(
     QWEN_NATIVE_PIN_MODEL=0
     "QWEN_NATIVE_PINNED_STAGING=${QWEN_NATIVE_PINNED_STAGING:-0}"
     "QWEN_NATIVE_PINNED_STAGING_COARSE=${QWEN_NATIVE_PINNED_STAGING_COARSE:-0}"
+    "QWEN_NATIVE_SELECTOR_WEIGHT=${QWEN_NATIVE_SELECTOR_WEIGHT:-1}"
 )
 # Capture explicit controls above, then prevent an inherited experimental flag
 # (including presence-only flags) from silently changing the next workload.
@@ -34,7 +37,7 @@ done < <(compgen -e)
 command=(env "${unset_controls[@]}" "${controls[@]}" "$trial_dir/executable" benchmark-real
     /home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf
     /home/alex/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-    "$workspace_dir/fixtures/real-benchmark-prompt.txt" 131072 "$outputs" 512 1.0)
+    "$prompt_path" 131072 "$outputs" 512 1.0)
 printf '%q ' "${command[@]}" | tee "$trial_dir/command.txt"
 printf '\n' | tee -a "$trial_dir/command.txt"
 date --iso-8601=seconds | tee "$trial_dir/start.txt"

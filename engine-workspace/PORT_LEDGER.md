@@ -40,3 +40,13 @@ and produced the baseline's measured outputs, but achieved only 1.11 and 2.11
 tokens/s versus the 3.18 baseline interval. Both are **rejected for promotion**
 and default off. The controlled real-prompt diagnostic is retained as evidence
 infrastructure, not as a claimed engine speedup.
+
+## Draft-head calibration
+
+The user authorized head/drafter/target changes. `MODEL_EXPERIMENTS.md` retains
+the selector scales 0.0, 0.5 and 1.0, conditional acceptance/recall diagnostics,
+and an independent C++ holdout. All tested head variants matched their real
+prompt's 256 committed target IDs. Half-strength reduced verification count on
+one prompt but not the holdout. It is **not promoted**; scale 1.0 remains default.
+No target weights changed and no head was retrained. New target-model variants
+require separately identified quality evidence under `BENCHMARK_CONTRACT.md`.

@@ -1,0 +1,6 @@
+Review this C++ function for correctness and lifetime safety:
+std::string_view label(int n) {
+  std::string s = "item-" + std::to_string(n);
+  return s;
+}
+Explain the bug, give two correct API designs with short compilable examples, compare ownership and allocation costs, and describe a test that would catch the original problem. Keep the final answer around 250 words.

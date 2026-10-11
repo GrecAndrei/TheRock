@@ -143,3 +143,7 @@ diagnostic; it never classifies short-context results as final-goal success.
 The primary-source literature shortlist and concrete experimental gates are in
 [`RESEARCH_IDEAS.md`](RESEARCH_IDEAS.md). NVIDIA kernel speedups are not assumed
 to transfer to gfx1032, and approximate prompt/KV skipping is excluded.
+
+Model/head experimentation was explicitly authorized on 2026-10-11. The added
+track, selector diagnostics and measured ablations are documented in
+[`MODEL_EXPERIMENTS.md`](MODEL_EXPERIMENTS.md); original models remain intact.
