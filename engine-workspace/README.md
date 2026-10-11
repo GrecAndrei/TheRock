@@ -10,6 +10,7 @@ prompt processing and recorded output. Setup does not establish that result.
 | --- | --- | --- |
 | `sources/kyanite` | Independent Git clone, branch `engine/rx6650xt-10tps`; expand this engine | `867ea43cfb67db9782b17814020a24593d9e4508` plus preserved local edits |
 | `sources/native-baseline` | Copy of the pending C++/HIP engine, including uncommitted changes; correctness and performance baseline | TheRock `ef774ed4d411f8e3fb41014a923939d2e4de866d` plus working files |
+| `sources/native-engine` | Independent Git repository for HIP/C++ timeout and prefill fixes | Branch `engine/timeout-prefill-fix`; preserved source snapshot plus repairs |
 | `references/llama.cpp` | Independent, detached development reference and comparison engine | `5ecbe1ac17ec0484c5b44af0bd580cdc9c428ed4` |
 | `references/llama-upstream` | Fresh upstream reference, detached worktree sharing the reference clone's objects | `966baae76b578d5d3dd4c179a75a35c80ff75577` |
 | `fixtures` | Copied frozen project corpus and canonical 131072-token prompt | Existing benchmark assets, not regenerated text |
@@ -109,14 +110,14 @@ exit status even on timeout. Optional arguments are context capacity, requested
 resident GiB and timeout seconds. This diagnostic has no final-goal success
 classifier. Use the existing journaled benchmark driver for final certification.
 
-For the preserved native HIP build, in a suitably provisioned session:
+For the repaired native HIP engine:
 
 ```sh
-cmake -S sources/native-baseline -B build/native-hip -G Ninja \
+cmake -S sources/native-engine -B build/native-engine -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH=/home/alex/TheRock/build/dist/rocm \
   -DCMAKE_CXX_COMPILER=/home/alex/TheRock/build/dist/rocm/bin/hipcc
-cmake --build build/native-hip --parallel 2
+cmake --build build/native-engine --parallel 2
 ```
 
 Configure a fresh llama.cpp comparison build from the pinned source using its
@@ -124,3 +125,12 @@ Configure a fresh llama.cpp comparison build from the pinned source using its
 the resulting executable hash. Existing external binaries are not assumed to
 match this source pin. Do not overlap GPU comparisons or CPU performance tests
 with a generation benchmark.
+
+The diagnostic runner defaults to `build/native-engine/qwen38-native`.
+`QWEN_NATIVE_DIAGNOSTIC_BINARY` can select the preserved baseline explicitly.
+Never edit a shell runner while its foreground request is executing.
+
+The completed timeout/prefill repair results are in
+[`TIMEOUT_PREFILL_RESULTS.md`](TIMEOUT_PREFILL_RESULTS.md). The same 360-second
+request now completes with its exit record; physical corpus prefill and exact
+feature/state parity are recorded separately from generated-token throughput.

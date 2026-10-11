@@ -86,6 +86,10 @@ partial token count is promoted to a successful performance measurement.
 
 ## Next engineering gate
 
+The subsequent HIP/C++ timeout/prefill repair is complete for the recorded
+fixtures and real request; see `TIMEOUT_PREFILL_RESULTS.md`. It preserves
+Kyanite's independent runtime boundary and does not certify the 10 TPS goal.
+
 Integrate the proven mapping and auxiliary-region ownership into the production
 dispatcher with failure/rollback tests. Then run bounded empty/write-index/
 vector-add dispatch, completion, readback and teardown before implementing the

@@ -1,0 +1,5 @@
+physical prefill 512/3073
+physical prefill 1024/3073
+physical prefill 3072/3073
+physical prefill 3073/3073
+{"diagnostic":"real_corpus_prefill","prompt_tokens":3073,"prompt_fnv64":3020550682829038446,"context_capacity":131072,"chunk":512,"initialization_seconds":0.519059739,"prefill_seconds":197.675439,"prefill_tokens_per_second":15.5456845,"decode_seconds":3.53205724,"committed_outputs":8,"ended_early":true,"target_active_tokens":3081,"draft_window_tokens":2048,"cpu_packed_bytes":6756677120,"goal_certified":false,"generated_ids":[6277,3874,1,3644,9251,14,51451,14]}

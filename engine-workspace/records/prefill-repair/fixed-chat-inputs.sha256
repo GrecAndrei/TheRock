@@ -1,0 +1,4 @@
+2f91e6d05178093b301d82f2961b8021284f1c0d785656d120a9154856d6bd1a  /home/alex/TheRock-qwen38/engine-workspace/build/native-engine/qwen38-native
+322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482  /home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf
+18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594  /home/alex/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+6eced93f413b7ee25774ad75397178edb0e29b4e2604dedfed24f12c307b048d  /home/alex/TheRock-qwen38/engine-workspace/fixtures/real-chat-input.txt

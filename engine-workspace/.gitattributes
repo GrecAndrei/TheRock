@@ -1,0 +1,3 @@
+# Evidence retains the exact terminal bytes, including prompt whitespace.
+records/**/*.raw.log -whitespace
+records/**/*-command.txt -whitespace
