@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,22 @@ namespace qwen_native {
 inline bool environment_flag_enabled(const char *name) {
     const char *value = std::getenv(name);
     return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+inline float configured_selector_weight() {
+    const char *value = std::getenv("QWEN_NATIVE_SELECTOR_WEIGHT");
+    if (!value) return 1.0F;
+    std::size_t consumed = 0;
+    float weight;
+    try {
+        weight = std::stof(value, &consumed);
+    } catch (const std::exception &) {
+        throw std::invalid_argument("selector weight must be finite and nonnegative");
+    }
+    if (consumed != std::strlen(value) || !std::isfinite(weight) || weight < 0.0F) {
+        throw std::invalid_argument("selector weight must be finite and nonnegative");
+    }
+    return weight;
 }
 
 // Serial native fixture helper only: restore after the owning session drains.

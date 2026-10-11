@@ -2,6 +2,7 @@
 #include "gguf.h"
 #include "kernels.h"
 #include "runtime_options.h"
+#include "draft_metrics.h"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -2753,6 +2754,8 @@ public:
         return found == items.end() ? -1 : static_cast<int>(std::distance(items.begin(), found));
     }
 
+    [[nodiscard]] float selector_weight() const { return selector_scale_; }
+
 private:
     struct InjectedCache {
         std::vector<std::uint16_t> keys;
@@ -2972,12 +2975,6 @@ private:
                 successors[current] = dequantize_selector_row("selector_successor.weight", candidates[pos][current]);
             }
             const float *hidden = selector_hidden.data() + pos * 256;
-            static const float selector_scale = [] {
-                if (const char *env = std::getenv("QWEN_NATIVE_SELECTOR_WEIGHT")) {
-                    return std::stof(env);
-                }
-                return 1.0F;
-            }();
             std::array<float, top_k> scores{};
             for (std::size_t current = 0; current < top_k; ++current) {
                 float transition = 0.0F;
@@ -2985,7 +2982,7 @@ private:
                 for (std::size_t rank = 0; rank < 256; ++rank) {
                     transition = std::fma(successors[current][rank], previous[rank] * hidden[rank], transition);
                 }
-                scores[current] = unary[pos][current] + selector_scale * transition;
+                scores[current] = unary[pos][current] + selector_scale_ * transition;
             }
             if (std::getenv("QWEN_NATIVE_DFLASH_DEBUG") && pos == 1) {
                 std::cerr << "    [dflash pos1 debug: ";
@@ -3035,12 +3032,6 @@ private:
                 successors[current] = dequantize_selector_row("selector_successor.weight", candidates[pos][current]);
             }
             const float *hidden = selector_hidden.data() + pos * 256;
-            static const float selector_scale = [] {
-                if (const char *env = std::getenv("QWEN_NATIVE_SELECTOR_WEIGHT")) {
-                    return std::stof(env);
-                }
-                return 1.0F;
-            }();
             std::array<float, top_k> scores{};
             for (std::size_t current = 0; current < top_k; ++current) {
                 float transition = 0.0F;
@@ -3048,7 +3039,7 @@ private:
                 for (std::size_t rank = 0; rank < 256; ++rank) {
                     transition = std::fma(successors[current][rank], previous[rank] * hidden[rank], transition);
                 }
-                scores[current] = unary[pos][current] + selector_scale * transition;
+                scores[current] = unary[pos][current] + selector_scale_ * transition;
             }
             if (std::getenv("QWEN_NATIVE_DFLASH_DEBUG") && pos == 1) {
                 std::cerr << "    [dflash pos1 debug: ";
@@ -3075,6 +3066,7 @@ private:
     Mapping mapping_;
     std::array<InjectedCache, 5> injected_;
     mutable std::array<std::array<std::uint32_t, 16>, 7> last_candidates_{};
+    float selector_scale_ = qwen_native::configured_selector_weight();
 };
 
 std::size_t configured_prefill_chunk(std::size_t fallback = 512) {
@@ -4210,6 +4202,7 @@ struct BenchmarkDecodeStats {
     double output_seconds = 0.0;
     bool ended_early = false;
     std::vector<std::uint32_t> tokens;
+    qwen_native::DraftAcceptanceMetrics draft_metrics;
 };
 
 std::uint64_t token_hash(const std::vector<std::uint32_t> &tokens) {
@@ -4336,6 +4329,12 @@ BenchmarkDecodeStats benchmark_decode_tokens(NativeTargetSession &target,
                verification.next_tokens[accepted] == proposals[accepted]) {
             ++accepted;
         }
+        std::array<int, 7> target_ranks{};
+        const auto labelled = std::min(proposal_count, accepted + 1);
+        for (std::size_t pos = 0; pos < labelled; ++pos) {
+            target_ranks[pos] = dflash.last_candidate_rank(pos, verification.next_tokens[pos]);
+        }
+        stats.draft_metrics.observe(proposal_count, accepted, target_ranks);
         if (accepted != proposal_count) {
             const auto commit_started = std::chrono::steady_clock::now();
             target.commit_speculative_prefix(checkpoint, accepted + 1);
@@ -4449,6 +4448,22 @@ void benchmark_real(const std::string &target_path, const std::string &dflash_pa
               << ",\"ffn_seconds\":" << measured.ffn_seconds
               << ",\"output_seconds\":" << measured.output_seconds
               << ",\"cpu_packed_bytes\":" << qwen_native::cpu_packed_matrix_cache_bytes()
+              << ",\"selector_weight\":" << dflash.selector_weight()
+              << ",\"draft_cycles\":" << measured.draft_metrics.draft_cycles;
+    const auto write_counts = [](const char *name, const auto &counts) {
+        std::cout << ",\"" << name << "\":[";
+        for (std::size_t index = 0; index < counts.size(); ++index) {
+            if (index) std::cout << ',';
+            std::cout << counts[index];
+        }
+        std::cout << ']';
+    };
+    write_counts("accepted_prefix_histogram", measured.draft_metrics.prefix_histogram);
+    write_counts("conditional_attempts", measured.draft_metrics.conditional_attempts);
+    write_counts("conditional_accepted", measured.draft_metrics.conditional_accepted);
+    write_counts("conditional_top16_hits", measured.draft_metrics.conditional_top16_hits);
+    write_counts("first_reject_rank_histogram", measured.draft_metrics.first_reject_rank);
+    std::cout
               << ",\"ended_early\":" << (measured.ended_early ? "true" : "false")
               << ",\"goal_certified\":false,\"generated_ids\":[";
     for (std::size_t index = 0; index < measured.tokens.size(); ++index) {
@@ -4617,6 +4632,7 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
             << ",\"QWEN_NATIVE_PIN_MODEL\":\"" << environment("QWEN_NATIVE_PIN_MODEL", "0") << "\""
             << ",\"QWEN_NATIVE_PINNED_STAGING\":\"" << environment("QWEN_NATIVE_PINNED_STAGING", "0") << "\""
             << ",\"QWEN_NATIVE_PINNED_STAGING_COARSE\":\"" << environment("QWEN_NATIVE_PINNED_STAGING_COARSE", "0") << "\""
+            << ",\"QWEN_NATIVE_SELECTOR_WEIGHT\":\"" << environment("QWEN_NATIVE_SELECTOR_WEIGHT", "1") << "\""
             << ",\"prefill_profile_enabled\":"
             << (qwen_native::environment_flag_enabled("QWEN_NATIVE_PREFILL_PROFILE") ? "true" : "false")
             << ",\"QWEN_NATIVE_DRAFT_N23\":\"" << environment("QWEN_NATIVE_DRAFT_N23", "0") << "\""

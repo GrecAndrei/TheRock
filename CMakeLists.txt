@@ -52,6 +52,11 @@ if(BUILD_TESTING)
     target_compile_options(qwen38-runtime-options-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME qwen38-runtime-options-test COMMAND qwen38-runtime-options-test)
 
+    add_executable(qwen38-draft-metrics-test tests/draft_metrics_test.cpp)
+    target_include_directories(qwen38-draft-metrics-test PRIVATE src)
+    target_compile_options(qwen38-draft-metrics-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME qwen38-draft-metrics-test COMMAND qwen38-draft-metrics-test)
+
     add_executable(qwen38-attention-tile-test tests/attention_tile_test.cpp)
     target_include_directories(qwen38-attention-tile-test PRIVATE src)
     target_compile_options(qwen38-attention-tile-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -62,7 +67,7 @@ if(BUILD_TESTING)
     target_compile_options(qwen38-single-job-worker-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME qwen38-single-job-worker-test COMMAND qwen38-single-job-worker-test)
     set_tests_properties(qwen38-single-job-worker-test PROPERTIES TIMEOUT 30)
-    set_target_properties(qwen38-runtime-options-test qwen38-attention-tile-test
+    set_target_properties(qwen38-runtime-options-test qwen38-draft-metrics-test qwen38-attention-tile-test
         qwen38-single-job-worker-test PROPERTIES
         BUILD_RPATH "${CMAKE_PREFIX_PATH}/lib"
     )

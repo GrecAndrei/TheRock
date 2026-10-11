@@ -46,6 +46,20 @@ the same 256 outputs in 92.8776443 seconds (2.75631453 tokens/s). Host variabili
 is visible; 3.18 is not a stable sustained-speed promise. Four CPU CTests and
 eight Python lifecycle tests passed after that replay.
 
+## Head diagnostics
+
+The real benchmark now records per-position acceptance, conditional top-16
+recall, accepted-prefix histograms and first-rejection rank. Labels stop at the
+first rejection; logits after a wrong speculative prefix are not true greedy
+labels. Anchor-only and short-tail cycles retain their actual proposal counts.
+
+`QWEN_NATIVE_SELECTOR_WEIGHT` is finite/nonnegative and captured per drafter
+session (default 1.0). It scales only the bilinear selector correction, not the
+target model or verifier. The workspace runner exposes and records the option.
+Changing a draft head must pass committed-target-ID comparisons; changing the
+target itself is a separately identified quality/performance experiment.
+Five CPU CTests and eight lifecycle tests pass with the new instrumentation.
+
 Raw evidence belongs to the workspace `results/decode-*` directories and the
 tracked evidence ledger. No result here demonstrates 10 tokens/s, completed
 physical-128K prefill, or independent complete-model numerical certification.

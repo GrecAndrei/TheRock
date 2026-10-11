@@ -70,7 +70,33 @@ int main() {
             if (std::string(error.what()) != "fixture unwind") throw;
             require_mode(true);
         }
-        std::cout << "9 runtime-flag cases and scoped restore/unwind passed; CPU-only, not inference timing\n";
+        constexpr const char *selector_name = "QWEN_NATIVE_SELECTOR_WEIGHT";
+        qwen_native::ScopedEnvironment selector_restore(selector_name, "1");
+        if (unsetenv(selector_name)) throw std::runtime_error("unsetenv failed");
+        if (qwen_native::configured_selector_weight() != 1.0F) {
+            throw std::runtime_error("selector default changed");
+        }
+        constexpr std::array<const char *, 4> weights = {"0", "0.5", "1", "2"};
+        constexpr std::array<float, 4> expected = {0.0F, 0.5F, 1.0F, 2.0F};
+        for (std::size_t index = 0; index < weights.size(); ++index) {
+            qwen_native::ScopedEnvironment weight(selector_name, weights[index]);
+            if (qwen_native::configured_selector_weight() != expected[index]) {
+                throw std::runtime_error("selector weight parsed incorrectly");
+            }
+        }
+        constexpr std::array<const char *, 8> invalid_weights = {
+            "", "-1", "nan", "inf", "1suffix", "1.0 ", "1e999", "false"};
+        for (const char *value : invalid_weights) {
+            qwen_native::ScopedEnvironment weight(selector_name, value);
+            bool rejected = false;
+            try {
+                (void)qwen_native::configured_selector_weight();
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            if (!rejected) throw std::runtime_error("invalid selector weight accepted");
+        }
+        std::cout << "runtime flags, scoped restore/unwind and selector-weight cases passed; CPU-only, not inference timing\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;
