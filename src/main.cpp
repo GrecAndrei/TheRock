@@ -3317,13 +3317,14 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
                              bool compare_engine_variants = false) {
     constexpr std::size_t prefix_tokens = 17;
     const bool candidate_async = qwen_native::environment_flag_enabled("QWEN_NATIVE_ASYNC_ACTIVATIONS");
+    const bool candidate_pinned = qwen_native::environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING");
     const char *tile_mode = std::getenv("QWEN_NATIVE_Q8_TILED");
     const std::string candidate_tile = tile_mode ? tile_mode : "warp16";
     if (compare_engine_variants &&
         (context_capacity <= 4096 ||
          (candidate_tile != "warp16" && candidate_tile != "warp16lds" &&
           candidate_tile != "warp16packed") ||
-         (!candidate_async && candidate_tile == "warp16"))) {
+         (!candidate_async && !candidate_pinned && candidate_tile == "warp16"))) {
         throw std::invalid_argument("engine variant test needs long capacity and an explicit "
                                     "async-activation or LDS variant");
     }
@@ -3350,6 +3351,8 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
         // Guards outlive the session, so all its workers drain before restore.
         qwen_native::ScopedEnvironment async_mode("QWEN_NATIVE_ASYNC_ACTIVATIONS",
             compare_engine_variants ? (layer_major && candidate_async ? "1" : "0") : nullptr);
+        qwen_native::ScopedEnvironment pinned_mode("QWEN_NATIVE_PINNED_STAGING",
+            compare_engine_variants ? (layer_major && candidate_pinned ? "1" : "0") : nullptr);
         qwen_native::ScopedEnvironment q8_mode("QWEN_NATIVE_Q8_TILED",
             compare_engine_variants ? (layer_major ? candidate_tile.c_str() : "warp16") : nullptr);
         qwen_native::ScopedEnvironment kv_mode("QWEN_NATIVE_KV", compare_engine_variants ? "q8" : nullptr);
@@ -4201,6 +4204,10 @@ struct BenchmarkDecodeStats {
     double verification_wall_seconds = 0.0;
     double commit_wall_seconds = 0.0;
     double injection_seconds = 0.0;
+    double recurrent_seconds = 0.0;
+    double attention_seconds = 0.0;
+    double ffn_seconds = 0.0;
+    double output_seconds = 0.0;
     bool ended_early = false;
     std::vector<std::uint32_t> tokens;
 };
@@ -4318,6 +4325,10 @@ BenchmarkDecodeStats benchmark_decode_tokens(NativeTargetSession &target,
         stats.checkpoint_host_seconds += std::chrono::duration<double>(
             target_started - checkpoint_started).count();
         const auto verification = target.step_batch8_pipelined(candidate, proposal_count + 1);
+        stats.recurrent_seconds += verification.recurrent_seconds;
+        stats.attention_seconds += verification.attention_seconds;
+        stats.ffn_seconds += verification.ffn_seconds;
+        stats.output_seconds += verification.output_seconds;
         stats.verification_wall_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - target_started).count();
         std::size_t accepted = 0;
@@ -4365,6 +4376,89 @@ BenchmarkDecodeStats benchmark_decode_tokens(NativeTargetSession &target,
     stats.seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     return stats;
+}
+
+std::vector<std::uint32_t> make_chat_prompt(Tokenizer &tokenizer, const std::string &text) {
+    std::vector<std::uint32_t> prompt{tokenizer.im_start(), 8678, 198};
+    const auto system = tokenizer.encode_full(
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+        "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.");
+    prompt.insert(prompt.end(), system.begin(), system.end());
+    prompt.insert(prompt.end(), {tokenizer.im_end(), 198, tokenizer.im_start(), 846, 198});
+    const auto user = tokenizer.encode_full(text);
+    prompt.insert(prompt.end(), user.begin(), user.end());
+    prompt.insert(prompt.end(), {tokenizer.im_end(), 198, tokenizer.im_start(), 74455, 198});
+    return prompt;
+}
+
+void benchmark_real(const std::string &target_path, const std::string &dflash_path,
+                    const std::string &prompt_path, std::size_t context_capacity,
+                    std::size_t output_count, std::size_t chunk,
+                    std::size_t resident_weight_budget) {
+    if (output_count == 0 || output_count > 8192 || context_capacity > 262144 ||
+        chunk < 8 || chunk > 512 || chunk % 8 != 0) {
+        throw std::invalid_argument("invalid real-prompt benchmark counts or chunk");
+    }
+    std::ifstream input(prompt_path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open real benchmark prompt");
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    auto text = contents.str();
+    if (!text.empty() && text.back() == '\n') text.pop_back();
+    if (!text.empty() && text.back() == '\r') text.pop_back();
+    const qwen_native::GgufFile model(target_path);
+    Tokenizer tokenizer(model);
+    const auto prompt = make_chat_prompt(tokenizer, text);
+    if (prompt.size() + output_count + 16 > context_capacity) {
+        throw std::invalid_argument("real benchmark context is too small for prompt and outputs");
+    }
+    const auto initialized = std::chrono::steady_clock::now();
+    NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
+    NativeDflashEncoder dflash(dflash_path);
+    dflash.preload_all_quantized();
+    const double initialization_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - initialized).count();
+    const auto started = std::chrono::steady_clock::now();
+    auto anchor = prefill_prompt(target, dflash, prompt, chunk);
+    const double prefill_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const auto warmup = benchmark_decode_tokens(target, dflash, tokenizer, anchor, 8);
+    if (warmup.generated != 8 || warmup.ended_early) {
+        throw std::runtime_error("real benchmark stopped before eight warmup outputs");
+    }
+    const auto measured = benchmark_decode_tokens(target, dflash, tokenizer, anchor, output_count);
+    std::cout << "{\"diagnostic\":\"real_prompt_decode\",\"prompt_tokens\":" << prompt.size()
+              << ",\"prompt_fnv64\":\"0x" << std::hex << token_hash(prompt) << std::dec
+              << "\",\"output_fnv64\":\"0x" << std::hex << token_hash(measured.tokens) << std::dec
+              << "\",\"context_capacity\":" << context_capacity
+              << ",\"chunk\":" << chunk << ",\"warmup_outputs\":8"
+              << ",\"initialization_seconds\":" << std::setprecision(9) << initialization_seconds
+              << ",\"prefill_seconds\":" << prefill_seconds
+              << ",\"decode_seconds\":" << measured.seconds
+              << ",\"committed_outputs\":" << measured.generated
+              << ",\"generated_tokens_per_second\":" << measured.generated / measured.seconds
+              << ",\"cycles\":" << measured.cycles
+              << ",\"proposed\":" << measured.proposed << ",\"accepted\":" << measured.accepted
+              << ",\"draft_seconds\":" << measured.draft_seconds
+              << ",\"checkpoint_host_seconds\":" << measured.checkpoint_host_seconds
+              << ",\"verification_seconds\":" << measured.verification_wall_seconds
+              << ",\"commit_seconds\":" << measured.commit_wall_seconds
+              << ",\"injection_seconds\":" << measured.injection_seconds
+              << ",\"recurrent_seconds\":" << measured.recurrent_seconds
+              << ",\"attention_seconds\":" << measured.attention_seconds
+              << ",\"ffn_seconds\":" << measured.ffn_seconds
+              << ",\"output_seconds\":" << measured.output_seconds
+              << ",\"cpu_packed_bytes\":" << qwen_native::cpu_packed_matrix_cache_bytes()
+              << ",\"ended_early\":" << (measured.ended_early ? "true" : "false")
+              << ",\"goal_certified\":false,\"generated_ids\":[";
+    for (std::size_t index = 0; index < measured.tokens.size(); ++index) {
+        if (index) std::cout << ',';
+        std::cout << measured.tokens[index];
+    }
+    std::cout << "]}\n";
+    if (measured.generated != output_count || measured.ended_early) {
+        throw std::runtime_error("real benchmark ended before all requested committed outputs");
+    }
 }
 
 void benchmark_prefill_corpus(const std::string &target_path, const std::string &dflash_path,
@@ -4521,6 +4615,8 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
             << ",\"QWEN_NATIVE_GPU_PIPELINE\":\"" << environment("QWEN_NATIVE_GPU_PIPELINE", "1") << "\""
             << ",\"QWEN_NATIVE_ASYNC_ACTIVATIONS\":\"" << environment("QWEN_NATIVE_ASYNC_ACTIVATIONS", "0") << "\""
             << ",\"QWEN_NATIVE_PIN_MODEL\":\"" << environment("QWEN_NATIVE_PIN_MODEL", "0") << "\""
+            << ",\"QWEN_NATIVE_PINNED_STAGING\":\"" << environment("QWEN_NATIVE_PINNED_STAGING", "0") << "\""
+            << ",\"QWEN_NATIVE_PINNED_STAGING_COARSE\":\"" << environment("QWEN_NATIVE_PINNED_STAGING_COARSE", "0") << "\""
             << ",\"prefill_profile_enabled\":"
             << (qwen_native::environment_flag_enabled("QWEN_NATIVE_PREFILL_PROFILE") ? "true" : "false")
             << ",\"QWEN_NATIVE_DRAFT_N23\":\"" << environment("QWEN_NATIVE_DRAFT_N23", "0") << "\""
@@ -4702,29 +4798,7 @@ void chat(const std::string &target_path, const std::string &dflash_path,
             continue;
         }
 
-        std::vector<std::uint32_t> prompt;
-        // Match the checkpoint's default chat template: thinking mode inserts
-        // the xhigh reasoning instruction as a system turn even when the user
-        // did not provide an explicit system message.
-        prompt.push_back(tokenizer.im_start());
-        prompt.push_back(8678);  // system
-        prompt.push_back(198);   // \n
-        const auto system_text = tokenizer.encode_full(
-            "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
-            "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.");
-        prompt.insert(prompt.end(), system_text.begin(), system_text.end());
-        prompt.push_back(tokenizer.im_end());
-        prompt.push_back(198);
-        prompt.push_back(tokenizer.im_start());
-        prompt.push_back(846);   // user
-        prompt.push_back(198);   // \n
-        auto user_text = tokenizer.encode_full(line);
-        prompt.insert(prompt.end(), user_text.begin(), user_text.end());
-        prompt.push_back(tokenizer.im_end());
-        prompt.push_back(198);
-        prompt.push_back(tokenizer.im_start());
-        prompt.push_back(74455); // assistant
-        prompt.push_back(198);
+        const auto prompt = make_chat_prompt(tokenizer, line);
 
         // Prefill with the same native pipeline used for verification when a
         // genuine long context was requested. This writes every prompt KV into
@@ -4930,6 +5004,7 @@ void usage(const char *program) {
               << "  " << program << " tokenize-file MODEL.gguf TEXT.txt\n"
               << "  " << program << " prompt-test TARGET.gguf TEXT [TOKENS]\n"
               << "  " << program << " chat TARGET.gguf DFLASH.gguf [CONTEXT] [RESIDENT_GIB]\n"
+              << "  " << program << " benchmark-real TARGET.gguf DFLASH.gguf PROMPT.txt CONTEXT [OUTPUTS] [CHUNK] [RESIDENT_GIB]\n"
               << "  " << program << " prefill-corpus TARGET.gguf DFLASH.gguf PROMPT.tokens COUNT CONTEXT CHUNK [RESIDENT_GIB]\n"
               << "  " << program << " benchmark-128k TARGET.gguf DFLASH.gguf OUTPUT.jsonl [RESIDENT_GIB] [RUNS] [PROMPT.txt] [REQUIRED_TPS]\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
@@ -5058,6 +5133,18 @@ int main(int argc, char **argv) {
             benchmark_128k(argv[2], argv[3], argv[4],
                            static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0),
                            runs, argc >= 8 ? argv[7] : "", required_tps);
+            return EXIT_SUCCESS;
+        }
+        if (argc >= 6 && argc <= 9 && std::string(argv[1]) == "benchmark-real") {
+            const double gib = argc == 9 ? std::stod(argv[8]) : 1.0;
+            if (!std::isfinite(gib) || gib < 0 || gib > 2.0) {
+                throw std::invalid_argument("real benchmark RESIDENT_GIB must be finite and in [0, 2]");
+            }
+            benchmark_real(argv[2], argv[3], argv[4],
+                static_cast<std::size_t>(std::stoull(argv[5])),
+                argc >= 7 ? static_cast<std::size_t>(std::stoull(argv[6])) : 256,
+                argc >= 8 ? static_cast<std::size_t>(std::stoull(argv[7])) : 512,
+                static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0));
             return EXIT_SUCCESS;
         }
         if ((argc == 8 || argc == 9) && std::string(argv[1]) == "prefill-corpus") {

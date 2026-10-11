@@ -5481,6 +5481,10 @@ struct DevicePipeline {
 
     void *weight_buf[2] = {};
     std::size_t weight_buf_capacity = 0;
+    bool pinned_staging = false;
+    bool coarse_staging = false;
+    void *host_weight_buf[2] = {};
+    bool host_weight_pending[2] = {};
     int active_weight_buf = 0;
     const void *prefetched_host_ptr[2] = {};
     std::size_t prefetched_bytes[2] = {};
@@ -5491,6 +5495,8 @@ struct DevicePipeline {
 
     void *inline_buf = nullptr;
     std::size_t inline_buf_capacity = 0;
+    void *host_inline_buf = nullptr;
+    bool host_inline_pending = false;
     const void *inline_prefetched_ptr = nullptr;
     std::size_t inline_prefetched_bytes = 0;
     hipEvent_t inline_done = nullptr;
@@ -5519,6 +5525,8 @@ struct DevicePipeline {
         if (hybrid_host_output2) (void)hipHostFree(hybrid_host_output2);
         if (hybrid_host_output3) (void)hipHostFree(hybrid_host_output3);
         for (auto &w : weight_buf) if (w) (void)hipFree(w);
+        for (auto &w : host_weight_buf) if (w) (void)hipHostFree(w);
+        if (host_inline_buf) (void)hipHostFree(host_inline_buf);
         for (auto &e : weight_consumed) if (e) (void)hipEventDestroy(e);
         for (auto &e : transfer_done) if (e) (void)hipEventDestroy(e);
         if (inline_buf) (void)hipFree(inline_buf);
@@ -5536,6 +5544,8 @@ DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t f
                                        std::size_t max_weight_bytes) {
     auto p = std::make_unique<DevicePipeline>();
     p->async_activations = environment_flag_enabled("QWEN_NATIVE_ASYNC_ACTIVATIONS");
+    p->pinned_staging = environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING");
+    p->coarse_staging = environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING_COARSE");
     hip_check(hipGetDevice(&p->device_ordinal), "pipeline current device");
     p->embedding_size = embedding_size;
     p->ffn_size = ffn_size;
@@ -5578,15 +5588,26 @@ DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t f
     for (auto &w : p->weight_buf) {
         hip_check(hipMalloc(&w, max_weight_bytes), "pipeline weight buf");
     }
+    if (p->pinned_staging) {
+        const unsigned flags = p->coarse_staging ? hipHostMallocNonCoherent : hipHostMallocDefault;
+        for (auto &w : p->host_weight_buf) {
+            hip_check(hipHostMalloc(&w, max_weight_bytes, flags),
+                      "pipeline bounded pinned weight staging");
+        }
+        hip_check(hipHostMalloc(&p->host_inline_buf, max_weight_bytes, flags),
+                  "pipeline bounded pinned inline staging");
+    }
     for (auto &e : p->weight_consumed) {
         hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline weight event");
     }
+    const unsigned copy_event_flags = hipEventDisableTiming |
+        (p->pinned_staging && p->coarse_staging ? hipEventReleaseToSystem : 0);
     for (auto &e : p->transfer_done) {
-        hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline transfer done event");
+        hip_check(hipEventCreateWithFlags(&e, copy_event_flags), "pipeline transfer done event");
     }
     hip_check(hipMalloc(&p->inline_buf, max_weight_bytes), "pipeline inline buf");
     p->inline_buf_capacity = max_weight_bytes;
-    hip_check(hipEventCreateWithFlags(&p->inline_done, hipEventDisableTiming), "pipeline inline event");
+    hip_check(hipEventCreateWithFlags(&p->inline_done, copy_event_flags), "pipeline inline event");
     hip_check(hipEventCreateWithFlags(&p->inline_consumed, hipEventDisableTiming),
               "pipeline inline consumed event");
     return p.release();
@@ -5594,6 +5615,30 @@ DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t f
 
 void destroy_device_pipeline(DevicePipeline *pipeline) {
     delete pipeline;
+}
+
+const void *pipeline_stage_host_weights(DevicePipeline *pipeline, const void *source,
+                                        std::size_t bytes, int buffer) {
+    if (!pipeline->pinned_staging) return source;
+    if (!source || bytes == 0 || buffer < -1 || buffer > 1 || bytes > pipeline->max_weight_bytes) {
+        throw std::invalid_argument("weight copy exceeds bounded host staging capacity");
+    }
+    if (buffer >= 0) {
+        if (pipeline->host_weight_pending[buffer]) {
+            hip_check(hipEventSynchronize(pipeline->transfer_done[buffer]),
+                      "wait previous pinned weight DMA before host reuse");
+        }
+        std::memcpy(pipeline->host_weight_buf[buffer], source, bytes);
+        pipeline->host_weight_pending[buffer] = true;
+        return pipeline->host_weight_buf[buffer];
+    }
+    if (pipeline->host_inline_pending) {
+        hip_check(hipEventSynchronize(pipeline->inline_done),
+                  "wait previous pinned inline DMA before host reuse");
+    }
+    std::memcpy(pipeline->host_inline_buf, source, bytes);
+    pipeline->host_inline_pending = true;
+    return pipeline->host_inline_buf;
 }
 
 namespace {
@@ -5774,9 +5819,14 @@ void pipeline_project_batch8(DevicePipeline *pipeline, const void *weights,
                 hip_check(hipEventSynchronize(pipeline->weight_consumed[buf]),
                           "pipeline sync event before upload");
             }
-            hip_check(hipMemcpyAsync(pipeline->weight_buf[buf], weights, weight_bytes,
+            const auto *host_weights = pipeline_stage_host_weights(pipeline, weights, weight_bytes, buf);
+            hip_check(hipMemcpyAsync(pipeline->weight_buf[buf], host_weights, weight_bytes,
                                      hipMemcpyHostToDevice, pipeline->compute_stream),
                       "pipeline weight upload");
+            if (pipeline->pinned_staging) {
+                hip_check(hipEventRecord(pipeline->transfer_done[buf], pipeline->compute_stream),
+                          "pipeline direct pinned upload complete");
+            }
             device_weights = pipeline->weight_buf[buf];
             used_buf = buf;
         }
@@ -5928,7 +5978,9 @@ void pipeline_project_gpu_rows_pipelined(DevicePipeline *pipeline,
                                          pipeline->weight_consumed[buffer], 0),
                       "hybrid row pipeline wait consumed");
         }
-        hip_check(hipMemcpyAsync(pipeline->weight_buf[buffer], source + row * row_bytes,
+        const auto *host_weights = pipeline_stage_host_weights(
+            pipeline, source + row * row_bytes, rows * row_bytes, buffer);
+        hip_check(hipMemcpyAsync(pipeline->weight_buf[buffer], host_weights,
                                  rows * row_bytes, hipMemcpyHostToDevice,
                                  pipeline->transfer_stream),
                   "hybrid row pipeline upload");
@@ -6211,7 +6263,8 @@ void pipeline_prefetch_weights(DevicePipeline *pipeline, const void *weights,
         hip_check(hipStreamWaitEvent(pipeline->transfer_stream, pipeline->weight_consumed[buf], 0),
                   "pipeline prefetch wait event");
     }
-    hip_check(hipMemcpyAsync(pipeline->weight_buf[buf], weights,
+    const auto *host_weights = pipeline_stage_host_weights(pipeline, weights, weight_bytes, buf);
+    hip_check(hipMemcpyAsync(pipeline->weight_buf[buf], host_weights,
                              weight_bytes, hipMemcpyHostToDevice, pipeline->transfer_stream),
               "pipeline prefetch weights");
     hip_check(hipEventRecord(pipeline->transfer_done[buf], pipeline->transfer_stream),
@@ -6248,7 +6301,8 @@ void pipeline_prefetch_inline(DevicePipeline *pipeline, const void *weights,
                   "pipeline inline prefetch wait consumed");
         pipeline->inline_consumed_valid = false;
     }
-    hip_check(hipMemcpyAsync(pipeline->inline_buf, weights,
+    const auto *host_weights = pipeline_stage_host_weights(pipeline, weights, weight_bytes, -1);
+    hip_check(hipMemcpyAsync(pipeline->inline_buf, host_weights,
                              weight_bytes, hipMemcpyHostToDevice, pipeline->transfer_stream),
               "pipeline inline prefetch");
     hip_check(hipEventRecord(pipeline->inline_done, pipeline->transfer_stream),
