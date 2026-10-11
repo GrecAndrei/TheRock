@@ -134,3 +134,12 @@ The completed timeout/prefill repair results are in
 [`TIMEOUT_PREFILL_RESULTS.md`](TIMEOUT_PREFILL_RESULTS.md). The same 360-second
 request now completes with its exit record; physical corpus prefill and exact
 feature/state parity are recorded separately from generated-token throughput.
+
+The next controlled decode measurements and rejected staging experiments are
+in [`DECODE_PROGRESS.md`](DECODE_PROGRESS.md). Run
+`bash scripts/run-real-benchmark.sh baseline 256` for the fixed real-prompt
+diagnostic; it never classifies short-context results as final-goal success.
+
+The primary-source literature shortlist and concrete experimental gates are in
+[`RESEARCH_IDEAS.md`](RESEARCH_IDEAS.md). NVIDIA kernel speedups are not assumed
+to transfer to gfx1032, and approximate prompt/KV skipping is excluded.

@@ -1,0 +1,8 @@
+native engine variant parity test (not generation throughput)
+  physical prefix: 17, compared tokens: 32
+  reference prefill seconds: 3.14996
+  candidate prefill seconds: 4.90443
+  predictions: match
+  bit-exact logits/features: yes
+  all prompt feature taps: match
+  feature relative RMSE: 0

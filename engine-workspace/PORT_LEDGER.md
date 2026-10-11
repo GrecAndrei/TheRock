@@ -29,3 +29,14 @@ fixtures, device result, workload, baseline/candidate distributions, resource
 cost, acceptance decision and failure evidence. Record `unmeasured`, `rejected`
 or `promoted` explicitly. Compiler support, modeled cost and upstream popularity
 do not constitute a promotion gate.
+
+## Native scheduling experiments, 2026-10-11
+
+The isolated HIP/C++ diagnostic and optional staging buffers are original local
+scheduling work, not an upstream algorithm port or a Kyanite runtime dependency.
+See `DECODE_PROGRESS.md` for frozen inputs, actual output IDs and phase evidence.
+Bounded coherent and noncoherent host staging both passed exact native parity
+and produced the baseline's measured outputs, but achieved only 1.11 and 2.11
+tokens/s versus the 3.18 baseline interval. Both are **rejected for promotion**
+and default off. The controlled real-prompt diagnostic is retained as evidence
+infrastructure, not as a claimed engine speedup.
