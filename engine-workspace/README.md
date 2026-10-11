@@ -103,6 +103,12 @@ GPU workloads. Native host tests default to `clang++`, matching the native
 engine's Clang build assumptions; `QWEN_HOST_CXX` can select another compatible
 compiler. Initial provenance is saved in `results/setup/provenance.json`.
 
+After the native HIP build, `bash scripts/run-chat-diagnostic.sh` runs the saved
+real request with a 360-second bound and retains hashes, raw output and wrapper
+exit status even on timeout. Optional arguments are context capacity, requested
+resident GiB and timeout seconds. This diagnostic has no final-goal success
+classifier. Use the existing journaled benchmark driver for final certification.
+
 For the preserved native HIP build, in a suitably provisioned session:
 
 ```sh

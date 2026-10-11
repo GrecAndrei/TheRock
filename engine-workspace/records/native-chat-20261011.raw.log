@@ -1,0 +1,12 @@
+qwen38-native chat (speculative decode)
+  context:  131072 tokens
+  weights:  2.05 GiB (57 matrices)
+  commands: /quit /reset /think
+
+[1;32mYou:[0m   [thinking: shown]
+
+[1;32mYou:[0m   [prefill 101 tok, 91.4s]
+[1;34mAssistant:[0m   [cycle 0: prop 43.3ms, step 2533.6ms (rec 1843.3, attn 90.8, ffn 423.4, head 15.4), commit 0.4ms, inj 6.2ms, total 2583.5ms (0.4 tok/s), acc=0/7, target-rank=7
+  [cycle 1: prop 41.3ms, step 766.4ms (rec 220.1, attn 93.3, ffn 420.7, head 15.2), commit 0.1ms, inj 75597.6ms, total 76405.5ms (0.0 tok/s), acc=2/7, target-rank=10
+[2m
+[0m[2mWe[0m[2m need[0m

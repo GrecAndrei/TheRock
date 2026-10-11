@@ -5,8 +5,8 @@
     "upstream": "https://github.com/GrecAndrei/rocmtry.git",
     "upstream_main": "867ea43cfb67db9782b17814020a24593d9e4508",
     "branch": "engine/rx6650xt-10tps",
-    "local_commit_prefix": "329a56a",
-    "imports_commit_prefix": "e836679"
+    "local_commit": "329a56a6f18ab20a4afc7c6a989dd5a5343f2950",
+    "imports_commit": "e836679f6553877e98100ee14b7dbf6e6341acf5"
   },
   "llama_dflash_reference": {
     "path": "references/llama.cpp",

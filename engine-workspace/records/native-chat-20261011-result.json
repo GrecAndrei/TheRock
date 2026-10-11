@@ -1,0 +1,42 @@
+{
+  "classification": "incomplete_real_request_diagnostic",
+  "source": "preserved native C++/HIP baseline; not Kyanite inference",
+  "binary_sha256": "6b451bd3babc7e8a83f5669841f120ded5194a597912c16518675a5203f5b928",
+  "command": [
+    "engine-workspace/build/native-hip/qwen38-native",
+    "chat",
+    "/home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf",
+    "/home/alex/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+    "131072",
+    "1.0"
+  ],
+  "controls": {
+    "QWEN_NATIVE_HYBRID": "1",
+    "QWEN_NATIVE_CPU_THREADS": "20",
+    "QWEN_NATIVE_DEVICE_CHECKPOINT": "1",
+    "QWEN_NATIVE_CPU_Q6_PREDECODE": "1",
+    "QWEN_NATIVE_CPU_IQ4_TILE_GEMM": "0",
+    "QWEN_NATIVE_CPU_IQ4_PREDECODE": "0",
+    "QWEN_NATIVE_CPU_K_TILE_GEMM": "0",
+    "QWEN_NATIVE_ASYNC_ACTIVATIONS": "0",
+    "QWEN_NATIVE_KV": "q8",
+    "QWEN_NATIVE_Q8_TILED": "warp16"
+  },
+  "stdin": "engine-workspace/fixtures/real-chat-input.txt",
+  "timeout_wrapper_seconds": 360,
+  "timeout_wrapper_exit_code": 124,
+  "exit_observation": "unified exec session 12994 completed with exit code 124; native process subsequently absent",
+  "native_child_exit_code": null,
+  "termination_note": "Timeout wrapper status is authoritative; native child exit/signal was not independently journaled. Shell pipefail exited before its planned exit.txt write.",
+  "prompt_tokens_reported_by_native": 101,
+  "context_capacity": 131072,
+  "prefill_seconds_reported_by_native": 91.4,
+  "feature_injection_seconds_one_reported_cycle": 75.5976,
+  "completed_response": false,
+  "sustained_generated_tokens_per_second": null,
+  "goal_passed": false,
+  "quality_parity_certified": false,
+  "resource_note": "During the request, host swap use was observed at 8.8 GiB. This observation alone does not identify the cause of stalls.",
+  "raw_log": "records/native-chat-20261011.raw.log",
+  "input_hashes": "records/native-chat-20261011-inputs.sha256"
+}

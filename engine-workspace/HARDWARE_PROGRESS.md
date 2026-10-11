@@ -70,7 +70,19 @@ prefill took **91.4 seconds**. At the first observed decode cycle the process
 and system showed substantial memory pressure; system swap use was **8.8 GiB**.
 This is a request diagnostic, not clean idle-host performance certification.
 Its per-cycle displays must not be reported as sustained generation throughput.
-Completion, full-request output and aggregate generation rate are pending.
+The request hit its **360-second timeout**, and the managed command returned
+**124**. The native process was subsequently absent. No complete answer or
+sustained generation result was produced. The native child exit/signal was not
+independently journaled: shell `pipefail` exited on the timeout before its
+planned exit-file write. The timeout-wrapper status is recorded explicitly in
+`records/native-chat-20261011-result.json`; it is not substituted for a native
+child exit code. The raw log and input hashes are retained in `records`.
+
+One observed cycle reported **75.5976 seconds** in feature injection. This is
+phase attribution from the native log, not proof that the arithmetic itself took
+that long: initialization, transfers and memory paging need separate diagnosis.
+The visible output stopped during reasoning at `We need`. No per-cycle burst or
+partial token count is promoted to a successful performance measurement.
 
 ## Next engineering gate
 

@@ -1,0 +1,1 @@
+03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 23 [Radeon RX 6650 XT / 6700S / 6800S] [1002:73ef] (rev c1)
