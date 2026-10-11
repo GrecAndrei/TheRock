@@ -31,6 +31,22 @@ inline float configured_selector_weight() {
     return weight;
 }
 
+inline unsigned configured_ffn_down_cpu_percentage() {
+    const char *value = std::getenv("QWEN_NATIVE_FFN_DOWN_CPU_PERCENT");
+    if (!value) return 50;
+    std::size_t consumed = 0;
+    int percentage;
+    try {
+        percentage = std::stoi(value, &consumed);
+    } catch (const std::exception &) {
+        throw std::invalid_argument("FFN down CPU percentage must be an integer in [1, 99]");
+    }
+    if (consumed != std::strlen(value) || percentage < 1 || percentage > 99) {
+        throw std::invalid_argument("FFN down CPU percentage must be an integer in [1, 99]");
+    }
+    return static_cast<unsigned>(percentage);
+}
+
 // Serial native fixture helper only: restore after the owning session drains.
 // A null replacement leaves the variable untouched. Process-wide environment
 // mutation must not be used while another session is executing in this process.

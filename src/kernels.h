@@ -136,6 +136,20 @@ void execute_n23q4_batch8_cached(const void *weights, const float *input,
 // Keeps hidden states on-device and overlaps PCIe weight transfer with
 // kernel execution using two streams and double-buffered weight staging.
 struct DevicePipeline;
+struct PipelineFfnProfile {
+    bool enabled = false;
+    std::size_t calls = 0;
+    std::size_t fused_dual_calls = 0;
+    double activation_host_seconds = 0;
+    double cpu_job_seconds = 0;
+    double gpu_submit_host_seconds = 0;
+    double down_prefetch_host_seconds = 0;
+    double gpu_wait_host_seconds = 0;
+    double cpu_wait_host_seconds = 0;
+    double down_dependency_gpu_seconds = 0;
+};
+void reset_pipeline_ffn_profile(DevicePipeline *pipeline);
+PipelineFfnProfile pipeline_ffn_profile(DevicePipeline *pipeline);
 DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t ffn_size,
                                        std::size_t max_weight_bytes);
 void destroy_device_pipeline(DevicePipeline *pipeline);
@@ -170,7 +184,8 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
                                     std::uint32_t type, std::size_t input_size,
                                     std::size_t output_size, bool keep_resident,
                                     int output_slot,
-                                    const float *input_buffer = nullptr);
+                                    const float *input_buffer = nullptr,
+                                    std::size_t cpu_rows_override = 0);
 void pipeline_project_attention_qkv_hybrid(
     DevicePipeline *pipeline,
     const void *q_weights, std::uint32_t q_type, std::size_t q_size,

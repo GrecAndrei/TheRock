@@ -60,6 +60,24 @@ Changing a draft head must pass committed-target-ID comparisons; changing the
 target itself is a separately identified quality/performance experiment.
 Five CPU CTests and eight lifecycle tests pass with the new instrumentation.
 
+## FFN scheduling controls
+
+`QWEN_NATIVE_FFN_PROFILE=1` is a diagnostic only: it adds a GPU-event endpoint
+wait and reports overlapping host/CPU intervals and a down-projection dependency
+span. Do not interpret the span as isolated kernel time or profiling TPS as a
+controlled optimization result. Counters exclude prefill and the eight warmups.
+
+`QWEN_NATIVE_HYBRID_FFN_DOWN=1` and integer
+`QWEN_NATIVE_FFN_DOWN_CPU_PERCENT=50` enable a separately identified CPU/GPU down
+row-shard experiment. The existing strict state/feature gate failed for 50%;
+the gate remains unchanged and the flag is **not promoted**, default off.
+Unsupported/resident tensors keep the legacy path. This experiment has no
+generation-throughput claim. The enclosing workspace retains the failed gate.
+
+An independent replay of the existing async-activation option passed strict
+parity and preserved the 256-output baseline sequence, but measured 3.19 tokens/s
+versus the same-build default's 3.20. It also remains off; these are single runs.
+
 Raw evidence belongs to the workspace `results/decode-*` directories and the
 tracked evidence ledger. No result here demonstrates 10 tokens/s, completed
 physical-128K prefill, or independent complete-model numerical certification.

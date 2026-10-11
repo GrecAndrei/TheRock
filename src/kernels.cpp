@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -5460,6 +5461,12 @@ __global__ void silu_multiply_batch8_kernel(float *__restrict__ gate,
 using AsyncWorker = SingleJobWorker;
 
 struct DevicePipeline {
+    bool hybrid_ffn_down = false;
+    unsigned down_cpu_percentage = 50;
+    bool profile_ffn = false;
+    PipelineFfnProfile ffn_profile;
+    hipEvent_t profile_down_begin = nullptr;
+    hipEvent_t profile_down_end = nullptr;
     hipStream_t compute_stream = nullptr;
     hipStream_t transfer_stream = nullptr;
     hipStream_t activation_stream = nullptr;
@@ -5534,6 +5541,8 @@ struct DevicePipeline {
         if (inline_consumed) (void)hipEventDestroy(inline_consumed);
         if (activation_ready) (void)hipEventDestroy(activation_ready);
         if (activation_copied) (void)hipEventDestroy(activation_copied);
+        if (profile_down_begin) (void)hipEventDestroy(profile_down_begin);
+        if (profile_down_end) (void)hipEventDestroy(profile_down_end);
         if (compute_stream) (void)hipStreamDestroy(compute_stream);
         if (transfer_stream) (void)hipStreamDestroy(transfer_stream);
         if (activation_stream) (void)hipStreamDestroy(activation_stream);
@@ -5543,6 +5552,13 @@ struct DevicePipeline {
 DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t ffn_size,
                                        std::size_t max_weight_bytes) {
     auto p = std::make_unique<DevicePipeline>();
+    p->hybrid_ffn_down = environment_flag_enabled("QWEN_NATIVE_HYBRID_FFN_DOWN");
+    p->down_cpu_percentage = configured_ffn_down_cpu_percentage();
+    p->profile_ffn = environment_flag_enabled("QWEN_NATIVE_FFN_PROFILE");
+    if (p->profile_ffn) {
+        hip_check(hipEventCreate(&p->profile_down_begin), "FFN profile begin event");
+        hip_check(hipEventCreate(&p->profile_down_end), "FFN profile end event");
+    }
     p->async_activations = environment_flag_enabled("QWEN_NATIVE_ASYNC_ACTIVATIONS");
     p->pinned_staging = environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING");
     p->coarse_staging = environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING_COARSE");
@@ -5615,6 +5631,18 @@ DevicePipeline *create_device_pipeline(std::size_t embedding_size, std::size_t f
 
 void destroy_device_pipeline(DevicePipeline *pipeline) {
     delete pipeline;
+}
+
+void reset_pipeline_ffn_profile(DevicePipeline *pipeline) {
+    pipeline->async_worker.wait();
+    pipeline->ffn_profile = {};
+}
+
+PipelineFfnProfile pipeline_ffn_profile(DevicePipeline *pipeline) {
+    pipeline->async_worker.wait();
+    auto result = pipeline->ffn_profile;
+    result.enabled = pipeline->profile_ffn;
+    return result;
 }
 
 const void *pipeline_stage_host_weights(DevicePipeline *pipeline, const void *source,
@@ -6014,7 +6042,7 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
                                     std::uint32_t type, std::size_t input_size,
                                     std::size_t output_size, bool keep_resident,
                                     int output_slot,
-                                    const float *input_buffer) {
+                                    const float *input_buffer, std::size_t cpu_rows_override) {
     const std::size_t weight_bytes = k_quant_weight_bytes(type, input_size, output_size);
     if (resident_weight_cache().find_or_add(weights, weight_bytes, keep_resident) != nullptr ||
         pipeline->inline_prefetched_ptr == weights ||
@@ -6026,7 +6054,10 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
         return;
     }
 
-    const std::size_t cpu_rows = hybrid_cpu_row_count(type, output_size);
+    const std::size_t cpu_rows = cpu_rows_override ? cpu_rows_override : hybrid_cpu_row_count(type, output_size);
+    if (cpu_rows >= output_size || cpu_rows % 8 != 0) {
+        throw std::invalid_argument("invalid hybrid CPU output-row shard");
+    }
     const std::size_t gpu_rows = output_size - cpu_rows;
     const std::size_t row_bytes = weight_bytes / output_size;
     if (gpu_rows * row_bytes > pipeline->max_weight_bytes) {
@@ -6049,8 +6080,10 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
     });
 
     const auto *gpu_weights = static_cast<const std::uint8_t *>(weights) + cpu_rows * row_bytes;
+    const bool prefetched_shard = pipeline->inline_prefetched_ptr == gpu_weights &&
+                                  pipeline->inline_prefetched_bytes == gpu_rows * row_bytes;
     const bool pipeline_gpu_rows = !std::getenv("QWEN_NATIVE_GPU_PIPELINE") || std::string(std::getenv("QWEN_NATIVE_GPU_PIPELINE")) != "0";
-    if (pipeline_gpu_rows) {
+    if (pipeline_gpu_rows && !prefetched_shard) {
         pipeline_project_gpu_rows_pipelined(pipeline, gpu_weights, type, input_size,
                                             gpu_rows, cpu_rows, output_size, output_slot,
                                             input_buffer);
@@ -6072,7 +6105,7 @@ void pipeline_project_batch8_hybrid(DevicePipeline *pipeline, const void *weight
                                  pipeline->compute_stream),
                   "hybrid projection upload CPU rows");
     }
-    if (!pipeline_gpu_rows) {
+    if (!pipeline_gpu_rows || prefetched_shard) {
         constexpr int threads = 256;
         const int elements = static_cast<int>(8 * gpu_rows);
         hipLaunchKernelGGL(scatter_hybrid_rows_kernel,
@@ -6404,6 +6437,29 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
                                           const void *up_weights, std::uint32_t up_type,
                                           const void *down_weights, std::uint32_t down_type,
                                           bool keep_gate_up_resident) {
+    using Clock = std::chrono::steady_clock;
+    const bool profile = pipeline->profile_ffn;
+    const auto stamp = [profile] { return profile ? Clock::now() : Clock::time_point{}; };
+    const auto elapsed = [](Clock::time_point started) {
+        return std::chrono::duration<double>(Clock::now() - started).count();
+    };
+    if (profile) ++pipeline->ffn_profile.calls;
+    const auto down_bytes = k_quant_weight_bytes(down_type, ffn_size, embedding_size);
+    const bool split_down = pipeline->hybrid_ffn_down &&
+        (down_type == 12 || down_type == 13 || down_type == 14 || down_type == 23) &&
+        resident_weight_cache().find_or_add(down_weights, down_bytes, false) == nullptr;
+    const auto down_cpu_rows = split_down
+        ? (embedding_size * pipeline->down_cpu_percentage / 100) / 8 * 8 : 0;
+    const auto prefetch_down = [&] {
+        if (split_down) {
+            const auto *gpu_weights = static_cast<const std::uint8_t *>(down_weights)
+                + down_cpu_rows * (down_bytes / embedding_size);
+            pipeline_prefetch_inline(pipeline, gpu_weights, down_type, ffn_size,
+                                     embedding_size - down_cpu_rows);
+        } else {
+            pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
+        }
+    };
     const auto soa_supported = [](std::uint32_t type) {
         return type == 12 || type == 13 || type == 14 || type == 23;
     };
@@ -6425,13 +6481,18 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
         pipeline_project_batch8_hybrid(pipeline, up_weights, up_type,
                                        embedding_size, ffn_size,
                                        keep_gate_up_resident, 1, pipeline->slots[3]);
-        pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
+        prefetch_down();
     } else {
         // Gate and up consume the same normalized activation. Run their CPU
         // shards in one worker-pool job and their GPU shards back-to-back so
         // neither resource waits at the matrix boundary and the activation is
         // downloaded only once.
+        const auto activation_started = stamp();
         pipeline_stage_cpu_input(pipeline, pipeline->slots[3], 8 * embedding_size);
+        if (profile) {
+            ++pipeline->ffn_profile.fused_dual_calls;
+            pipeline->ffn_profile.activation_host_seconds += elapsed(activation_started);
+        }
 
         const std::size_t gate_cpu_rows = hybrid_cpu_row_count(gate_type, ffn_size);
         const std::size_t up_cpu_rows = hybrid_cpu_row_count(up_type, ffn_size);
@@ -6466,22 +6527,32 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
         };
         pipeline->async_worker.submit([=] {
             pipeline_wait_cpu_input(pipeline);
+            const auto cpu_started = stamp();
             cpu_quant_matvec_batch8_rows_packed_dual(
                 gate_weights, gate_type, pipeline->hybrid_host_output, gate_cpu_rows,
                 up_weights, up_type, pipeline->hybrid_host_output2, up_cpu_rows,
                 pipeline->hybrid_host_input, embedding_size,
                 hybrid_cpu_worker_count());
+            if (profile) pipeline->ffn_profile.cpu_job_seconds += elapsed(cpu_started);
         });
 
+        const auto gpu_submit_started = stamp();
         launch_gpu_shard(gate_weights, gate_type, gate_cpu_rows, gate_gpu_rows,
                          gate_row_bytes, 0);
         launch_gpu_shard(up_weights, up_type, up_cpu_rows, up_gpu_rows,
                          up_row_bytes, 1);
-        pipeline_prefetch_inline(pipeline, down_weights, down_type, ffn_size, embedding_size);
+        if (profile) pipeline->ffn_profile.gpu_submit_host_seconds += elapsed(gpu_submit_started);
+        const auto down_prefetch_started = stamp();
+        prefetch_down();
+        if (profile) pipeline->ffn_profile.down_prefetch_host_seconds += elapsed(down_prefetch_started);
 
+        const auto gpu_wait_started = stamp();
         hip_check(hipStreamSynchronize(pipeline->compute_stream),
                   "fused SoA FFN wait GPU gate/up");
+        if (profile) pipeline->ffn_profile.gpu_wait_host_seconds += elapsed(gpu_wait_started);
+        const auto cpu_wait_started = stamp();
         pipeline->async_worker.wait();
+        if (profile) pipeline->ffn_profile.cpu_wait_host_seconds += elapsed(cpu_wait_started);
 
         // CPU rows are packed as [batch][row]. Upload each result in one DMA
         // and scatter it on-device instead of issuing eight small H2D copies.
@@ -6510,9 +6581,22 @@ void pipeline_fused_ffn_batch8_hybrid_soa(DevicePipeline *pipeline, const float 
     }
 
     pipeline_silu_multiply(pipeline, 0, 1, 8 * ffn_size);
+    if (profile) {
+        hip_check(hipEventRecord(pipeline->profile_down_begin, pipeline->compute_stream),
+                  "FFN down dependency begin");
+    }
     pipeline_project_batch8_hybrid(pipeline, down_weights, down_type,
-                                   ffn_size, embedding_size, false, 2, pipeline->slots[0]);
+                                   ffn_size, embedding_size, false, 2, pipeline->slots[0], down_cpu_rows);
     pipeline_residual_add(pipeline, 2);
+    if (profile) {
+        hip_check(hipEventRecord(pipeline->profile_down_end, pipeline->compute_stream),
+                  "FFN down dependency end");
+        hip_check(hipEventSynchronize(pipeline->profile_down_end), "FFN profile await down");
+        float milliseconds = 0;
+        hip_check(hipEventElapsedTime(&milliseconds, pipeline->profile_down_begin,
+                                      pipeline->profile_down_end), "FFN down dependency time");
+        pipeline->ffn_profile.down_dependency_gpu_seconds += milliseconds / 1000.0;
+    }
 }
 
 // ============================================================================

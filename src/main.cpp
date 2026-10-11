@@ -1074,6 +1074,10 @@ public:
     [[nodiscard]] qwen_native::ResidentWeightCacheStats resident_weight_stats() const {
         return qwen_native::resident_weight_cache_stats();
     }
+    void reset_ffn_profile() { qwen_native::reset_pipeline_ffn_profile(pipeline_); }
+    qwen_native::PipelineFfnProfile ffn_profile() const {
+        return qwen_native::pipeline_ffn_profile(pipeline_);
+    }
     [[nodiscard]] const std::array<std::vector<float>, 5> &dflash_features() const {
         return dflash_features_;
     }
@@ -3310,13 +3314,16 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
     constexpr std::size_t prefix_tokens = 17;
     const bool candidate_async = qwen_native::environment_flag_enabled("QWEN_NATIVE_ASYNC_ACTIVATIONS");
     const bool candidate_pinned = qwen_native::environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING");
+    const bool candidate_profile = qwen_native::environment_flag_enabled("QWEN_NATIVE_FFN_PROFILE");
+    const bool candidate_down = qwen_native::environment_flag_enabled("QWEN_NATIVE_HYBRID_FFN_DOWN");
     const char *tile_mode = std::getenv("QWEN_NATIVE_Q8_TILED");
     const std::string candidate_tile = tile_mode ? tile_mode : "warp16";
     if (compare_engine_variants &&
         (context_capacity <= 4096 ||
          (candidate_tile != "warp16" && candidate_tile != "warp16lds" &&
           candidate_tile != "warp16packed") ||
-         (!candidate_async && !candidate_pinned && candidate_tile == "warp16"))) {
+         (!candidate_async && !candidate_pinned && !candidate_profile && !candidate_down &&
+          candidate_tile == "warp16"))) {
         throw std::invalid_argument("engine variant test needs long capacity and an explicit "
                                     "async-activation or LDS variant");
     }
@@ -3345,6 +3352,10 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
             compare_engine_variants ? (layer_major && candidate_async ? "1" : "0") : nullptr);
         qwen_native::ScopedEnvironment pinned_mode("QWEN_NATIVE_PINNED_STAGING",
             compare_engine_variants ? (layer_major && candidate_pinned ? "1" : "0") : nullptr);
+        qwen_native::ScopedEnvironment profile_mode("QWEN_NATIVE_FFN_PROFILE",
+            compare_engine_variants ? (layer_major && candidate_profile ? "1" : "0") : nullptr);
+        qwen_native::ScopedEnvironment down_mode("QWEN_NATIVE_HYBRID_FFN_DOWN",
+            compare_engine_variants ? (layer_major && candidate_down ? "1" : "0") : nullptr);
         qwen_native::ScopedEnvironment q8_mode("QWEN_NATIVE_Q8_TILED",
             compare_engine_variants ? (layer_major ? candidate_tile.c_str() : "warp16") : nullptr);
         qwen_native::ScopedEnvironment kv_mode("QWEN_NATIVE_KV", compare_engine_variants ? "q8" : nullptr);
@@ -4425,7 +4436,9 @@ void benchmark_real(const std::string &target_path, const std::string &dflash_pa
     if (warmup.generated != 8 || warmup.ended_early) {
         throw std::runtime_error("real benchmark stopped before eight warmup outputs");
     }
+    target.reset_ffn_profile();
     const auto measured = benchmark_decode_tokens(target, dflash, tokenizer, anchor, output_count);
+    const auto ffn_profile = target.ffn_profile();
     std::cout << "{\"diagnostic\":\"real_prompt_decode\",\"prompt_tokens\":" << prompt.size()
               << ",\"prompt_fnv64\":\"0x" << std::hex << token_hash(prompt) << std::dec
               << "\",\"output_fnv64\":\"0x" << std::hex << token_hash(measured.tokens) << std::dec
@@ -4449,6 +4462,19 @@ void benchmark_real(const std::string &target_path, const std::string &dflash_pa
               << ",\"output_seconds\":" << measured.output_seconds
               << ",\"cpu_packed_bytes\":" << qwen_native::cpu_packed_matrix_cache_bytes()
               << ",\"selector_weight\":" << dflash.selector_weight()
+              << ",\"hybrid_ffn_down\":"
+              << (qwen_native::environment_flag_enabled("QWEN_NATIVE_HYBRID_FFN_DOWN") ? "true" : "false")
+              << ",\"ffn_down_cpu_percentage\":" << qwen_native::configured_ffn_down_cpu_percentage()
+              << ",\"ffn_profile_enabled\":" << (ffn_profile.enabled ? "true" : "false")
+              << ",\"ffn_profile_calls\":" << ffn_profile.calls
+              << ",\"ffn_profile_fused_dual_calls\":" << ffn_profile.fused_dual_calls
+              << ",\"ffn_activation_host_seconds\":" << ffn_profile.activation_host_seconds
+              << ",\"ffn_cpu_job_seconds\":" << ffn_profile.cpu_job_seconds
+              << ",\"ffn_gpu_submit_host_seconds\":" << ffn_profile.gpu_submit_host_seconds
+              << ",\"ffn_down_prefetch_host_seconds\":" << ffn_profile.down_prefetch_host_seconds
+              << ",\"ffn_gpu_wait_host_seconds\":" << ffn_profile.gpu_wait_host_seconds
+              << ",\"ffn_cpu_wait_host_seconds\":" << ffn_profile.cpu_wait_host_seconds
+              << ",\"ffn_down_dependency_gpu_seconds\":" << ffn_profile.down_dependency_gpu_seconds
               << ",\"draft_cycles\":" << measured.draft_metrics.draft_cycles;
     const auto write_counts = [](const char *name, const auto &counts) {
         std::cout << ",\"" << name << "\":[";
@@ -4633,6 +4659,9 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
             << ",\"QWEN_NATIVE_PINNED_STAGING\":\"" << environment("QWEN_NATIVE_PINNED_STAGING", "0") << "\""
             << ",\"QWEN_NATIVE_PINNED_STAGING_COARSE\":\"" << environment("QWEN_NATIVE_PINNED_STAGING_COARSE", "0") << "\""
             << ",\"QWEN_NATIVE_SELECTOR_WEIGHT\":\"" << environment("QWEN_NATIVE_SELECTOR_WEIGHT", "1") << "\""
+            << ",\"QWEN_NATIVE_FFN_PROFILE\":\"" << environment("QWEN_NATIVE_FFN_PROFILE", "0") << "\""
+            << ",\"QWEN_NATIVE_HYBRID_FFN_DOWN\":\"" << environment("QWEN_NATIVE_HYBRID_FFN_DOWN", "0") << "\""
+            << ",\"QWEN_NATIVE_FFN_DOWN_CPU_PERCENT\":\"" << environment("QWEN_NATIVE_FFN_DOWN_CPU_PERCENT", "50") << "\""
             << ",\"prefill_profile_enabled\":"
             << (qwen_native::environment_flag_enabled("QWEN_NATIVE_PREFILL_PROFILE") ? "true" : "false")
             << ",\"QWEN_NATIVE_DRAFT_N23\":\"" << environment("QWEN_NATIVE_DRAFT_N23", "0") << "\""

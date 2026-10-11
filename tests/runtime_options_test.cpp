@@ -96,7 +96,29 @@ int main() {
             }
             if (!rejected) throw std::runtime_error("invalid selector weight accepted");
         }
-        std::cout << "runtime flags, scoped restore/unwind and selector-weight cases passed; CPU-only, not inference timing\n";
+        constexpr const char *down_name = "QWEN_NATIVE_FFN_DOWN_CPU_PERCENT";
+        qwen_native::ScopedEnvironment down_restore(down_name, "50");
+        if (unsetenv(down_name)) throw std::runtime_error("unsetenv failed");
+        if (qwen_native::configured_ffn_down_cpu_percentage() != 50) {
+            throw std::runtime_error("FFN down default changed");
+        }
+        for (const char *value : {"1", "50", "99"}) {
+            qwen_native::ScopedEnvironment option(down_name, value);
+            if (qwen_native::configured_ffn_down_cpu_percentage() != std::stoul(value)) {
+                throw std::runtime_error("FFN down percentage parsed incorrectly");
+            }
+        }
+        for (const char *value : {"0", "100", "-1", "", "nan", "50.5", "50suffix", "9999999999"}) {
+            qwen_native::ScopedEnvironment option(down_name, value);
+            bool rejected = false;
+            try {
+                (void)qwen_native::configured_ffn_down_cpu_percentage();
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            if (!rejected) throw std::runtime_error("invalid FFN down percentage accepted");
+        }
+        std::cout << "runtime flags, scoped restore/unwind, selector and FFN shard cases passed; CPU-only, not inference timing\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;
