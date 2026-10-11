@@ -1,5 +1,10 @@
 # qwen38-native
 
+This is the isolated timeout/prefill repair branch. Current changes and commands
+are documented in [`TIMEOUT_PREFILL_FIX.md`](TIMEOUT_PREFILL_FIX.md): reclaimable
+model sources, shared chunked chat/benchmark prefill and exact DFlash feature
+capture. Historical observations below remain historical evidence.
+
 `qwen38-native` is a standalone C++20/HIP chat and test executable for the
 official Qwen3.8-27B UD Q4_K_M target and DFlash2 Q4_K_M drafter on gfx1032.
 It parses GGUF v3 and executes the model directly. It does **not** build, link,
