@@ -147,3 +147,7 @@ to transfer to gfx1032, and approximate prompt/KV skipping is excluded.
 Model/head experimentation was explicitly authorized on 2026-10-11. The added
 track, selector diagnostics and measured ablations are documented in
 [`MODEL_EXPERIMENTS.md`](MODEL_EXPERIMENTS.md); original models remain intact.
+
+FFN attribution, a failed down-shard parity gate and the independent async-copy
+replay are in [`FFN_SCHEDULING.md`](FFN_SCHEDULING.md). Both scheduling candidates
+remain off; instrumentation results are not presented as throughput wins.

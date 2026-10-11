@@ -1,0 +1,9 @@
+native engine variant parity test (not generation throughput)
+  physical prefix: 17, compared tokens: 32
+  reference prefill seconds: 3.17776
+  candidate prefill seconds: 3.6278
+  predictions: match
+  bit-exact logits/features: no
+  all prompt feature taps: MISMATCH
+  feature relative RMSE: 0.000908711
+qwen38-native: target comparison changed reference predictions/logits/features

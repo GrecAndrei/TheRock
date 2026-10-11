@@ -27,12 +27,14 @@
   "native_engine": {
     "path": "sources/native-engine",
     "branch": "engine/timeout-prefill-fix",
-    "code_commit": "20337067862d4652e434b2a2bb277d8be445e7d5",
-    "head": "20337067862d4652e434b2a2bb277d8be445e7d5",
-    "tested_binary_sha256": "681a3a02f783d51fb126dfb7a76c05a47c509284b4884da5674a3a992db8bd9b",
+    "code_commit": "77684584ce1eb8c53901b598b4860de9b55caf1d",
+    "head": "77684584ce1eb8c53901b598b4860de9b55caf1d",
+    "tested_binary_sha256": "4bf931e05e74aa03b53fd0103d989bfa4880b651a76b31bb099599bd95c9f419",
     "timeout_repair_commit": "b01570281cc32c25306512de4dd5acefa040679d",
     "staging_candidates_promoted": false,
-    "selector_weight_default": 1.0
+    "selector_weight_default": 1.0,
+    "ffn_down_shard_promoted": false,
+    "async_activations_promoted": false
   },
   "goal_tps_demonstrated": false
 }

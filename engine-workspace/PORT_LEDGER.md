@@ -50,3 +50,12 @@ prompt's 256 committed target IDs. Half-strength reduced verification count on
 one prompt but not the holdout. It is **not promoted**; scale 1.0 remains default.
 No target weights changed and no head was retrained. New target-model variants
 require separately identified quality evidence under `BENCHMARK_CONTRACT.md`.
+
+## FFN transfer scheduling
+
+Optional profiling separates CPU gate/up jobs, host down-copy submission and a
+GPU-event down dependency span; it changes synchronization and is diagnostic
+only. The half-CPU down-row candidate failed the unchanged strict feature/state
+gate and is **not promoted**. The separate async activation replay passed strict
+parity but had no measured throughput benefit over its same-build baseline.
+Its default remains off. See `FFN_SCHEDULING.md` for exact scope and failed logs.

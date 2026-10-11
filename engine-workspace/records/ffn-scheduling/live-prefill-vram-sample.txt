@@ -1,0 +1,6 @@
+Read-only sysfs sample during decode-scheduling-baseline-dsA456 prefill.
+2026-10-11T18:00:11+03:00
+/sys/class/drm/card2/device/mem_info_vram_total:8573157376
+/sys/class/drm/card2/device/mem_info_vram_used:8096858112
+/sys/class/drm/card2/device/mem_info_gtt_used:1350324224
+One sample, not a peak/average or HIP allocation guarantee.

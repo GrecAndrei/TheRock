@@ -1,0 +1,16 @@
+test_evidence_is_never_overwritten (test_benchmark_driver.DriverTest.test_evidence_is_never_overwritten) ... ok
+test_explicit_threshold_and_paths_in_command (test_benchmark_driver.DriverTest.test_explicit_threshold_and_paths_in_command) ... ok
+test_failed_exit_is_not_success (test_benchmark_driver.DriverTest.test_failed_exit_is_not_success) ... partial prefill
+ok
+test_identity_mismatch_refuses_signal (test_benchmark_driver.DriverTest.test_identity_mismatch_refuses_signal) ... ok
+test_invalid_thresholds_and_residency_fail_before_launch (test_benchmark_driver.DriverTest.test_invalid_thresholds_and_residency_fail_before_launch) ... ok
+test_killed_worker_has_negative_return_and_signal (test_benchmark_driver.DriverTest.test_killed_worker_has_negative_return_and_signal) ... ok
+test_launch_error_is_durable (test_benchmark_driver.DriverTest.test_launch_error_is_durable) ... ok
+test_lossless_log_and_success_exit (test_benchmark_driver.DriverTest.test_lossless_log_and_success_exit) ... rawÿ
+error stream
+ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.049s
+
+OK
