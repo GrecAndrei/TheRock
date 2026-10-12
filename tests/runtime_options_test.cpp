@@ -118,7 +118,39 @@ int main() {
             }
             if (!rejected) throw std::runtime_error("invalid FFN down percentage accepted");
         }
-        std::cout << "runtime flags, scoped restore/unwind, selector and FFN shard cases passed; CPU-only, not inference timing\n";
+        constexpr const char *extra_name = "QWEN_NATIVE_EXTRA_DOWN_MB";
+        qwen_native::ScopedEnvironment extra_restore(extra_name, "0");
+        if (unsetenv(extra_name)) throw std::runtime_error("unsetenv failed");
+        if (qwen_native::configured_extra_down_mebibytes() != 0) {
+            throw std::runtime_error("extra cache default changed");
+        }
+        for (const char *value : {"0", "128", "1024"}) {
+            qwen_native::ScopedEnvironment option(extra_name, value);
+            if (qwen_native::configured_extra_down_mebibytes() != std::stoul(value)) {
+                throw std::runtime_error("extra cache amount parsed incorrectly");
+            }
+        }
+        for (const char *value : {"-1", "1025", "", "128.5", "128suffix", "nan", "9999999999"}) {
+            qwen_native::ScopedEnvironment option(extra_name, value);
+            bool rejected = false;
+            try {
+                (void)qwen_native::configured_extra_down_mebibytes();
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            if (!rejected) throw std::runtime_error("invalid extra cache amount accepted");
+        }
+        constexpr std::size_t mib = 1024 * 1024;
+        for (const auto values : {
+                 std::array<std::size_t, 4>{128, 700, 512, 128},
+                 {128, 544, 512, 32}, {128, 512, 512, 0},
+                 {128, 256, 512, 0}, {0, 1024, 512, 0}}) {
+            if (qwen_native::bounded_residency_allowance(values[0] * mib, values[1] * mib,
+                                                        values[2] * mib) != values[3] * mib) {
+                throw std::runtime_error("free-memory guard allowance mismatch");
+            }
+        }
+        std::cout << "runtime flags, restore/unwind, selector, FFN shard and guarded cache cases passed; CPU-only, not inference timing\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

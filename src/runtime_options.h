@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstddef>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -45,6 +46,30 @@ inline unsigned configured_ffn_down_cpu_percentage() {
         throw std::invalid_argument("FFN down CPU percentage must be an integer in [1, 99]");
     }
     return static_cast<unsigned>(percentage);
+}
+
+inline unsigned configured_extra_down_mebibytes() {
+    const char *value = std::getenv("QWEN_NATIVE_EXTRA_DOWN_MB");
+    if (!value) return 0;
+    std::size_t consumed = 0;
+    int amount;
+    try {
+        amount = std::stoi(value, &consumed);
+    } catch (const std::exception &) {
+        throw std::invalid_argument("extra down cache must be integer MiB in [0, 1024]");
+    }
+    if (consumed != std::strlen(value) || amount < 0 || amount > 1024) {
+        throw std::invalid_argument("extra down cache must be integer MiB in [0, 1024]");
+    }
+    return static_cast<unsigned>(amount);
+}
+
+inline std::size_t bounded_residency_allowance(std::size_t requested_bytes,
+                                              std::size_t free_bytes,
+                                              std::size_t reserve_bytes) {
+    if (free_bytes <= reserve_bytes) return 0;
+    const auto available = free_bytes - reserve_bytes;
+    return requested_bytes < available ? requested_bytes : available;
 }
 
 // Serial native fixture helper only: restore after the owning session drains.

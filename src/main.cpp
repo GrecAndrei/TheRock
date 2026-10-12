@@ -1074,6 +1074,44 @@ public:
     [[nodiscard]] qwen_native::ResidentWeightCacheStats resident_weight_stats() const {
         return qwen_native::resident_weight_cache_stats();
     }
+    struct ExtraDownCacheInfo {
+        bool attempted = false;
+        std::size_t requested_bytes = 0;
+        std::size_t free_before_bytes = 0;
+        std::size_t reserve_bytes = 512ULL * 1024 * 1024;
+        std::size_t allowance_bytes = 0;
+        std::size_t added_bytes = 0;
+        std::size_t added_matrices = 0;
+    };
+    const ExtraDownCacheInfo &extra_down_cache_info() const { return extra_down_cache_; }
+    void preload_extra_ffn_down() {
+        if (extra_down_cache_.attempted) return;
+        const auto requested = static_cast<std::size_t>(qwen_native::configured_extra_down_mebibytes())
+            * 1024 * 1024;
+        if (!requested) return;
+        extra_down_cache_.attempted = true;
+        extra_down_cache_.requested_bytes = requested;
+        std::size_t total_bytes = 0;
+        hip_check(hipMemGetInfo(&extra_down_cache_.free_before_bytes, &total_bytes),
+                  "extra down cache free-memory observation");
+        extra_down_cache_.allowance_bytes = qwen_native::bounded_residency_allowance(
+            requested, extra_down_cache_.free_before_bytes, extra_down_cache_.reserve_bytes);
+        if (!extra_down_cache_.allowance_bytes) return;
+        const auto before = resident_weight_stats();
+        qwen_native::set_resident_weight_cache_budget(before.resident_bytes +
+                                                     extra_down_cache_.allowance_bytes);
+        for (int layer = 0; layer < 64; ++layer) {
+            preload_projection("blk." + std::to_string(layer) + ".ffn_down.weight");
+        }
+        const auto after = resident_weight_stats();
+        // No unused allowance may later move an unrelated CPU tensor to GPU.
+        qwen_native::set_resident_weight_cache_budget(after.resident_bytes);
+        extra_down_cache_.added_bytes = after.resident_bytes - before.resident_bytes;
+        extra_down_cache_.added_matrices = after.matrix_count - before.matrix_count;
+        if (extra_down_cache_.added_bytes > extra_down_cache_.allowance_bytes) {
+            throw std::runtime_error("extra down cache exceeded guarded allowance");
+        }
+    }
     void reset_ffn_profile() { qwen_native::reset_pipeline_ffn_profile(pipeline_); }
     qwen_native::PipelineFfnProfile ffn_profile() const {
         return qwen_native::pipeline_ffn_profile(pipeline_);
@@ -1551,7 +1589,9 @@ public:
         qwen_native::pipeline_sync(pipeline_);
         const std::size_t base = active_tokens_;
         BatchStepResult profile;
-        const std::size_t padded_count = (count + 7) / 8 * 8;
+        const bool wide_ffn = qwen_native::environment_flag_enabled("QWEN_NATIVE_WIDE_PREFILL");
+        const std::size_t padding = wide_ffn ? 32 : 8;
+        const std::size_t padded_count = (count + padding - 1) / padding * padding;
         std::vector<float> hidden(padded_count * kEmbedding);
         if (captured) {
             for (auto &feature : *captured) feature.assign(count * kEmbedding, 0.0F);
@@ -1594,15 +1634,38 @@ public:
                 }
                 float *batch_hidden = hidden.data() + begin * kEmbedding;
                 qwen_native::pipeline_upload_hidden(pipeline_, batch_hidden, 8 * kEmbedding);
-                execute_layer_batch8(layer, valid, captured != nullptr, profile, true, false);
+                execute_layer_batch8(layer, valid, !wide_ffn && captured != nullptr, profile, true, false, wide_ffn);
                 qwen_native::pipeline_download_hidden(pipeline_, batch_hidden, 8 * kEmbedding);
-                if (captured) {
+                if (captured && !wide_ffn) {
                     constexpr std::array<int, 5> taps{5, 19, 33, 47, 61};
                     const auto tap = std::find(taps.begin(), taps.end(), layer);
                     if (tap != taps.end()) {
                         const auto index = static_cast<std::size_t>(tap - taps.begin());
                         std::copy_n(batch_dflash_features_[index].data(), valid * kEmbedding,
                                     (*captured)[index].data() + begin * kEmbedding);
+                    }
+                }
+            }
+            if (wide_ffn) {
+                const auto &gate = tensor(prefix + "ffn_gate.weight");
+                const auto &up = tensor(prefix + "ffn_up.weight");
+                const auto &down = tensor(prefix + "ffn_down.weight");
+                const auto ffn_started = std::chrono::steady_clock::now();
+                for (std::size_t begin = 0; begin < count; begin += 32) {
+                    qwen_native::execute_prefill_ffn_batch32(hidden.data() + begin * kEmbedding,
+                        f32_vector(prefix + "post_attention_norm.weight", kEmbedding), kEmbedding, kFfn, epsilon_,
+                        tensor_data(mapping_, model_, gate), gate.type,
+                        tensor_data(mapping_, model_, up), up.type,
+                        tensor_data(mapping_, model_, down), down.type);
+                }
+                profile.ffn_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - ffn_started).count();
+                if (captured) {
+                    constexpr std::array<int, 5> taps{5, 19, 33, 47, 61};
+                    const auto tap = std::find(taps.begin(), taps.end(), layer);
+                    if (tap != taps.end()) {
+                        std::copy_n(hidden.data(), count * kEmbedding,
+                                    (*captured)[static_cast<std::size_t>(tap - taps.begin())].data());
                     }
                 }
             }
@@ -1624,7 +1687,10 @@ public:
 private:
     void execute_layer_batch8(int layer, std::size_t valid_tokens, bool capture_dflash,
                              BatchStepResult &result, bool force_gpu = false,
-                             bool prefetch_next = true) {
+                             bool prefetch_next = true, bool attention_only = false) {
+        if (attention_only && (capture_dflash || prefetch_next || !force_gpu)) {
+            throw std::invalid_argument("attention-only prefill requires ordered GPU execution without feature capture");
+        }
         constexpr std::size_t hidden_count = 8 * kEmbedding;
         const std::size_t recurrent_index = static_cast<std::size_t>(layer - layer / 4);
         const std::size_t attention_index = static_cast<std::size_t>(layer / 4);
@@ -1662,7 +1728,7 @@ private:
             // The SoA tensor-parallel path consumes disjoint rows directly and
             // does not stage a complete gate/up matrix. Legacy GPU scheduling
             // retains its overlap prefetch.
-            if (!hybrid_soa) {
+            if (!attention_only && !hybrid_soa) {
                 if (hybrid_ffn) {
                     qwen_native::pipeline_prefetch_weights(
                         pipeline_, gate_data, gate_type, kEmbedding, kFfn);
@@ -1777,6 +1843,7 @@ private:
             }
 
 
+            if (attention_only) return;
             const auto ffn_started = std::chrono::steady_clock::now();
             const bool keep_gate_up = allow_dynamic_target_cache_;
             if (hybrid_soa) {
@@ -2471,6 +2538,7 @@ private:
     qwen_native::DevicePipeline *pipeline_ = nullptr;
     qwen_native::RecurrentDeviceState *recurrent_device_ = nullptr;
     qwen_native::AttentionDeviceState *attn_device_ = nullptr;
+    ExtraDownCacheInfo extra_down_cache_;
 };
 
 // DFlash2's encoder is intentionally a separate native component: it consumes
@@ -3310,19 +3378,22 @@ void target_compare_batch(const std::string &path, std::size_t context_capacity,
 
 void target_layer_major_test(const std::string &path, std::size_t context_capacity,
                              std::size_t token_count, std::size_t resident_weight_budget,
-                             bool compare_engine_variants = false) {
+                             bool compare_engine_variants = false,
+                             bool compare_wide_prefill = false) {
     constexpr std::size_t prefix_tokens = 17;
     const bool candidate_async = qwen_native::environment_flag_enabled("QWEN_NATIVE_ASYNC_ACTIVATIONS");
     const bool candidate_pinned = qwen_native::environment_flag_enabled("QWEN_NATIVE_PINNED_STAGING");
     const bool candidate_profile = qwen_native::environment_flag_enabled("QWEN_NATIVE_FFN_PROFILE");
     const bool candidate_down = qwen_native::environment_flag_enabled("QWEN_NATIVE_HYBRID_FFN_DOWN");
+    const auto candidate_extra = qwen_native::configured_extra_down_mebibytes();
+    const auto candidate_extra_text = std::to_string(candidate_extra);
     const char *tile_mode = std::getenv("QWEN_NATIVE_Q8_TILED");
     const std::string candidate_tile = tile_mode ? tile_mode : "warp16";
     if (compare_engine_variants &&
         (context_capacity <= 4096 ||
          (candidate_tile != "warp16" && candidate_tile != "warp16lds" &&
           candidate_tile != "warp16packed") ||
-         (!candidate_async && !candidate_pinned && !candidate_profile && !candidate_down &&
+         (!candidate_async && !candidate_pinned && !candidate_profile && !candidate_down && !candidate_extra &&
           candidate_tile == "warp16"))) {
         throw std::invalid_argument("engine variant test needs long capacity and an explicit "
                                     "async-activation or LDS variant");
@@ -3345,9 +3416,13 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
         std::array<std::vector<float>, 5> features;
         std::array<std::vector<float>, 5> prefill_features;
         double seconds = 0.0;
+        std::size_t extra_added_bytes = 0;
+        std::size_t extra_added_matrices = 0;
     };
     const auto execute = [&](bool layer_major) {
         // Guards outlive the session, so all its workers drain before restore.
+        qwen_native::ScopedEnvironment wide_mode("QWEN_NATIVE_WIDE_PREFILL",
+            compare_wide_prefill ? (layer_major ? "1" : "0") : nullptr);
         qwen_native::ScopedEnvironment async_mode("QWEN_NATIVE_ASYNC_ACTIVATIONS",
             compare_engine_variants ? (layer_major && candidate_async ? "1" : "0") : nullptr);
         qwen_native::ScopedEnvironment pinned_mode("QWEN_NATIVE_PINNED_STAGING",
@@ -3356,12 +3431,17 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
             compare_engine_variants ? (layer_major && candidate_profile ? "1" : "0") : nullptr);
         qwen_native::ScopedEnvironment down_mode("QWEN_NATIVE_HYBRID_FFN_DOWN",
             compare_engine_variants ? (layer_major && candidate_down ? "1" : "0") : nullptr);
+        qwen_native::ScopedEnvironment extra_mode("QWEN_NATIVE_EXTRA_DOWN_MB",
+            compare_engine_variants ? (layer_major ? candidate_extra_text.c_str() : "0") : nullptr);
         qwen_native::ScopedEnvironment q8_mode("QWEN_NATIVE_Q8_TILED",
             compare_engine_variants ? (layer_major ? candidate_tile.c_str() : "warp16") : nullptr);
         qwen_native::ScopedEnvironment kv_mode("QWEN_NATIVE_KV", compare_engine_variants ? "q8" : nullptr);
         qwen_native::clear_resident_weight_cache();
         NativeTargetSession session(path, context_capacity, resident_weight_budget);
+        if (compare_engine_variants) session.preload_extra_ffn_down();
         Result result;
+        result.extra_added_bytes = session.extra_down_cache_info().added_bytes;
+        result.extra_added_matrices = session.extra_down_cache_info().added_matrices;
         const auto microbatch_prefill = [&](std::size_t begin, std::size_t end) {
             for (; begin < end; begin += 8) {
                 const auto valid = std::min<std::size_t>(8, end - begin);
@@ -3381,7 +3461,7 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
         };
         microbatch_prefill(0, prefix_tokens);
         const auto started = std::chrono::steady_clock::now();
-        if (layer_major && !compare_engine_variants) {
+        if ((layer_major || compare_wide_prefill) && !compare_engine_variants) {
             for (std::size_t begin = prefix_tokens; begin < prompt.size(); begin += 512) {
                 std::array<std::vector<float>, 5> features;
                 session.prefill_layer_major(prompt.data() + begin,
@@ -3425,11 +3505,14 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
     const double relative_rmse = std::sqrt(squared_error / std::max(squared_reference, 1.0e-30));
     const bool exact = reference.features == optimized.features && reference.logits == optimized.logits &&
                        reference.prefill_features == optimized.prefill_features;
-    std::cout << (compare_engine_variants
+    std::cout << (compare_wide_prefill
+                    ? "native layer-major 8-versus-32 prefill test (not generation throughput)\n"
+                    : compare_engine_variants
                     ? "native engine variant parity test (not generation throughput)\n"
                     : "native layer-major prefill test (not generation throughput)\n")
               << "  physical prefix: " << prefix_tokens << ", compared tokens: " << token_count << '\n'
-              << "  reference prefill seconds: " << reference.seconds << '\n'
+              << (compare_wide_prefill ? "  layer-major batch8 prefill seconds: " : "  reference prefill seconds: ")
+              << reference.seconds << '\n'
               << (compare_engine_variants ? "  candidate prefill seconds: " : "  layer-major prefill seconds: ")
               << optimized.seconds << '\n'
               << "  predictions: " << (tokens_match ? "match" : "MISMATCH") << '\n'
@@ -3437,6 +3520,13 @@ void target_layer_major_test(const std::string &path, std::size_t context_capaci
               << "  all prompt feature taps: "
               << (reference.prefill_features == optimized.prefill_features ? "match" : "MISMATCH") << '\n'
               << "  feature relative RMSE: " << relative_rmse << '\n';
+    if (compare_engine_variants && candidate_extra) {
+        std::cout << "  extra resident down bytes: " << optimized.extra_added_bytes
+                  << ", matrices: " << optimized.extra_added_matrices << '\n';
+        if (!optimized.extra_added_bytes) {
+            throw std::runtime_error("extra-cache parity fixture did not allocate candidate matrices");
+        }
+    }
     // Layer-major comparison requires all-GPU parity. Engine-variant mode
     // holds CPU/GPU row routing fixed and also requires exact logits/features;
     // it does not accept a different reduction order as a scheduling change.
@@ -4058,6 +4148,60 @@ void bench_matvec(const std::string &path, const std::string &tensor_name, int i
     }
 }
 
+void wide_projection_test(const std::string &path) {
+    const qwen_native::GgufFile model(path);
+    Mapping mapping(path);
+    qwen_native::clear_resident_weight_cache();
+    qwen_native::set_resident_weight_cache_budget(0);
+    std::size_t fixtures = 0;
+    constexpr float canary = 998877.0F;
+    std::cout << "32-token projection parity (not generation throughput)\n";
+    for (const auto type : {8U, 11U, 12U, 13U, 14U, 20U, 21U, 23U}) {
+        bool exercised = false;
+        for (const auto columns : {5120U, 17408U}) {
+            const auto item = std::find_if(model.tensors().begin(), model.tensors().end(),
+                [&](const auto &tensor) {
+                    return tensor.type == type && tensor.dimensions.size() == 2 &&
+                           tensor.dimensions[0] == columns && tensor.dimensions[1] >= 17;
+                });
+            if (item == model.tensors().end()) continue;
+            exercised = true;
+            std::vector<float> input(32 * columns);
+            std::uint32_t random = 0x6650;
+            for (auto &value : input) {
+                random = random * 1664525U + 1013904223U;
+                value = (static_cast<int>(random >> 20) - 2048) / 8192.0F;
+            }
+            for (const std::size_t requested_rows : {1U, 17U, 33U}) {
+                const auto rows = std::min<std::size_t>(requested_rows, item->dimensions[1]);
+                std::vector<float> reference(32 * rows + 16, canary);
+                auto candidate = reference;
+                const auto *weights = tensor_data(mapping, model, *item);
+                for (std::size_t batch = 0; batch < 32; batch += 8) {
+                    qwen_native::execute_k_matvec_cached_batch8(weights, type, input.data() + batch * columns,
+                        columns, reference.data() + 8 + batch * rows, rows, false);
+                }
+                qwen_native::execute_k_matvec_cached_batch32(weights, type, input.data(), columns,
+                                                             candidate.data() + 8, rows, false);
+                if (std::memcmp(reference.data(), candidate.data(), reference.size() * sizeof(float))) {
+                    throw std::runtime_error("wide projection changed bits/guards: " + item->name +
+                                             ", rows " + std::to_string(rows));
+                }
+                for (std::size_t index = 8; index < 8 + 32 * rows; ++index) {
+                    if (!std::isfinite(candidate[index])) {
+                        throw std::runtime_error("nonfinite wide projection output");
+                    }
+                }
+                ++fixtures;
+            }
+            std::cout << "  " << qwen_native::ggml_type_name(type) << ": " << item->name
+                      << ", columns " << columns << ", three row-boundary cases exact\n";
+        }
+        if (!exercised) throw std::runtime_error("wide projection test missed a model quant format");
+    }
+    std::cout << "  passed " << fixtures << " real-weight fixtures; all 32 outputs and guards bit-exact\n";
+}
+
 void bench_ffn(const std::string &path, int layer, int iterations) {
     if (layer < 0) {
         throw std::invalid_argument("FFN layer index must be non-negative");
@@ -4426,6 +4570,7 @@ void benchmark_real(const std::string &target_path, const std::string &dflash_pa
     NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
     NativeDflashEncoder dflash(dflash_path);
     dflash.preload_all_quantized();
+    target.preload_extra_ffn_down();
     const double initialization_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - initialized).count();
     const auto started = std::chrono::steady_clock::now();
@@ -4439,6 +4584,7 @@ void benchmark_real(const std::string &target_path, const std::string &dflash_pa
     target.reset_ffn_profile();
     const auto measured = benchmark_decode_tokens(target, dflash, tokenizer, anchor, output_count);
     const auto ffn_profile = target.ffn_profile();
+    const auto &extra_down = target.extra_down_cache_info();
     std::cout << "{\"diagnostic\":\"real_prompt_decode\",\"prompt_tokens\":" << prompt.size()
               << ",\"prompt_fnv64\":\"0x" << std::hex << token_hash(prompt) << std::dec
               << "\",\"output_fnv64\":\"0x" << std::hex << token_hash(measured.tokens) << std::dec
@@ -4465,6 +4611,15 @@ void benchmark_real(const std::string &target_path, const std::string &dflash_pa
               << ",\"hybrid_ffn_down\":"
               << (qwen_native::environment_flag_enabled("QWEN_NATIVE_HYBRID_FFN_DOWN") ? "true" : "false")
               << ",\"ffn_down_cpu_percentage\":" << qwen_native::configured_ffn_down_cpu_percentage()
+              << ",\"extra_down_attempted\":" << (extra_down.attempted ? "true" : "false")
+              << ",\"extra_down_requested_bytes\":" << extra_down.requested_bytes
+              << ",\"extra_down_free_before_bytes\":" << extra_down.free_before_bytes
+              << ",\"extra_down_reserve_bytes\":" << extra_down.reserve_bytes
+              << ",\"extra_down_allowance_bytes\":" << extra_down.allowance_bytes
+              << ",\"extra_down_added_bytes\":" << extra_down.added_bytes
+              << ",\"extra_down_added_matrices\":" << extra_down.added_matrices
+              << ",\"wide_prefill_enabled\":"
+              << (qwen_native::environment_flag_enabled("QWEN_NATIVE_WIDE_PREFILL") ? "true" : "false")
               << ",\"ffn_profile_enabled\":" << (ffn_profile.enabled ? "true" : "false")
               << ",\"ffn_profile_calls\":" << ffn_profile.calls
               << ",\"ffn_profile_fused_dual_calls\":" << ffn_profile.fused_dual_calls
@@ -4526,6 +4681,7 @@ void benchmark_prefill_corpus(const std::string &target_path, const std::string 
     NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
     NativeDflashEncoder dflash(dflash_path);
     dflash.preload_all_quantized();
+    target.preload_extra_ffn_down();
     const qwen_native::GgufFile model(target_path);
     Tokenizer tokenizer(model);
     const double initialization_seconds = std::chrono::duration<double>(
@@ -4550,6 +4706,9 @@ void benchmark_prefill_corpus(const std::string &target_path, const std::string 
               << ",\"ended_early\":" << (decoded.ended_early ? "true" : "false")
               << ",\"target_active_tokens\":" << target.active_tokens()
               << ",\"draft_window_tokens\":" << dflash.injected_token_count()
+              << ",\"extra_down_added_bytes\":" << target.extra_down_cache_info().added_bytes
+              << ",\"wide_prefill_enabled\":"
+              << (qwen_native::environment_flag_enabled("QWEN_NATIVE_WIDE_PREFILL") ? "true" : "false")
               << ",\"cpu_packed_bytes\":" << qwen_native::cpu_packed_matrix_cache_bytes()
               << ",\"goal_certified\":false,\"generated_ids\":[";
     for (std::size_t index = 0; index < decoded.tokens.size(); ++index) {
@@ -4662,6 +4821,8 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
             << ",\"QWEN_NATIVE_FFN_PROFILE\":\"" << environment("QWEN_NATIVE_FFN_PROFILE", "0") << "\""
             << ",\"QWEN_NATIVE_HYBRID_FFN_DOWN\":\"" << environment("QWEN_NATIVE_HYBRID_FFN_DOWN", "0") << "\""
             << ",\"QWEN_NATIVE_FFN_DOWN_CPU_PERCENT\":\"" << environment("QWEN_NATIVE_FFN_DOWN_CPU_PERCENT", "50") << "\""
+            << ",\"QWEN_NATIVE_EXTRA_DOWN_MB\":\"" << environment("QWEN_NATIVE_EXTRA_DOWN_MB", "0") << "\""
+            << ",\"QWEN_NATIVE_WIDE_PREFILL\":\"" << environment("QWEN_NATIVE_WIDE_PREFILL", "0") << "\""
             << ",\"prefill_profile_enabled\":"
             << (qwen_native::environment_flag_enabled("QWEN_NATIVE_PREFILL_PROFILE") ? "true" : "false")
             << ",\"QWEN_NATIVE_DRAFT_N23\":\"" << environment("QWEN_NATIVE_DRAFT_N23", "0") << "\""
@@ -4689,6 +4850,7 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
         NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
         NativeDflashEncoder dflash(dflash_path);
         dflash.preload_all_quantized();
+        target.preload_extra_ffn_down();
         const double initialization_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - initialization_started).count();
 
@@ -4760,6 +4922,8 @@ void benchmark_128k(const std::string &target_path, const std::string &dflash_pa
                 << ",\"injection_seconds\":" << measured.injection_seconds
                 << ",\"resident_bytes\":" << stats.resident_bytes
                 << ",\"resident_matrices\":" << stats.matrix_count
+                << ",\"extra_down_added_bytes\":" << target.extra_down_cache_info().added_bytes
+                << ",\"extra_down_added_matrices\":" << target.extra_down_cache_info().added_matrices
                 << ",\"tokens\":[";
         for (std::size_t index = 0; index < measured.tokens.size(); ++index) {
             if (index) records << ',';
@@ -4798,6 +4962,7 @@ void chat(const std::string &target_path, const std::string &dflash_path,
     NativeTargetSession target(target_path, context_capacity, resident_weight_budget);
     NativeDflashEncoder dflash(dflash_path);
     dflash.preload_all_quantized();
+    target.preload_extra_ffn_down();
 
     const qwen_native::GgufFile model(target_path);
     Tokenizer tokenizer(model);
@@ -4811,6 +4976,11 @@ void chat(const std::string &target_path, const std::string &dflash_path,
               << static_cast<double>(stats.resident_bytes) / (1024.0 * 1024.0 * 1024.0)
               << " GiB (" << stats.matrix_count << " matrices)\n"
               << "  commands: /quit /reset /think\n\n";
+    if (target.extra_down_cache_info().attempted) {
+        std::cerr << "  extra down cache: " << target.extra_down_cache_info().added_bytes
+                  << " actual bytes in " << target.extra_down_cache_info().added_matrices
+                  << " matrices (guarded)\n";
+    }
 
     auto emit_token = [&](std::uint32_t token, bool &thinking) {
         if (token == 248068) { thinking = true; return; }
@@ -5054,6 +5224,7 @@ void usage(const char *program) {
               << "  " << program << " benchmark-128k TARGET.gguf DFLASH.gguf OUTPUT.jsonl [RESIDENT_GIB] [RUNS] [PROMPT.txt] [REQUIRED_TPS]\n"
               << "  " << program << " bench-matvec MODEL.gguf TENSOR [ITERATIONS]\n"
               << "  " << program << " bench-ffn MODEL.gguf LAYER [ITERATIONS]\n"
+              << "  " << program << " wide-projection-test MODEL.gguf\n"
               << "  " << program << " bench-gdn [ITERATIONS]\n"
               << "  " << program << " mtp-test TARGET.gguf CONTEXT TOKEN_ID [TOKENS] [RESIDENT_GIB]\n"
               << "  " << program << " target-generate TARGET.gguf CONTEXT TOKEN_ID [TOKENS] [RESIDENT_GIB]\n"
@@ -5065,6 +5236,7 @@ void usage(const char *program) {
               << "  " << program << " target-prefill-test TARGET.gguf CONTEXT [RESIDENT_GIB]\n"
               << "  " << program << " tokenizer-self-test TARGET.gguf\n"
               << "  " << program << " target-layer-major-test TARGET.gguf CONTEXT TOKENS [RESIDENT_GIB]\n"
+              << "  " << program << " target-wide-prefill-test TARGET.gguf CONTEXT TOKENS [RESIDENT_GIB]\n"
               << "  " << program << " target-engine-variant-test TARGET.gguf CONTEXT TOKENS [RESIDENT_GIB]\n"
               << "  " << program << " dflash-commit-test TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
               << "  " << program << " dflash-encode TARGET.gguf DFLASH.gguf CONTEXT TOKEN_ID [RESIDENT_GIB]\n"
@@ -5080,6 +5252,10 @@ void usage(const char *program) {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "wide-projection-test") {
+            wide_projection_test(argv[2]);
+            return EXIT_SUCCESS;
+        }
         if (argc == 2 && std::string(argv[1]) == "device") {
             show_device();
             return EXIT_SUCCESS;
@@ -5291,6 +5467,7 @@ int main(int argc, char **argv) {
         }
         if ((argc == 5 || argc == 6) &&
             (std::string(argv[1]) == "target-layer-major-test" ||
+             std::string(argv[1]) == "target-wide-prefill-test" ||
              std::string(argv[1]) == "target-engine-variant-test")) {
             const double requested_gib = argc == 6 ? std::stod(argv[5]) : 1.0;
             if (!std::isfinite(requested_gib) || requested_gib < 0.0 || requested_gib > 7.0) {
@@ -5299,7 +5476,8 @@ int main(int argc, char **argv) {
             target_layer_major_test(argv[2], static_cast<std::size_t>(std::stoull(argv[3])),
                 static_cast<std::size_t>(std::stoull(argv[4])),
                 static_cast<std::size_t>(requested_gib * 1024.0 * 1024.0 * 1024.0),
-                std::string(argv[1]) == "target-engine-variant-test");
+                std::string(argv[1]) == "target-engine-variant-test",
+                std::string(argv[1]) == "target-wide-prefill-test");
             return EXIT_SUCCESS;
         }
         if (argc == 3 && std::string(argv[1]) == "tokenizer-self-test") {

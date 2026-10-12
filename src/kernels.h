@@ -98,6 +98,11 @@ void execute_k_matvec_cached_batch8(const void *weights, std::uint32_t weight_ty
                                     const float *input, std::size_t input_size,
                                     float *output, std::size_t output_size,
                                     bool keep_resident);
+// Thirty-two real input rows; the caller supplies padding for any invalid tail.
+void execute_k_matvec_cached_batch32(const void *weights, std::uint32_t weight_type,
+                                     const float *input, std::size_t input_size,
+                                     float *output, std::size_t output_size,
+                                     bool keep_resident);
 void execute_k_matvec_hybrid_cached_batch8(const void *weights, std::uint32_t weight_type,
                                            const float *input, std::size_t input_size,
                                            float *output, std::size_t output_size,
@@ -235,6 +240,13 @@ void pipeline_prefetch_inline(DevicePipeline *pipeline, const void *weights,
 
 // Run a full fused FFN layer batch-8 on the pipeline (norm → gate → up → silu → down → add).
 // Hidden state is updated in-place. norm_weights are the post-attention norm.
+// The caller stages all three unchanged matrices and supplies 32 padded rows.
+void execute_prefill_ffn_batch32(float *hidden, const float *norm_weights,
+                                std::size_t embedding_size, std::size_t ffn_size, float epsilon,
+                                const void *gate_weights, std::uint32_t gate_type,
+                                const void *up_weights, std::uint32_t up_type,
+                                const void *down_weights, std::uint32_t down_type);
+
 void pipeline_fused_ffn_batch8(DevicePipeline *pipeline, const float *norm_weights,
                                std::size_t embedding_size, std::size_t ffn_size, float epsilon,
                                const void *gate_weights, std::uint32_t gate_type,

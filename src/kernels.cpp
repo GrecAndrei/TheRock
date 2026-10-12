@@ -1086,6 +1086,113 @@ __global__ void iq3s_matvec_kernel(const IQ3SBlock *__restrict__ weights,
     if (lane == 0) output[row] = sum;
 }
 
+template <int Kind>
+__device__ float wide_projection_weight(const void *weights, std::size_t index, int step, int lane) {
+    if constexpr (Kind == 12 || Kind == 13) {
+        using Block = std::conditional_t<Kind == 12, Q4KBlock, Q5KBlock>;
+        const auto &block = static_cast<const Block *>(weights)[index];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        const float dm = __half2float(*reinterpret_cast<const __half *>(&block.dmin));
+        std::uint8_t scale = 0, minimum = 0;
+        scale_min(block.scales, step, scale, minimum);
+        const auto packed = block.quants[(step / 2) * 32 + lane];
+        int code = step % 2 ? packed >> 4 : packed & 15;
+        if constexpr (Kind == 13) {
+            code += (block.high_bits[lane] & (1U << step)) ? 16 : 0;
+        }
+        return d * static_cast<float>(scale) * static_cast<float>(code)
+             - dm * static_cast<float>(minimum);
+    } else if constexpr (Kind == 14) {
+        const auto &block = static_cast<const Q6KBlock *>(weights)[index];
+        const int half = step / 4, component = step % 4;
+        const auto packed = block.low_quants[half * 64 + (component % 2) * 32 + lane];
+        const int low = component >= 2 ? packed >> 4 : packed & 15;
+        const int high = (block.high_quants[half * 32 + lane] >> (2 * component)) & 3;
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        return d * static_cast<float>(block.scales[half * 8 + lane / 16 + component * 2])
+                 * static_cast<float>(low + (high << 4) - 32);
+    } else if constexpr (Kind == 8) {
+        const auto &block = static_cast<const Q8_0Block *>(weights)[index];
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        return d * static_cast<float>(block.qs[lane]);
+    } else if constexpr (Kind == 20) {
+        const auto &block = static_cast<const IQ4NLBlock *>(weights)[index];
+        const int nibble = lane < 16 ? block.qs[lane] & 15 : block.qs[lane - 16] >> 4;
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        return d * static_cast<float>(kvalues_iq4nl[nibble]);
+    } else if constexpr (Kind == 23) {
+        const auto &block = static_cast<const IQ4XSBlock *>(weights)[index];
+        const int ls = ((block.scales_l[step / 2] >> (4 * (step % 2))) & 15)
+                     | (((block.scales_h >> (2 * step)) & 3) << 4);
+        const int nibble = lane < 16 ? block.qs[step * 16 + lane] & 15
+                                     : block.qs[step * 16 + lane - 16] >> 4;
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        return (d * static_cast<float>(ls - 32)) * static_cast<float>(kvalues_iq4nl[nibble]);
+    } else if constexpr (Kind == 11) {
+        const auto &block = static_cast<const Q3KBlock *>(weights)[index];
+        const int position = step * 32 + lane;
+        const int low = (block.qs[(step / 4) * 32 + lane] >> ((step & 3) * 2)) & 3;
+        const int high = (block.hmask[lane] >> step) & 1;
+        const float d = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        return (d * static_cast<float>(q3k_decode_scale(block.scales, position / 16)))
+                   * static_cast<float>((low | (high << 2)) - 4);
+    } else {
+        static_assert(Kind == 21);
+        return iq3s_decode_weight(static_cast<const IQ3SBlock *>(weights)[index], step * 32 + lane);
+    }
+}
+
+template <int Kind>
+__global__ void quant_matvec_batch32_kernel(const void *__restrict__ weights,
+                                            const float *__restrict__ input,
+                                            float *__restrict__ output,
+                                            int input_size, int blocks_per_row, int rows) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int token_group = static_cast<int>(threadIdx.y);
+    if (row >= rows || lane >= kWarpSize) return;
+    constexpr int columns = Kind == 8 || Kind == 20 ? 32 : 256;
+    // Four waves each accumulate eight positions, reusing a cooperatively
+    // decoded quant block. All waves take both barriers, including formats
+    // whose 32-column block is decoded by wave zero alone. The per-position
+    // FMA sequence and wave reduction remain identical to batch8.
+    __shared__ float decoded[columns];
+    float sums[8] = {};
+    for (int block = 0; block < blocks_per_row; ++block) {
+        const auto index = static_cast<std::size_t>(row) * blocks_per_row + block;
+        for (int step = token_group; step < columns / 32; step += 4) {
+            decoded[step * 32 + lane] = wide_projection_weight<Kind>(weights, index, step, lane);
+        }
+        __syncthreads();
+#pragma clang loop unroll(disable)
+        for (int step = 0; step < columns / 32; ++step) {
+            const float weight = decoded[step * 32 + lane];
+            const int column = block * columns + step * 32 + lane;
+#pragma unroll
+            for (int batch = 0; batch < 8; ++batch) {
+                const auto position = static_cast<std::size_t>(token_group * 8 + batch);
+                sums[batch] = fmaf(weight, input[position * input_size + column],
+                                   sums[batch]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            sums[batch] += __shfl_down(sums[batch], offset, kWarpSize);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int batch = 0; batch < 8; ++batch) {
+            const auto position = static_cast<std::size_t>(token_group * 8 + batch);
+            output[position * rows + row] = sums[batch];
+        }
+    }
+}
+
 __global__ void q8_0_matvec_kernel(const Q8_0Block *__restrict__ weights,
                                    const float *__restrict__ input,
                                    float *__restrict__ output,
@@ -3530,6 +3637,34 @@ void launch_k_matvec_batch8(std::uint32_t type, const void *weights, const float
     }
 }
 
+template <int Kind>
+void launch_wide32_projection(const void *weights, const float *input, float *output,
+                              std::size_t input_size, std::size_t output_size,
+                              hipStream_t stream) {
+    constexpr std::size_t columns_per_block = Kind == 8 || Kind == 20 ? 32 : 256;
+    const dim3 grid(static_cast<unsigned>(output_size));
+    const dim3 block(kWarpSize, 4);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(quant_matvec_batch32_kernel<Kind>), grid, block, 0, stream,
+                       weights, input, output, static_cast<int>(input_size),
+                       static_cast<int>(input_size / columns_per_block), static_cast<int>(output_size));
+}
+
+void launch_k_matvec_batch32(std::uint32_t type, const void *weights, const float *input,
+                             float *output, std::size_t input_size, std::size_t output_size,
+                             hipStream_t stream = nullptr) {
+    switch (type) {
+    case 8: return launch_wide32_projection<8>(weights, input, output, input_size, output_size, stream);
+    case 11: return launch_wide32_projection<11>(weights, input, output, input_size, output_size, stream);
+    case 12: return launch_wide32_projection<12>(weights, input, output, input_size, output_size, stream);
+    case 13: return launch_wide32_projection<13>(weights, input, output, input_size, output_size, stream);
+    case 14: return launch_wide32_projection<14>(weights, input, output, input_size, output_size, stream);
+    case 20: return launch_wide32_projection<20>(weights, input, output, input_size, output_size, stream);
+    case 21: return launch_wide32_projection<21>(weights, input, output, input_size, output_size, stream);
+    case 23: return launch_wide32_projection<23>(weights, input, output, input_size, output_size, stream);
+    default: throw std::invalid_argument("unsupported wide projection quant type");
+    }
+}
+
 void launch_k_matvec(std::uint32_t type, const void *weights, const float *input,
                      float *output, std::size_t input_size, std::size_t output_size) {
     const dim3 grid(static_cast<unsigned int>(output_size));
@@ -4060,6 +4195,29 @@ void execute_k_matvec_cached_batch8(const void *weights, std::uint32_t weight_ty
     hip_check(hipGetLastError(), "native cached batch8 matvec launch");
     hip_check(hipMemcpy(output, workspace.output, batch_size * output_size * sizeof(float), hipMemcpyDeviceToHost),
               "hipMemcpy native cached batch8 matvec output");
+}
+
+void execute_k_matvec_cached_batch32(const void *weights, std::uint32_t weight_type,
+                                     const float *input, std::size_t input_size,
+                                     float *output, std::size_t output_size,
+                                     bool keep_resident) {
+    if (!weights || !input || !output) throw std::invalid_argument("null wide projection buffer");
+    const auto bytes = k_quant_weight_bytes(weight_type, input_size, output_size);
+    auto &workspace = matvec_workspace();
+    const void *device_weights = resident_weight_cache().find_or_add(weights, bytes, keep_resident);
+    if (!device_weights) {
+        workspace.reserve_weights(bytes);
+        hip_check(hipMemcpy(workspace.weights, weights, bytes, hipMemcpyHostToDevice), "wide projection weights");
+        device_weights = workspace.weights;
+    }
+    workspace.reserve_input(32 * input_size);
+    workspace.reserve_output(32 * output_size);
+    hip_check(hipMemcpy(workspace.input, input, 32 * input_size * sizeof(float), hipMemcpyHostToDevice),
+              "wide projection input");
+    launch_k_matvec_batch32(weight_type, device_weights, workspace.input, workspace.output, input_size, output_size);
+    hip_check(hipGetLastError(), "wide projection launch");
+    hip_check(hipMemcpy(output, workspace.output, 32 * output_size * sizeof(float), hipMemcpyDeviceToHost),
+              "wide projection output");
 }
 
 void execute_k_matvec_cached_batch8_top16(const void *weights, std::uint32_t weight_type,
@@ -6343,6 +6501,87 @@ void pipeline_prefetch_inline(DevicePipeline *pipeline, const void *weights,
     pipeline->inline_done_valid = true;
     pipeline->inline_prefetched_ptr = weights;
     pipeline->inline_prefetched_bytes = weight_bytes;
+}
+
+namespace {
+
+struct PrefillFfn32Workspace {
+    std::size_t embedding_size = 0, ffn_size = 0;
+    hipStream_t stream = nullptr;
+    float *hidden = nullptr, *normalized = nullptr, *norm_weights = nullptr;
+    float *gate = nullptr, *up = nullptr, *down = nullptr;
+    ~PrefillFfn32Workspace() {
+        if (stream) (void)hipStreamSynchronize(stream);
+        for (auto *buffer : {hidden, normalized, norm_weights, gate, up, down}) {
+            if (buffer) (void)hipFree(buffer);
+        }
+        if (stream) (void)hipStreamDestroy(stream);
+    }
+};
+
+PrefillFfn32Workspace &prefill_ffn32_workspace(std::size_t embedding_size, std::size_t ffn_size) {
+    static std::unique_ptr<PrefillFfn32Workspace> cached;
+    if (!cached || cached->embedding_size != embedding_size || cached->ffn_size != ffn_size) {
+        auto next = std::make_unique<PrefillFfn32Workspace>();
+        next->embedding_size = embedding_size;
+        next->ffn_size = ffn_size;
+        hip_check(hipStreamCreate(&next->stream), "wide FFN stream");
+        const auto allocate = [](float **buffer, std::size_t count) {
+            hip_check(hipMalloc(reinterpret_cast<void **>(buffer), count * sizeof(float)), "wide FFN buffer");
+        };
+        allocate(&next->hidden, 32 * embedding_size);
+        allocate(&next->normalized, 32 * embedding_size);
+        allocate(&next->norm_weights, embedding_size);
+        allocate(&next->gate, 32 * ffn_size);
+        allocate(&next->up, 32 * ffn_size);
+        allocate(&next->down, 32 * embedding_size);
+        cached = std::move(next);
+    }
+    return *cached;
+}
+
+} // namespace
+
+void execute_prefill_ffn_batch32(float *hidden, const float *norm_weights,
+                                std::size_t embedding_size, std::size_t ffn_size, float epsilon,
+                                const void *gate_weights, std::uint32_t gate_type,
+                                const void *up_weights, std::uint32_t up_type,
+                                const void *down_weights, std::uint32_t down_type) {
+    if (!hidden || !norm_weights || !embedding_size || !ffn_size ||
+        embedding_size > 32768 || ffn_size > 65536) {
+        throw std::invalid_argument("invalid wide FFN buffers or dimensions");
+    }
+    const auto staged = [](const void *weights, std::uint32_t type,
+                            std::size_t input, std::size_t output) {
+        const auto *device = resident_weight_cache().find_or_add(
+            weights, k_quant_weight_bytes(type, input, output), false);
+        if (!device) throw std::runtime_error("wide prefill requires staged matrix weights");
+        return device;
+    };
+    const auto *device_gate = staged(gate_weights, gate_type, embedding_size, ffn_size);
+    const auto *device_up = staged(up_weights, up_type, embedding_size, ffn_size);
+    const auto *device_down = staged(down_weights, down_type, ffn_size, embedding_size);
+    auto &w = prefill_ffn32_workspace(embedding_size, ffn_size);
+    const auto hidden_bytes = 32 * embedding_size * sizeof(float);
+    hip_check(hipMemcpyAsync(w.hidden, hidden, hidden_bytes, hipMemcpyHostToDevice, w.stream), "wide FFN input");
+    hip_check(hipMemcpyAsync(w.norm_weights, norm_weights, embedding_size * sizeof(float),
+                             hipMemcpyHostToDevice, w.stream), "wide FFN norm weights");
+    constexpr int threads = 256;
+    hipLaunchKernelGGL(rms_norm_batch8_kernel, dim3(32), dim3(threads), threads * sizeof(float),
+                       w.stream, w.hidden, w.normalized, w.norm_weights,
+                       static_cast<int>(embedding_size), epsilon);
+    launch_k_matvec_batch32(gate_type, device_gate, w.normalized, w.gate, embedding_size, ffn_size, w.stream);
+    launch_k_matvec_batch32(up_type, device_up, w.normalized, w.up, embedding_size, ffn_size, w.stream);
+    const int activation_count = static_cast<int>(32 * ffn_size);
+    hipLaunchKernelGGL(silu_multiply_batch8_kernel, dim3((activation_count + threads - 1) / threads),
+                       dim3(threads), 0, w.stream, w.gate, w.up, activation_count);
+    launch_k_matvec_batch32(down_type, device_down, w.gate, w.down, ffn_size, embedding_size, w.stream);
+    const int residual_count = static_cast<int>(32 * embedding_size);
+    hipLaunchKernelGGL(vector_add_batch8_kernel, dim3((residual_count + threads - 1) / threads),
+                       dim3(threads), 0, w.stream, w.hidden, w.down, residual_count);
+    hip_check(hipGetLastError(), "wide FFN launch");
+    hip_check(hipMemcpyAsync(hidden, w.hidden, hidden_bytes, hipMemcpyDeviceToHost, w.stream), "wide FFN output");
+    hip_check(hipStreamSynchronize(w.stream), "complete wide FFN before staged-weight release");
 }
 
 void pipeline_fused_ffn_batch8(DevicePipeline *pipeline, const float *norm_weights,
