@@ -1,0 +1,6 @@
+physical node=1 gpu_id=40264 gfx=100302 queue geometry=QueueSaveGeometry { eop_size: 4096, context_save_size: 11157504, control_stack_size: 16384, debugger_size: 32768 }
+compiled fill: workgroup=[64, 1, 1], grid=[64, 1, 1], descriptor=[00, 00, 00, 00, 00, 00, 00, 00, 20, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 01, 00, ac, e0, 84, 00, 00, 00, 08, 04, 00, 00, 00, 00, 00, 00], text=[00, 01, 04, f4, 00, 00, 00, fa, 80, 01, 04, f4, 10, 00, 00, fa, 00, 02, 00, f4, 18, 00, 00, fa, 7f, c0, 8c, bf, 08, 02, 02, 7e, 02, c0, 09, 93, 09, 00, 04, 4a, 80, 02, 06, 7e, 04, 02, 08, 7e, 05, 02, 0a, 7e, 06, 00, 69, d5, 06, 04, 02, 00, 07, 00, 6a, d5, 06, 04, 02, 00, 08, 00, 69, d5, 07, 04, 02, 00, 08, 0f, 0e, 4a, 04, 6a, 0f, d7, 06, 09, 02, 00, 07, 0b, 0a, 50, 00, 80, 70, dc, 04, 01, 7d, 00, 70, 3f, 8c, bf, 00, 00, 81, bf]
+repetition 1: fill completion/readback/guards and explicit teardown passed
+repetition 2: fill completion/readback/guards and explicit teardown passed
+repetition 3: fill completion/readback/guards and explicit teardown passed
+fill silicon gate passed; event mailbox stays pinned until process exit; no inference TPS measured

@@ -5,7 +5,11 @@
     "upstream": "https://github.com/GrecAndrei/rocmtry.git",
     "upstream_main": "867ea43cfb67db9782b17814020a24593d9e4508",
     "branch": "engine/rx6650xt-10tps",
-    "local_commit": "329a56a6f18ab20a4afc7c6a989dd5a5343f2950",
+    "local_commit": "709a5f491b82e616b87dabbdb8e5f80410951889",
+    "dispatch_tested_binary_sha256": "66e287f79770ed4d42aad2035def724154f305c9fa585556f64f3231cb7f82d4",
+    "dispatch_source_archive_sha256": "1b71115b675e545e39988d560bc522bc702ee81f0c8c907df2e3259e5c02a206",
+    "silicon_gates": ["queue", "noop", "fill", "vector-add"],
+    "inference_verified": false,
     "imports_commit": "e836679f6553877e98100ee14b7dbf6e6341acf5"
   },
   "llama_dflash_reference": {

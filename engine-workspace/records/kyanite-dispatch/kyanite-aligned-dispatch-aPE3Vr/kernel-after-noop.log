@@ -1,0 +1,10 @@
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu: [gfxhub] page fault (src_id:0 ring:64 vmid:8 pasid:85)
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:  Process executable pid 47347 thread executable pid 47347
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:   in page starting at address 0x0000001000002000 from client 0x1b (UTCL2)
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu: GCVM_L2_PROTECTION_FAULT_STATUS:0x00800880
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:          Faulty UTCL2 client ID: CPF (0x4)
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:          MORE_FAULTS: 0x0
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:          WALKER_ERROR: 0x0
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:          PERMISSION_FAULTS: 0x8
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:          MAPPING_ERROR: 0x0
+Oct 12 12:10:59 alexander-b760m kernel: amdgpu 0000:03:00.0: amdgpu:          RW: 0x0

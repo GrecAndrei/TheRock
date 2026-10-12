@@ -30,6 +30,10 @@ The new `hardware_queue` probe uses existing Kyanite allocation and queue owners
 - queue destruction before allocation cleanup, with process-exit retention on
   indeterminate queue/cleanup errors.
 
+This section records the initial queue-only checkpoint. Production dispatch
+has since advanced; see `KYANITE_DISPATCH_PROGRESS.md` for 2026-10-12 no-op,
+fill and vector-add evidence and the retained permission-fault attempts.
+
 Three physical create/map/destroy/free repetitions passed, with exit status 0.
 Evidence: `results/kfd-queue-UlEHQ0/queue.log`. This proves the chosen queue
 arrangement, not kernel execution or model inference. The production
@@ -90,8 +94,8 @@ The subsequent HIP/C++ timeout/prefill repair is complete for the recorded
 fixtures and real request; see `TIMEOUT_PREFILL_RESULTS.md`. It preserves
 Kyanite's independent runtime boundary and does not certify the 10 TPS goal.
 
-Integrate the proven mapping and auxiliary-region ownership into the production
-dispatcher with failure/rollback tests. Then run bounded empty/write-index/
-vector-add dispatch, completion, readback and teardown before implementing the
-missing inference operators. Neither the queue probe nor a native chat result
-can establish Kyanite's 10 tokens/s goal.
+The production dispatcher now integrates owned mapping/auxiliary regions and
+passes bounded no-op, fill and vector-add completion/readback/teardown gates.
+Reduction with LDS/barriers, tiled matrix multiplication and broader dispatch
+stress are next before inference operators. Neither these gates nor a native
+chat result establishes Kyanite's 10 tokens/s goal.

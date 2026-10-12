@@ -59,8 +59,10 @@ The initial restricted terminal could not see GPU devices. Host access is now
 enabled: `/dev/kfd` and both DRM render nodes are accessible, and the native HIP
 device query identifies an RX 6650 XT with gfx1032 and 7.98 GiB VRAM. A new direct
 KFD queue probe passed three physical lifecycle repetitions. The production
-dispatcher still needs the proven mapping/save-area arrangement integrated;
-kernel execution and model inference in Kyanite remain unproven.
+dispatcher now owns that mapping/save-area arrangement and passes actual
+no-op, guarded fill and multi-workgroup vector-add, three cycles each. See
+`KYANITE_DISPATCH_PROGRESS.md` for the committed source and evidence, including
+earlier failures. Model inference in Kyanite remains unproven.
 
 The 15.33 GiB target weights exceed the card's approximately 8 GiB VRAM before
 KV state and drafter storage. Weight residency, transfers, CPU/GPU partitioning,

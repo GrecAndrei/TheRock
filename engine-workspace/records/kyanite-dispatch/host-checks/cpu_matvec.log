@@ -1,0 +1,4 @@
+CPU Q6 predecode: 51 bit-exact fixtures passed; scalar oracle, guards, cache keys, dual paths passed
+CPU IQ4_XS tile GEMM: 53 bit-exact fixtures passed; scalar oracle, guards, cache layout, dual paths passed
+CPU IQ4_XS predecode: 53 bit-exact fixtures passed; scalar oracle, guards, cache layout, dual paths passed
+CPU Q4/Q5_K tile GEMM: 128 bit-exact fixtures passed; scalar oracle, interleaved FMA order, guards, dual flags passed

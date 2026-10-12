@@ -1,0 +1,1 @@
+single-job worker: error propagation, reuse, overlap refusal, destruction drain and capture lifetimes passed (CPU only)

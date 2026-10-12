@@ -1,0 +1,4 @@
+    Checking kyanite-linux-kfd v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/linux-kfd)
+    Checking kyanite-fuzz v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/fuzz)
+    Checking kyanite-bringup v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/bringup)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.81s
