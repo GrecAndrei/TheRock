@@ -29,6 +29,8 @@ controls=(
     "QWEN_NATIVE_FFN_PROFILE=${QWEN_NATIVE_FFN_PROFILE:-0}"
     "QWEN_NATIVE_HYBRID_FFN_DOWN=${QWEN_NATIVE_HYBRID_FFN_DOWN:-0}"
     "QWEN_NATIVE_FFN_DOWN_CPU_PERCENT=${QWEN_NATIVE_FFN_DOWN_CPU_PERCENT:-50}"
+    "QWEN_NATIVE_EXTRA_DOWN_MB=${QWEN_NATIVE_EXTRA_DOWN_MB:-0}"
+    "QWEN_NATIVE_WIDE_PREFILL=${QWEN_NATIVE_WIDE_PREFILL:-0}"
 )
 # Capture explicit controls above, then prevent an inherited experimental flag
 # (including presence-only flags) from silently changing the next workload.

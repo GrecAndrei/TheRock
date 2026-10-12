@@ -1,0 +1,13 @@
+Environment inspection before the LDS comparisons found no inherited QWEN_NATIVE_* variables.
+
+Projection commands, for both LDS frozen executables:
+env QWEN_NATIVE_PIN_MODEL=0 EXECUTABLE wide-projection-test /home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf
+
+Rolled LDS direct comparisons, N=1,17,33,513:
+timeout 360s env -u QWEN_NATIVE_HYBRID -u QWEN_NATIVE_CPU_GATE QWEN_NATIVE_GPU_GATE=1 QWEN_NATIVE_PIN_MODEL=0 QWEN_NATIVE_KV=q8 QWEN_NATIVE_EXTRA_DOWN_MB=0 results/wide-prefill-lds-gates-z9r3D9/executable target-wide-prefill-test /home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf 131336 N 1.0
+The 1/17/33 commands used timeout 120s instead of 360s. All exited normally.
+
+Unrolled LDS direct comparison, profiling enabled:
+timeout 360s env -u QWEN_NATIVE_HYBRID -u QWEN_NATIVE_CPU_GATE QWEN_NATIVE_GPU_GATE=1 QWEN_NATIVE_PIN_MODEL=0 QWEN_NATIVE_KV=q8 QWEN_NATIVE_EXTRA_DOWN_MB=0 QWEN_NATIVE_PREFILL_PROFILE=1 results/wide-prefill-lds-unrolled-S7LrAq/executable target-wide-prefill-test /home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf 131336 513 1.0
+
+Each command was piped through tee with both command/wrapper and logger PIPESTATUS entries recorded. The frozen executables and source archives are identified by their adjacent inputs.sha256 records. Only 17+N prompt positions were physically processed; 131336 is context capacity, not occupied context.

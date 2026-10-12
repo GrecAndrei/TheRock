@@ -59,3 +59,21 @@ only. The half-CPU down-row candidate failed the unchanged strict feature/state
 gate and is **not promoted**. The separate async activation replay passed strict
 parity but had no measured throughput benefit over its same-build baseline.
 Its default remains off. See `FFN_SCHEDULING.md` for exact scope and failed logs.
+
+## Guarded cache and wider physical prefill, 2026-10-12
+
+The post-drafter extra-cache experiment adds only unchanged down matrices while
+preserving existing tensor placement and an observed free-memory reserve. It
+passed strict parity but did not beat the real-prompt baseline; default is zero.
+See `GUARDED_CACHE_RESULTS.md` for actual allocations and committed output IDs.
+
+The 32-position FFN prototype and its eight quantized projections are original
+native implementations, not copied upstream code or new Kyanite dependencies.
+Projection arithmetic retains the existing FMA and wave reduction order. Gates
+use actual model weights, tail positions, physical chunk boundaries, all five
+prompt taps and a following verifier block. An independent full-model oracle
+against llama.cpp is still outstanding; native-reference parity is not that
+oracle. Direct layer-major comparisons show no prefill win for the retained
+LDS layout, and unrolling that layout regresses further. No candidate is
+promoted; default prefill remains the existing layer-major batch-8 path.
+See `WIDE_PREFILL_PROGRESS.md` for compiler resources and retained failed runs.

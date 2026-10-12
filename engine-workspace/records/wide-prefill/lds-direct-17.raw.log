@@ -1,0 +1,8 @@
+native layer-major 8-versus-32 prefill test (not generation throughput)
+  physical prefix: 17, compared tokens: 17
+  layer-major batch8 prefill seconds: 2.37661
+  layer-major prefill seconds: 2.66411
+  predictions: match
+  bit-exact logits/features: yes
+  all prompt feature taps: match
+  feature relative RMSE: 0

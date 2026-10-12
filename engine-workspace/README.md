@@ -151,3 +151,8 @@ track, selector diagnostics and measured ablations are documented in
 FFN attribution, a failed down-shard parity gate and the independent async-copy
 replay are in [`FFN_SCHEDULING.md`](FFN_SCHEDULING.md). Both scheduling candidates
 remain off; instrumentation results are not presented as throughput wins.
+
+The extra-cache comparison is in [`GUARDED_CACHE_RESULTS.md`](GUARDED_CACHE_RESULTS.md).
+The genuine 32-position projection/FFN prefill prototype and its gates are in
+[`WIDE_PREFILL_PROGRESS.md`](WIDE_PREFILL_PROGRESS.md). Both default off until
+their applicable correctness and performance evidence supports promotion.

@@ -1,0 +1,12 @@
+layer-major 512 physical tokens: recurrent 6.44328s, attention 2.01936s, FFN 19.06s
+layer-major 1 physical tokens: recurrent 0.0854266s, attention 0.0367881s, FFN 0.295718s
+layer-major 512 physical tokens: recurrent 6.33789s, attention 1.98696s, FFN 32.2904s
+layer-major 1 physical tokens: recurrent 0.0855314s, attention 0.0367931s, FFN 2.02254s
+native layer-major 8-versus-32 prefill test (not generation throughput)
+  physical prefix: 17, compared tokens: 513
+  layer-major batch8 prefill seconds: 30.4111
+  layer-major prefill seconds: 45.215
+  predictions: match
+  bit-exact logits/features: yes
+  all prompt feature taps: match
+  feature relative RMSE: 0

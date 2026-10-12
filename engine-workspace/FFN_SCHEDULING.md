@@ -97,5 +97,6 @@ unchanged down matrices after the drafter is resident. Use `hipMemGetInfo` to
 cap additions and reserve transient-prefill/checkpoint headroom. Tighten the
 cache budget to the actual populated bytes afterward, so unused requested room
 cannot silently move other CPU tensors to the GPU. Record requested and actual
-added bytes, free-memory observations and exact output/state checks. This is a
-design for the next experiment, **not implemented or measured yet**.
+added bytes, free-memory observations and exact output/state checks. This was
+subsequently implemented and measured; see `GUARDED_CACHE_RESULTS.md`. It passed
+strict parity but had no measured decode benefit, so remains default off.
