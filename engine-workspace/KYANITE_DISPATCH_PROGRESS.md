@@ -75,8 +75,9 @@ development references, not shipped dependencies or copied algorithm ports.
 
 ## Remaining work
 
-Next: reduction with LDS/barriers, tiled matrix multiplication and broader
-dispatch/error stress before inference operators. Native generation remains
+The subsequent reduction/LDS fixture passed; see `KYANITE_REDUCTION_PROGRESS.md`.
+Next: tiled matrix multiplication and broader dispatch/error stress before
+inference operators. Native generation remains
 about 3.14 committed tokens/s on the latest 256-output replay; this checkpoint
 does not change it. Full physical-128K generation, broad quality evaluation and
 10 generated tokens/s remain unproven. Original target/DFlash weights unchanged.

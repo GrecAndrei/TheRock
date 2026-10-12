@@ -1,0 +1,6 @@
+physical node=1 gpu_id=40264 gfx=100302 queue geometry=QueueSaveGeometry { eop_size: 4096, context_save_size: 11157504, control_stack_size: 16384, debugger_size: 32768 }
+compiled noop: workgroup=[1, 1, 1], grid=[1, 1, 1], descriptor=[00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, ac, e0, 04, 00, 00, 00, 08, 04, 00, 00, 00, 00, 00, 00], text=[00, 00, 81, bf]
+repetition 1: noop completion/readback/guards and explicit teardown passed
+repetition 2: noop completion/readback/guards and explicit teardown passed
+repetition 3: noop completion/readback/guards and explicit teardown passed
+noop silicon gate passed; event mailbox stays pinned until process exit; no inference TPS measured

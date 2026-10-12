@@ -1,0 +1,2 @@
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx1032"
+	v_xor_b32_e32 v3, v4, v5                ; encoding: [0x04,0x0b,0x06,0x3a]

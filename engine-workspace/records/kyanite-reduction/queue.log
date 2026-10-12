@@ -1,0 +1,5 @@
+physical node=1 gpu_id=40264 gfx=100302 queue geometry=QueueSaveGeometry { eop_size: 4096, context_save_size: 11157504, control_stack_size: 16384, debugger_size: 32768 }
+repetition 1: production dispatcher create/map/close/reclose passed
+repetition 2: production dispatcher create/map/close/reclose passed
+repetition 3: production dispatcher create/map/close/reclose passed
+queue gate passed; no kernel dispatched, no inference measurement

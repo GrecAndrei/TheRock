@@ -62,7 +62,9 @@ KFD queue probe passed three physical lifecycle repetitions. The production
 dispatcher now owns that mapping/save-area arrangement and passes actual
 no-op, guarded fill and multi-workgroup vector-add, three cycles each. See
 `KYANITE_DISPATCH_PROGRESS.md` for the committed source and evidence, including
-earlier failures. Model inference in Kyanite remains unproven.
+earlier failures. Its six-stage cross-wave LDS reduction also passes the
+guarded physical fixture; see `KYANITE_REDUCTION_PROGRESS.md`. Matrix
+multiplication and model inference in Kyanite remain unproven.
 
 The 15.33 GiB target weights exceed the card's approximately 8 GiB VRAM before
 KV state and drafter storage. Weight residency, transfers, CPU/GPU partitioning,

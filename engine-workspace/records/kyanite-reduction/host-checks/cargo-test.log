@@ -1,0 +1,937 @@
+   Compiling kyanite-kernels v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/kernels)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_bench-89939a4c44d09fb2)
+
+running 27 tests
+test canonical::tests::canonical_json_normalizes_negative_zero_and_preserves_exact_floats ... ok
+test collector::tests::mock_procfs_cpu_and_ram_collection ... ok
+test canonical::tests::canonical_json_sorts_keys_and_normalizes_floats ... ok
+test collector::tests::mock_sysfs_missing_pcie_and_clocks_fail ... ok
+test canonical::tests::artifact_id_is_deterministic_and_roundtrips_hex ... ok
+test collector::tests::mock_sysfs_unknown_gpu_reports_unknown ... ok
+test collector::tests::mock_sysfs_gpu_and_clocks_collection ... ok
+test lifecycle::tests::lifecycle_activation_and_shutdown_reverse_effects ... ok
+test runner::tests::alternating_scheduler_generates_symmetric_order ... ok
+test lifecycle::tests::lifecycle_partial_activation_failure_rolls_back ... ok
+test runner::tests::mock_executor_captures_failure_and_timeout ... ok
+test stats::tests::credible_win_evaluation_latency ... ok
+test stats::tests::credible_win_evaluation_throughput ... ok
+test stats::tests::full_sample_ten_runs_no_warning ... ok
+test stats::tests::single_sample_statistics ... ok
+test lifecycle::tests::lifecycle_reconciliation_restarts_only_dependants ... ok
+test stats::tests::small_sample_percentiles_and_mad ... ok
+test tier::tests::differing_hardware_yields_incomparable ... ok
+test tier::tests::differing_quantization_yields_separate_tier ... ok
+test tier::tests::identical_packages_classify_as_direct_comparison ... ok
+test validation::tests::insufficient_measured_runs_fails_validation ... ok
+test validation::tests::incomplete_package_fails_validation ... ok
+test validation::tests::unverified_correctness_fails_validation ... ok
+test validation::tests::validate_silicon_package_rejects_modeled_data ... ok
+test validation::tests::valid_package_passes_validation ... ok
+test validation::tests::silicon_claim_missing_telemetry_fails_closed ... ok
+test report::tests::build_and_generate_reports_across_three_targets ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/determinism.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/determinism-6f21ce990968263d)
+
+running 3 tests
+test reordered_json_keys_produce_identical_canonical_bytes_and_hash ... ok
+test repeated_report_generation_is_strictly_deterministic ... ok
+test repeated_serialization_is_strictly_byte_identical ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+     Running tests/evidence_repairs.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/evidence_repairs-542b6f986edfabd3)
+
+running 5 tests
+test dirty_physical_source_is_not_reproducible_evidence ... ok
+test hashes_are_required_to_use_lowercase_hex ... ok
+test physical_claim_requires_audited_gpu_manifest_identity ... ok
+test successful_samples_cannot_be_silently_dropped_and_failures_must_be_retained ... ok
+test report_timestamp_is_derived_from_evidence_not_wall_clock ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hostile_inputs.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/hostile_inputs-47781a172f10aa0e)
+
+running 14 tests
+test hostile_failed_runs_retained_with_raw_io ... ok
+test hostile_overflow_and_non_finite_statistics ... ok
+test hostile_malformed_records_rejected ... ok
+test hostile_missing_metadata_rejected ... ok
+test hostile_clock_changes_and_throttling_detected ... ok
+test hostile_failed_and_non_finite_samples_excluded_from_statistics ... ok
+test hostile_timeout_execution_bounded_and_retained ... ok
+test hostile_silicon_publication_rejects_modeled_data ... ok
+test hostile_silicon_publication_missing_telemetry_fails_closed ... ok
+test hostile_invalid_comparisons_and_incomparable_reasons ... ok
+test hostile_unknown_pci_hardware_mapping ... ok
+test hostile_unequal_quality_and_placement_tiers_classified ... ok
+test hostile_tampered_canonical_evidence_and_round_trip ... ok
+test hostile_pipe_saturation_and_timeout ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_bench-2dee11d476fb26c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_bringup-c6db354e6a395c3d)
+
+running 8 tests
+test tests::geometry_helpers_follow_aql_inactive_axis_rules ... ok
+test tests::artifact_name_mismatch_is_rejected ... ok
+test tests::zero_group_counts_are_rejected_before_packet_construction ... ok
+test tests::grid_overflow_is_rejected_with_geometry_context ... ok
+test tests::grid_scales_with_group_counts_and_lifts_dimensions ... ok
+test tests::staged_workgroups_match_the_catalog_sources ... ok
+test tests::every_bringup_entry_stages_a_silicon_validated_packet ... ok
+test tests::staging_is_deterministic_for_identical_inputs ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_compiler-4573d139424f2669)
+
+running 9 tests
+test tests::empty_module_is_verifiable_for_pass_tests ... ok
+test tests::constant_fold_uses_reference_semantics_and_preserves_traps ... ok
+test tests::pass_failure_prevents_target_invocation ... ok
+test tests::constant_fold_is_differentially_equivalent_in_reference_executor ... ok
+test tests::orders_passes_deterministically ... ok
+test tests::rejects_duplicate_pass_ids_across_stages ... ok
+test tests::pipeline_rejects_artifact_identity_not_matching_selected_target ... ok
+test tests::canonicalize_pass_returns_canonical_reverified_ir ... ok
+test tests::successful_pipeline_invokes_target_exactly_once ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase2_exit.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/phase2_exit-235e1685dfa65c0d)
+
+running 1 test
+test phase2_program_classes_compile_to_deterministic_custom_images ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/target_replacement.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/target_replacement-95806459bf1057ff)
+
+running 12 tests
+test candidates_missing_from_both_context_and_provision_produces_error ... ok
+test missing_and_duplicate_target_providers_are_structured_errors ... ok
+test irrelevant_context_change_preserves_active_components ... ok
+test failed_replacement_rolls_back_to_coherent_previous_provider ... ok
+test install_uninstall_and_reinstall_work ... ok
+test no_model_crate_or_runtime_core_depends_on_synthetic_target ... ok
+test selection_by_semantic_capabilities_without_target_identity_tag ... ok
+test runtime_compatibility_boundary_rejects_genuine_synthetic_artifacts_before_allocation_or_dispatch ... ok
+test resolution_and_artifact_output_are_deterministic ... ok
+test compiler_core_selects_either_target_through_typed_context_without_target_name_conditionals ... ok
+test relevant_capability_change_invalidates_selected_target_and_transitive_dependants ... ok
+test candidates_enter_selection_via_declared_component_provision ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_context-282dd774b7a45118)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lifecycle.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/lifecycle-99a40efc17f81a7f)
+
+running 16 tests
+test deterministic_order_and_reverse_shutdown ... ok
+test observe_only_context_change_does_not_restart ... ok
+test failed_reconcile_with_local_rollback_failure_poisoned ... ok
+test failed_reconciliation_restores_old_effects_and_context ... ok
+test activation_failure_and_panic_rollback_local_and_prior_effects ... ok
+test panicking_effect_apply_is_compensated ... ok
+test optional_context_presence_change_restarts_observer ... ok
+test provision_dependency_overrides_order_hint_and_is_typed ... ok
+test rejects_duplicate_provider_missing_provider_and_cycle ... ok
+test rollback_failure_is_aggregated_and_prevents_false_cleanup_claim ... ok
+test runtime_drop_is_a_cleanup_safety_net ... ok
+test reconciliation_restarts_direct_observer_and_transitive_consumer_only ... ok
+test shutdown_then_restart_reinstalls_components ... ok
+test start_validates_context_before_effects ... ok
+test undeclared_access_is_rejected ... ok
+test independent_component_order_ignores_registration_order ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_dsl-219c09c9e49eea46)
+
+running 23 tests
+test tests::empty_module_lowers_without_placeholder_kernels ... ok
+test tests::invalid_view_access_is_rejected ... ok
+test tests::if_syntax_condition_types_and_return_placement_are_diagnosed ... ok
+test tests::for_loop_validation_and_scope_failures_are_structured ... ok
+test tests::deeply_chained_binary_operators_are_safely_rejected ... ok
+test tests::lexer_is_deterministic_and_skips_line_comments ... ok
+test tests::branch_lets_are_lexical_and_sibling_names_are_independent ... ok
+test tests::lexer_rejects_unknown_characters_at_exact_byte ... ok
+test tests::missing_return_is_a_structured_syntax_error ... ok
+test tests::loads_advance_effects_in_left_to_right_expression_order ... ok
+test tests::malformed_workgroup_declarations_and_accesses_are_structured ... ok
+test tests::rejects_non_ascii_source_with_a_precise_byte_span ... ok
+test tests::one_returning_branch_reconverges_the_other_path ... ok
+test tests::rank_n_workgroup_objects_lower_to_generic_memory_operations ... ok
+test tests::deeply_nested_if_blocks_recursion_limit_is_safely_rejected ... ok
+test tests::loop_body_is_lexical_and_nested_cfg_carries_loop_state ... ok
+test tests::semantic_failures_have_specific_structured_diagnostics ... ok
+test tests::returning_loop_body_does_not_make_the_loop_a_return ... ok
+test tests::nested_parentheses_recursion_limit_is_safely_rejected ... ok
+test tests::typed_barrier_kernel_parses_lowers_and_verifies ... ok
+test tests::typed_literals_parentheses_and_all_operators_lower_and_verify ... ok
+test tests::structured_if_builds_verified_effect_join_cfg_deterministically ... ok
+test tests::large_whitespace_input_lexer_allocation_is_bounded ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/source_execution.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/source_execution-8cfa09aca4186ee1)
+
+running 5 tests
+test source_elementwise_add_matches_cpu_and_has_exact_canonical_bytes ... ok
+test source_guarded_elementwise_add_preserves_tail_canary ... ok
+test source_workgroup_reduce4_matches_cpu_with_deterministic_bytes ... ok
+test source_for_loop_reduction_is_deterministic_and_fuel_bounded ... ok
+test source_software_tiled_matrix_matches_independent_cpu_result ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_fuzz-13c4276e076a1bed)
+
+running 5 tests
+test targets::wire_oracle::tests::ir_oracle_rejects_bad_fixed_header_without_decoding_records ... ok
+test targets::wire_oracle::tests::kernel_image_oracle_checks_exact_section_lengths ... ok
+test engine::tests::iteration_budget_includes_initial_corpus_and_deduplicates_it ... ok
+test corpus::tests::loader_rejects_stale_sidecar_hashes ... ok
+test corpus::tests::loader_reads_payloads_and_ignores_sidecar_metadata ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/kyanite_fuzz.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_fuzz-65ee798029fd1eb2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_inference_plan-bc6d8d72e05c2130)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/components.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/components-4804c360cd3852af)
+
+running 6 tests
+test missing_duplicate_and_cycle_dependencies_are_structured ... ok
+test replacement_policy_installs_without_core_changes ... ok
+test failed_reconfiguration_rolls_back_and_restores_previous_plan ... ok
+test activation_deactivation_and_reinstall_are_clean ... ok
+test context_invalidation_is_precise_and_transitive ... ok
+test deterministic_resolution_ignores_registration_order ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/model_check.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/model_check-878619445b1b0471)
+
+running 3 tests
+test event_identifiers_do_not_supply_ordering ... ok
+test recomputation_dependency_mutations_match_reference_explorer ... ok
+test exhaustive_small_plans_match_independent_schedule_explorer ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/planner.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/planner-4744bcd101a7184e)
+
+running 15 tests
+test mutable_access_is_rejected_until_versioning_and_writeback_exist ... ok
+test impossible_quality_and_capacity_are_structured ... ok
+test fully_resident_plan_has_no_transfers ... ok
+test failed_partial_recompute_is_rolled_back_before_transfer_fallback ... ok
+test recomputation_wins_or_loses_by_explicit_modeled_cost ... ok
+test verifier_rejects_id_favorable_but_unordered_recompute_reader_eviction ... ok
+test two_buffers_create_prefetch_overlap_opportunity ... ok
+test recomputation_chains_and_fanout_record_every_input_reader ... ok
+test verifier_rejects_duplicate_async_completion_tickets ... ok
+test a_failed_attempt_cannot_affect_the_next_deterministic_plan ... ok
+test zero_slack_recompute_does_not_overwrite_its_input ... ok
+test forced_streaming_reuses_capacity_safely ... ok
+test verifier_rejects_adversarial_mutations ... ok
+test serialized_plans_are_byte_identical ... ok
+test synthetic_eight_gib_class_twenty_seven_billion_parameter_scale_is_data_only ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_ir-7ab2e582081e81f2)
+
+running 27 tests
+test codec::tests::decoder_reverifies_semantic_invariants ... ok
+test codec::tests::canonicalization_ignores_block_storage_order ... ok
+test codec::tests::empty_module_has_a_fixed_golden_encoding ... ok
+test codec::tests::canonicalization_removes_arbitrary_serialized_ids ... ok
+test codec::tests::impossible_counts_are_rejected_before_reservation ... ok
+test codec::tests::decoder_rejects_version_trailing_data_and_limits ... ok
+test codec::tests::populated_module_has_an_independently_written_golden_encoding ... ok
+test codec::tests::workgroup_object_has_an_independent_v3_golden_encoding ... ok
+test codec::tests::round_trip_is_canonically_idempotent ... ok
+test interpreter::tests::empty_multidimensional_binding_needs_no_addressable_span ... ok
+test interpreter::tests::race_history_preserves_writers_and_all_readers ... ok
+test codec::tests::encoder_rejects_content_the_decoder_can_never_accept ... ok
+test tests::aggregate_workgroup_resource_overflow_is_rejected ... ok
+test tests::invalid_workgroup_layout_is_rejected ... ok
+test tests::entry_rejects_unbound_scalar_arguments ... ok
+test interpreter::tests::float_results_canonicalize_nan_and_preserve_signed_zero ... ok
+test tests::missing_workgroup_object_never_panics_with_empty_results ... ok
+test tests::malformed_effectful_result_lists_never_verify ... ok
+test tests::numeric_binary_operation_remains_valid ... ok
+test tests::requirements_are_inferred_from_verified_semantics ... ok
+test tests::ordering_comparison_rejects_boolean_operands ... ok
+test tests::terminator_cannot_use_a_value_defined_in_its_successor ... ok
+test codec::tests::workgroup_objects_and_operations_round_trip_canonically ... ok
+test tests::workgroup_memory_is_typed_and_effect_ordered ... ok
+test tests::verifies_a_minimal_well_typed_kernel ... ok
+test codec::tests::deep_cfg_canonicalization_uses_no_recursion ... ok
+test codec::tests::arbitrary_bytes_never_panic ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/interpreter.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/interpreter-c033d043b215f095)
+
+running 8 tests
+test cyclic_cfg_is_bounded_by_fuel ... ok
+test descriptor_and_scalar_mismatches_are_structured_errors ... ok
+test integer_overflow_is_a_defined_trap ... ok
+test aliased_input_and_output_share_one_allocation ... ok
+test guarded_tail_does_not_touch_output_canary ... ok
+test workgroup_operations_are_rejected_before_execution ... ok
+test out_of_bounds_access_is_diagnosed ... ok
+test elementwise_add_matches_independent_cpu_loop ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/matrix_tile.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/matrix_tile-f2e86a5356ee5285)
+
+running 2 tests
+test verified_matrix_tile_has_deterministic_canonical_bytes ... ok
+test software_tiled_matrix_multiply_matches_reference_with_strides ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reduction.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/reduction-9736e9d0a44a69b4)
+
+running 3 tests
+test reduction_rejects_an_undersized_input_transactionally ... ok
+test tree_reduction_matches_independent_reference ... ok
+test reduction_is_deterministic_for_identical_inputs ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workgroup_interpreter.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/workgroup_interpreter-38e316254a368d3c)
+
+running 5 tests
+test distinct_divergent_barrier_sites_do_not_merge ... ok
+test conflicting_workgroup_writes_are_diagnosed ... ok
+test divergent_barrier_is_a_transactional_error ... ok
+test barrier_publishes_initialized_workgroup_memory ... ok
+test late_fuel_failure_rolls_back_global_stores ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_kernel_image-e255a7bbf2e68a3a)
+
+running 7 tests
+test tests::decoder_enforces_limits_before_allocating ... ok
+test tests::decoder_rejects_truncation_trailing_data_and_unknown_version ... ok
+test tests::encoding_is_deterministic_and_round_trips ... ok
+test tests::invalid_and_overlapping_relocations_are_rejected ... ok
+test tests::opaque_metadata_round_trips_and_is_bounded ... ok
+test tests::rejects_incomplete_images ... ok
+test tests::relocations_are_canonical_and_round_trip ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_kernels-1f0435677caffd23)
+
+running 5 tests
+test tests::bringup_steps_are_contiguous_from_one ... ok
+test tests::catalog_names_are_unique_and_sorted ... ok
+test tests::catalog_names_match_their_source ... ok
+test tests::catalog_entries_parse_and_verify ... ok
+test tests::bringup_family_compiles_and_estimates_on_gfx1032 ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/workgroup_sum.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/workgroup_sum-01cd8d559704ebff)
+
+running 4 tests
+test xor_reference_preserves_high_bits_and_rejects_floats ... ok
+test xor_precedence_and_association_are_explicit ... ok
+test missing_read_before_overwrite_barrier_is_a_race_not_a_pass ... ok
+test six_stage_sum_matches_snapshot_reference_across_groups_and_rounding ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_linux_kfd-834ccb00ed470d9b)
+
+running 117 tests
+test completion::tests::abi_image_keeps_value_and_mailbox_distinct ... ok
+test completion::tests::dropping_in_flight_signal_quarantines_its_slot ... ok
+test completion::tests::dropping_unsubmitted_signal_returns_its_slot ... ok
+test completion::tests::event_creation_failure_returns_the_reserved_slot ... ok
+test completion::tests::in_flight_signal_cannot_close_until_value_reaches_zero ... ok
+test completion::tests::inherited_pool_rejects_creation_before_touching_signal_memory ... ok
+test completion::tests::initialization_failure_destroys_event_and_returns_slot ... ok
+test completion::tests::initialization_rollback_failure_retains_event_and_slot_for_retry ... ok
+test completion::tests::oversized_slot_count_is_rejected_before_allocation ... ok
+test completion::tests::pool_close_requires_all_signal_owners_to_close ... ok
+test completion::tests::pool_is_bounded_and_reuses_closed_slots ... ok
+test dispatch::tests::aql_packet_index_doorbell_requires_an_eight_byte_store ... ok
+test dispatch::tests::atomic_views_reject_null_and_misaligned_addresses ... ok
+test dispatch::tests::body_staging_preserves_first_atomic_dword_and_publication_replaces_it_once ... ok
+test completion::tests::public_pool_construction_rejects_foreign_event_session_before_allocation ... ok
+test dispatch::tests::composite_close_releases_queue_before_storage ... ok
+test dispatch::tests::initialization_uses_atomic_invalid_dwords_and_zeroes_indices ... ok
+test dispatch::tests::closed_data_buffer_is_rejected_and_returns_every_uncommitted_owner ... ok
+test dispatch::tests::indeterminate_queue_creation_retains_storage_even_on_drop ... ok
+test dispatch::tests::foreign_data_buffer_is_rejected_and_returns_every_uncommitted_owner ... ok
+test dispatch::tests::queue_close_failure_retains_storage_and_retries_in_order ... ok
+test dispatch::tests::missing_kernarg_rejection_returns_every_uncommitted_owner ... ok
+test dispatch::tests::queue_indices_round_trip_through_little_endian_atomics ... ok
+test dispatch::tests::queue_creation_recovery_retains_storage_until_destroy_succeeds ... ok
+test memory::tests::alloc_copyout_failure_with_nonzero_partial_handle_is_indeterminate ... ok
+test dispatch::tests::submitted_kernarg_is_retained_until_completion_and_returned ... ok
+test memory::tests::allocation_and_free_errno_preserve_operation_and_retry_ownership ... ok
+test memory::tests::batch_argument_validation_is_structured ... ok
+test memory::tests::backward_errno_progress_on_retry_is_forwarded_and_blocks_free ... ok
+test memory::tests::allocation_copyout_fault_retains_reservation_and_quarantines_session ... ok
+test memory::tests::alloc_copyout_failure_without_handle_is_indeterminate ... ok
+test memory::tests::closed_session_is_rejected_before_ioctl ... ok
+test memory::tests::completed_prefix_errno_rolls_back_full_array ... ok
+test memory::tests::completed_unmap_prefix_retries_post_processing_at_length_cursor ... ok
+test memory::tests::data_buffer_is_zeroed_bounded_and_explicitly_revertible ... ok
+test memory::tests::dgpu_event_page_uses_coherent_uncached_gtt_and_runtime_cleanup ... ok
+test memory::tests::indeterminate_event_page_remains_pinned_on_drop ... ok
+test memory::tests::invalid_memory_context_is_rejected ... ok
+test memory::tests::direct_kfd_allocates_only_native_executable_with_executable_provenance ... ok
+test memory::tests::dont_fork_failure_releases_host_mapping_before_freeing_handle ... ok
+test memory::tests::dont_fork_retry_does_not_repeat_the_render_mapping ... ok
+test memory::tests::host_mapping_uses_exact_reserved_range_and_releases_it ... ok
+test memory::tests::host_release_failure_blocks_free_and_remains_retryable ... ok
+test memory::tests::direct_kfd_rejects_non_silicon_executable_before_boundary_effects ... ok
+test memory::tests::installed_event_page_rejects_cleanup_and_remains_pinned_on_drop ... ok
+test memory::tests::invalid_gpu_identity_and_process_mismatch_precede_ioctl_effects ... ok
+test memory::tests::kernarg_allocation_is_exact_kernel_bound_and_explicitly_revertible ... ok
+test memory::tests::known_staged_handle_cleanup_failure_retains_retry_ownership ... ok
+test memory::tests::linux_request_validation_precedes_reservation_and_ioctl ... ok
+test memory::tests::map_copyout_failure_poisoning_retains_allocation_without_freeing ... ok
+test memory::tests::ordinary_allocation_failure_releases_the_reservation ... ok
+test memory::tests::render_mapping_failure_frees_kfd_handle_and_releases_reservation ... ok
+test memory::tests::partial_map_errno_rolls_back_only_the_kernel_reported_prefix ... ok
+test memory::tests::partial_unmap_retries_full_array_at_cumulative_cursor ... ok
+test memory::tests::queue_auxiliary_invalid_geometry_and_overflow_precede_effects ... ok
+test queue::tests::encoded_kfd_mmap_offset_preserves_high_type_bits ... ok
+test memory::tests::queue_auxiliary_regions_have_exact_distinct_bos_and_reverse_cleanup ... ok
+test memory::tests::queue_partial_activation_preserves_retryable_reverse_rollback ... ok
+test queue::tests::queue_context_derives_checked_process_slice_geometry ... ok
+test memory::tests::queue_storage_derives_geometry_without_aql_double_map_flag ... ok
+test queue::tests::real_create_queue_on_dev_null_preserves_enotty ... ok
+test memory::tests::real_memory_ioctl_on_dev_null_preserves_enotty ... ok
+test queue::tests::wrong_mapping_type_gpu_and_value_range_are_rejected_before_mmap ... ok
+test memory::tests::reservation_failure_precedes_all_kernel_effects ... ok
+test memory::tests::short_success_is_a_protocol_failure_not_false_completion ... ok
+test memory::tests::successful_transaction_uses_exact_arguments_and_reverse_cleanup ... ok
+test memory::tests::unmap_copyout_failure_poisoning_blocks_free ... ok
+test memory::tests::zero_handle_success_is_a_protocol_error_and_releases_reservation ... ok
+test signal::tests::event_page_from_another_vm_session_is_rejected_before_ioctl ... ok
+test queue::tests::create_copyout_fault_quarantines_the_session ... ok
+test queue::tests::create_errno_has_no_mapping_or_cleanup_effect ... ok
+test queue::tests::create_map_close_translate_exact_kfd_arguments_and_offsets ... ok
+test queue::tests::malformed_returned_doorbell_is_destroyed_before_error ... ok
+test queue::tests::map_failure_destroys_queue_and_destroy_failure_remains_retryable ... ok
+test signal::tests::out_of_range_event_slot_destroys_known_event ... ok
+test signal::tests::wait_age_is_carried_into_the_next_ioctl ... ok
+test tests::compatible_abi_accepts_the_pinned_minimum_and_newer_minor ... ok
+test memory::tests::out_of_range_errno_progress_is_forwarded_to_runtime_validation ... ok
+test signal::tests::closed_and_wrong_process_sessions_fail_before_ioctl ... ok
+test signal::tests::create_copyout_fault_quarantines_signal_creation ... ok
+test signal::tests::create_operate_wait_and_destroy_use_exact_capability_and_arguments ... ok
+test signal::tests::destroy_errno_retains_capability_for_retry ... ok
+test tests::impossible_negative_drm_descriptor_is_a_structured_conversion_failure ... ok
+test signal::tests::destroy_ioctl_is_process_affine_while_session_descriptor_close_is_not ... ok
+test tests::incompatible_abi_is_structured_for_major_and_minor_mismatches ... ok
+test queue::tests::closed_wrong_process_and_wrong_gpu_fail_before_ioctl ... ok
+test signal::tests::event_page_handle_is_installed_once_and_then_retained_by_events ... ok
+test signal::tests::first_create_errno_quarantines_page_installation_and_preserves_errno ... ok
+test signal::tests::kernel_eio_fail_result_translates_to_semantic_wait_failure ... ok
+test signal::tests::real_create_event_on_dev_null_preserves_enotty ... ok
+test queue::tests::priority_classes_map_to_pinned_kfd_values ... ok
+test memory::tests::queue_storage_rejects_geometry_before_any_boundary_effect ... ok
+test signal::tests::wait_errno_preserves_age_and_capability_for_retry ... ok
+test tests::dev_null_rejects_the_real_kfd_version_ioctl_with_enotty ... ok
+test tests::missing_explicit_path_is_a_structured_open_failure ... ok
+test tests::explicit_vm_close_releases_both_files_and_reclose_is_a_no_op ... ok
+test tests::topology_derived_vm_context_preserves_identity_and_generation ... ok
+test tests::failed_negotiation_closes_the_owned_descriptor ... ok
+test tests::vm_context_rejects_missing_snapshot_node_or_render_minor ... ok
+test tests::vm_context_rejects_ambiguous_capability_selection ... ok
+test tests::inherited_kfd_device_is_rejected_before_render_open_or_ioctl ... ok
+test tests::inherited_vm_session_reports_process_mismatch_but_can_still_close ... ok
+test topology::tests::discovery_is_sorted_typed_and_skips_cpu_nodes ... ok
+test topology::tests::concurrent_generation_change_rejects_the_snapshot ... ok
+test tests::injected_acquire_failure_closes_both_opened_files ... ok
+test tests::injected_query_error_is_preserved_as_a_structured_get_version_failure ... ok
+test topology::tests::generic_selection_rejects_zero_or_multiple_matching_capabilities ... ok
+test virtual_memory::tests::fixed_mapping_arguments_reject_zero ... ok
+test topology::tests::filesystem_source_rejects_unexpected_node_entry_names ... ok
+test topology::tests::malformed_duplicate_and_missing_properties_are_structured ... ok
+test tests::injected_acquire_keeps_both_files_owned_until_the_vm_session_drops ... ok
+test tests::injected_query_opens_an_explicit_path_and_records_its_abi ... ok
+test tests::injected_query_rejects_an_old_kernel_before_returning_a_device ... ok
+test tests::missing_explicit_render_node_is_a_structured_open_failure ... ok
+test tests::real_acquire_on_dev_null_returns_enotty ... ok
+test tests::staged_kfd_device_closes_idempotently_and_cannot_acquire_afterward ... ok
+test tests::vm_session_retains_topology_generation_for_audit_and_invalidation ... ok
+
+test result: ok. 117 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_linux_uapi-45d91649a5f3ecad)
+
+running 6 tests
+test tests::acquire_vm_layout_matches_pinned_linux_header ... ok
+test tests::event_layouts_match_pinned_linux_header ... ok
+test tests::ioctl_requests_match_independent_c_header_oracle ... ok
+test tests::memory_layouts_match_pinned_linux_header ... ok
+test tests::pinned_version_compatibility_is_explicit ... ok
+test tests::queue_layout_matches_pinned_linux_header ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_model_format-97df47a5e27fdc62)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/adversarial.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/adversarial-5d45a8f89fcddf2e)
+
+running 20 tests
+test test_adversarial_index_cumulative_metadata_limit_rejected ... ok
+test test_adversarial_index_empty_shard_string_rejected ... ok
+test test_adversarial_byte_count_overflow_rejected ... ok
+test test_adversarial_gap_at_beginning_rejected ... ok
+test test_adversarial_gap_before_empty_tensor_rejected ... ok
+test test_adversarial_gap_between_tensors_rejected ... ok
+test test_adversarial_index_entry_count_limit_rejected ... ok
+test test_adversarial_index_missing_weight_map_rejected ... ok
+test test_adversarial_index_nesting_depth_limit_rejected ... ok
+test test_adversarial_index_size_limit_rejected ... ok
+test test_adversarial_index_string_length_limit_rejected ... ok
+test test_adversarial_misaligned_offset_rejected ... ok
+test test_adversarial_out_of_bounds_span_rejected ... ok
+test test_adversarial_overlapping_spans_rejected ... ok
+test test_adversarial_shape_overflow_rejected ... ok
+test test_adversarial_reversed_offsets_rejected ... ok
+test test_manifest_try_new_overflow_returns_structured_error_without_panic ... ok
+test test_adversarial_trailing_payload_bytes_rejected ... ok
+test test_safetensors_allows_unaligned_payload_offsets_by_default ... ok
+test test_adversarial_shard_changed_during_read_detected ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/deterministic_identity.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/deterministic_identity-ccc286c8f7b78782)
+
+running 4 tests
+test test_length_prefixed_encoding_prevents_delimiter_collision ... ok
+test test_deterministic_identity_across_insertion_orders ... ok
+test test_identity_changes_on_any_field_perturbation ... ok
+test test_deterministic_identity_from_file_loaders ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/disk_storage.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/disk_storage-38c27f53234e371d)
+
+running 2 tests
+test test_disk_storage_rejects_path_traversal ... ok
+test test_disk_storage_single_file_load_and_slice ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/external_oracle.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/external_oracle-254036d7fa6b64f9)
+
+running 2 tests
+test test_kyanite_loads_official_safetensors_serialized ... ok
+test test_oracle_deserializes_our_format ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fuzz_smoke.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/fuzz_smoke-12c560c32f9b771e)
+
+running 4 tests
+test test_fuzz_smoke_multi_shard_loader_never_panic ... ok
+test test_fuzz_smoke_header_mutations_never_panic ... ok
+test test_fuzz_smoke_shard_index_mutations_never_panic ... ok
+test test_fuzz_smoke_manifest_construction_never_panic ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/golden_fixtures.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/golden_fixtures-cc875792478b3a94)
+
+running 15 tests
+test test_rejects_duplicate_metadata_key ... ok
+test test_rejects_duplicate_tensor_name ... ok
+test test_rejects_header_too_large ... ok
+test test_rejects_inconsistent_tensor_size ... ok
+test test_rejects_non_string_metadata_value ... ok
+test test_rejects_misaligned_offset ... ok
+test test_explicit_close_prevents_read ... ok
+test test_rejects_overlapping_tensor_spans ... ok
+test test_rejects_trailing_data_after_buffer ... ok
+test test_rejects_trailing_non_whitespace_in_header ... ok
+test test_rejects_span_out_of_range ... ok
+test test_rejects_unsupported_dtype ... ok
+test test_valid_multi_tensor_with_metadata_and_padding ... ok
+test test_valid_minimal_single_tensor ... ok
+test test_valid_scalar_and_empty_tensors ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lifecycle.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/lifecycle-f2802614eb5cd9b1)
+
+running 10 tests
+test test_deterministic_resolution_order ... ok
+test test_missing_and_duplicate_providers ... ok
+test test_expected_identity_mismatch_fails_activation ... ok
+test test_backend_unregister_failure_poisons_runtime ... ok
+test test_backend_register_failure_aborts_activation_and_rolls_back ... ok
+test test_irrelevant_context_change_preserves_instance ... ok
+test test_partial_failure_rollback ... ok
+test test_relevant_file_identity_change_invalidates_and_restarts ... ok
+test test_transitive_dependant_restarts_on_reconcile ... ok
+test test_install_uninstall_reinstall ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/multi_shard.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/multi_shard-17151f708ab2160b)
+
+running 7 tests
+test test_sharded_rejects_duplicate_in_index ... ok
+test test_sharded_rejects_missing_shard_file ... ok
+test test_sharded_rejects_missing_tensor_in_shard ... ok
+test test_sharded_rejects_orphan_tensor ... ok
+test test_sharded_rejects_total_size_mismatch ... ok
+test test_sharded_rejects_tensor_shard_mismatch ... ok
+test test_valid_multi_shard_loading ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/proptest_property.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/proptest_property-86da4a14a577fa2b)
+
+running 5 tests
+test arbitrary_manifest_construction_never_panic ... ok
+test small_arbitrary_bytes_never_panic ... ok
+test valid_generated_headers_roundtrip ... ok
+test arbitrary_index_json_never_panic ... ok
+test arbitrary_bytes_never_panic ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_runtime-c31e2e39663f537e)
+
+running 64 tests
+test aql::tests::accepts_dimension_and_integer_boundaries ... ok
+test aql::tests::offset_constants_describe_exact_64_byte_layout ... ok
+test aql::tests::checks_nonzero_kernarg_alignment_but_accepts_null ... ok
+test aql::tests::publication_word_is_separate_and_encodes_setup_and_controls ... ok
+test aql::tests::rejects_dimensions_outside_one_through_three ... ok
+test aql::tests::invalid_packet_encoding_matches_byte_golden ... ok
+test aql::tests::rejects_grid_smaller_than_workgroup ... ok
+test aql::tests::rejects_non_unit_inactive_dimensions ... ok
+test dispatch::tests::doorbell_failure_retries_only_notification ... ok
+test aql::tests::rejects_zero_extents_on_every_axis ... ok
+test dispatch::tests::read_ahead_and_index_overflow_are_structured ... ok
+test dispatch::tests::precommit_failures_retry_the_same_slot ... ok
+test dispatch::tests::invalid_configuration_and_full_queue_have_no_writes ... ok
+test dispatch::tests::submission_order_slot_selection_and_indices_are_exact ... ok
+test executable::contract_tests::executable_required_workgroup_is_enforced_before_packet_building ... ok
+test dispatch::tests::write_index_failure_blocks_then_resumes_exact_phase ... ok
+test executable::contract_tests::explicit_text_alignment_pads_actual_addresses_and_rejects_overflow ... ok
+test executable::contract_tests::inconsistent_contract_silicon_classification_is_rejected ... ok
+test executable::contract_tests::inconsistent_contract_target_identity_is_rejected ... ok
+test executable::contract_tests::mismatched_target_is_rejected_before_executable_construction ... ok
+test executable::contract_tests::verification_delegates_target_rules_without_runtime_target_knowledge ... ok
+test memory::tests::allocation_can_be_created_again_after_close ... ok
+test memory::tests::allocation_cleanup_remains_bound_to_its_originating_backend ... ok
+test memory::tests::allocation_close_and_reclose_follow_reverse_effect_order ... ok
+test memory::tests::allocation_failure_cleans_a_staged_recovery_effect ... ok
+test memory::tests::allocation_failure_has_no_rollback_effects ... ok
+test memory::tests::allocation_failure_retains_staged_effect_when_cleanup_fails ... ok
+test memory::tests::backend_owned_allocation_activation_reuses_runtime_lifecycle ... ok
+test memory::tests::backward_unmap_progress_poisoning_blocks_free_and_further_backend_calls ... ok
+test memory::tests::completed_unmap_prefix_still_retries_post_processing_before_free ... ok
+test memory::tests::drop_is_a_final_cleanup_safety_net ... ok
+test memory::tests::failed_unmap_blocks_free_and_can_be_retried ... ok
+test memory::tests::impossible_map_progress_poisoning_retains_ownership_without_freeing ... ok
+test memory::tests::invalid_backend_activation_rolls_back_unmapped_allocation ... ok
+test memory::tests::indeterminate_allocation_failure_is_not_reported_as_effect_free ... ok
+test memory::tests::invalid_requests_have_no_external_effects ... ok
+test memory::tests::map_failure_frees_the_owned_allocation ... ok
+test memory::tests::map_post_processing_failure_rolls_back_all_processed_devices ... ok
+test memory::tests::partial_map_failure_unmaps_only_the_processed_prefix_before_free ... ok
+test memory::tests::partial_rollback_retries_the_same_prefix_from_its_cumulative_cursor ... ok
+test memory::tests::preserves_target_neutral_allocation_intent ... ok
+test memory::tests::rollback_failure_retains_both_diagnostics ... ok
+test memory::tests::unactivated_backend_allocation_has_a_drop_cleanup_safety_net ... ok
+test queue::tests::create_close_and_reclose_reverse_effects ... ok
+test queue::tests::create_failure_has_no_rollback_effects ... ok
+test queue::tests::doorbell_map_failure_destroys_queue ... ok
+test queue::tests::drop_is_a_final_cleanup_safety_net ... ok
+test queue::tests::failed_destroy_retains_queue_and_is_retryable ... ok
+test queue::tests::failed_unmap_blocks_destroy_and_is_retryable ... ok
+test queue::tests::queue_can_be_created_again_after_close ... ok
+test queue::tests::known_create_effect_is_rolled_back_and_indeterminate_effect_is_not_guessed ... ok
+test queue::tests::rejects_invalid_requests_without_effects ... ok
+test queue::tests::rollback_failure_retains_queue_for_retry ... ok
+test queue::tests::validates_limits_and_context_save_relationships ... ok
+test signal::tests::create_close_reclose_and_reinstall_are_deterministic ... ok
+test signal::tests::destroy_failure_retains_retryable_ownership ... ok
+test signal::tests::create_failure_does_not_destroy_an_unowned_event ... ok
+test signal::tests::drop_is_a_final_cleanup_safety_net ... ok
+test signal::tests::event_operations_remain_bound_to_the_originating_backend ... ok
+test signal::tests::finite_waits_report_completion_and_timeout ... ok
+test signal::tests::indeterminate_create_is_distinct_and_has_no_guessed_cleanup ... ok
+test signal::tests::known_create_effect_is_destroyed_or_retained_for_retry ... ok
+test signal::tests::set_reset_and_closed_state_are_explicit ... ok
+test signal::tests::unbounded_and_failed_waits_are_rejected ... ok
+
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_target_api-270cf02644999cb2)
+
+running 3 tests
+test tests::legality_accepts_requirements_within_every_limit ... ok
+test tests::legality_reports_the_first_unsupported_requirement_stably ... ok
+test tests::target_ids_are_validated_at_construction ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/machine.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/machine-8f3ec598ff2b06c5)
+
+running 6 tests
+test structural_verifier_rejects_edge_shape_and_missing_definitions ... ok
+test structural_verifier_rejects_use_before_definition ... ok
+test scheduler_preserves_memory_and_barrier_ordering ... ok
+test scheduler_detects_overlapping_physical_tuple_units ... ok
+test scheduler_moves_only_dependency_independent_instructions ... ok
+test fixed_point_liveness_substitutes_loop_and_join_parameters ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_target_gfx1032-a8394dbf42bab695)
+
+running 68 tests
+test abi::tests::typed_packing_rejects_count_type_and_rank_mismatches ... ok
+test abi::tests::typed_packing_matches_the_declared_little_endian_layout ... ok
+test abi::tests::decoder_rejects_noncanonical_layout_and_trailing_data ... ok
+test abi::tests::layout_is_aligned_and_metadata_is_deterministic ... ok
+test execution::tests::rejects_descriptor_without_kernarg_user_sgprs ... ok
+test execution::tests::rejects_invalid_alignment_and_unencodable_workgroup_metadata ... ok
+test execution::tests::rejects_non_native_text_terminator ... ok
+test execution::tests::rejects_target_mismatch_before_parsing_descriptor ... ok
+test execution::tests::rejects_truncated_or_inconsistent_kernarg_metadata ... ok
+test execution::tests::validates_native_descriptor_and_text ... ok
+test machine::tests::branch_displacement_uses_twos_complement_bits ... ok
+test machine::tests::memory_operand_fields_are_checked_before_encoding ... ok
+test lower::tests::unsupported_scalar_kernarg_kind_is_rejected ... ok
+test lower::tests::scalar_u64_kernarg_lands_in_a_vgpr_pair ... ok
+test lower::tests::scalar_f32_kernarg_loads_and_broadcasts_before_use ... ok
+test lower::tests::u64_xor_lowers_both_halves_without_truncating ... ok
+test machine::tests::program_encoding_is_ordered_and_deterministic ... ok
+test machine::tests::public_isa_golden_bytes_match_scalar_global_and_lds_memory_encodings ... ok
+test machine::tests::public_isa_golden_words_match_register_only_sop_encodings ... ok
+test machine::tests::public_isa_golden_bytes_match_u64_address_arithmetic_encodings ... ok
+test machine::tests::public_isa_golden_words_match_inline_and_mixed_source_encodings ... ok
+test machine::tests::public_isa_golden_words_match_register_only_vop2_encodings ... ok
+test machine::tests::public_isa_golden_words_match_scalar_compare_and_branch_encodings ... ok
+test machine::tests::public_isa_golden_words_match_sopp_encodings ... ok
+test machine::tests::sgpr_constructor_does_not_alias_special_source_encodings ... ok
+test machine::tests::unavailable_inline_constants_are_structured_errors ... ok
+test machine::tests::vop2_register_fields_accept_full_vgpr_width_without_truncation ... ok
+test machine::tests::wait_counter_widths_are_checked ... ok
+test machine::tests::xor_encoding_matches_independent_llvm_gfx1032_oracle ... ok
+test occupancy::tests::empty_kernel_is_architecturally_limited ... ok
+test occupancy::tests::empty_workgroup_is_rejected ... ok
+test occupancy::tests::full_register_file_gives_one_wave_per_simd ... ok
+test occupancy::tests::group_segment_over_the_documented_limit_is_rejected ... ok
+test occupancy::tests::lds_heavy_kernel_is_lds_limited ... ok
+test occupancy::tests::lds_limit_interacts_with_multivave_workgroups ... ok
+test occupancy::tests::residency_rounds_down_to_whole_workgroups ... ok
+test occupancy::tests::vgpr_count_over_the_documented_limit_is_rejected ... ok
+test occupancy::tests::vgpr_heavy_kernel_is_register_limited ... ok
+test occupancy::tests::workgroup_larger_than_slot_count_is_rejected ... ok
+test occupancy::tests::workgroup_needing_more_waves_than_slots_reports_insufficient_resources ... ok
+test occupancy::tests::wrong_descriptor_length_is_rejected ... ok
+test program::tests::duplicate_and_unbound_labels_are_structured_errors ... ok
+test occupancy::tests::properties_hold_across_the_input_space ... ok
+test program::tests::forward_and_backward_labels_resolve_from_following_instruction ... ok
+test program::tests::labels_and_branches_use_dword_offsets_for_wide_instructions ... ok
+test program::tests::scalar_condition_branches_share_checked_label_resolution ... ok
+test queue::tests::actual_topology_provides_queue_geometry_without_os_reads ... ok
+test queue::tests::invalid_and_unsupported_contexts_are_explicit ... ok
+test schedule::tests::insertion_drains_a_chained_dependency_between_loads ... ok
+test schedule::tests::insertion_drains_only_the_barrier_domain ... ok
+test schedule::tests::insertion_drains_only_before_the_first_consumer ... ok
+test schedule::tests::insertion_rejects_control_flow ... ok
+test schedule::tests::insertion_overlaps_independent_memory_operations ... ok
+test schedule::tests::lds_write_requires_explicit_drain_before_barrier ... ok
+test schedule::tests::insertion_drains_smem_kernarg_before_vector_broadcast ... ok
+test schedule::tests::insertion_preserves_existing_waits ... ok
+test schedule::tests::insertion_waits_for_outstanding_domains_before_endpgm ... ok
+test schedule::tests::scalar_and_lds_domains_are_not_conflated_with_vmem ... ok
+test schedule::tests::vector_memory_result_cannot_be_overwritten_before_wait ... ok
+test tests::descriptor_layout_matches_amdhsa_offsets ... ok
+test schedule::tests::vector_memory_result_requires_an_explicit_zero_wait ... ok
+test tests::matrix_capabilities_separate_hardware_evidence_from_implementation ... ok
+test tests::legality_is_checked_before_lowering ... ok
+test tests::empty_kernels_compile_to_sorted_oracle_checked_images ... ok
+test program::tests::oversized_branch_is_rejected_instead_of_truncated ... ok
+test tests::occupancy_estimator_accepts_real_compiled_descriptors ... ok
+test tests::straight_line_elementwise_add_compiles_deterministically ... ok
+test tests::software_tiled_matrix_program_compiles_deterministically ... ok
+
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/phase4_foundation.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/phase4_foundation-620fb65f45388b97)
+
+running 9 tests
+test fixed_physical_tuples_require_target_alignment ... ok
+test illegal_tuple_reserved_collision_and_encoding_overflow_are_distinct ... ok
+test allocated_register_indices_feed_independently_pinned_encoding ... ok
+test block_parameter_edges_survive_allocate_schedule_reverification ... ok
+test virtual_values_interfere_with_fixed_physical_definitions ... ok
+test virtual_values_interfere_with_fixed_physical_uses ... ok
+test pressure_boundary_is_exact_and_spilling_is_explicitly_unsupported ... ok
+test tuples_are_aligned_skip_reserved_units_and_output_reverifies ... ok
+test independent_lifetimes_reuse_one_vgpr ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/lib.rs (/home/alex/TheRock-qwen38/engine-workspace/build/kyanite-host/debug/deps/kyanite_target_synthetic-bcada5a0d2d9bc9b)
+
+running 5 tests
+test tests::enforces_compilation_limits ... ok
+test tests::synthetic_target_capabilities_are_explicit_and_host_checked ... ok
+test tests::compiles_arithmetic_to_explicitly_synthetic_artifact ... ok
+test tests::relocation_updates_descriptor_entry_point ... ok
+test tests::compilation_is_byte_for_byte_deterministic ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_bench
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_bringup
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_compiler
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_context
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_dsl
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_fuzz
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_inference_plan
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_ir
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_kernel_image
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_kernels
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_linux_kfd
+
+running 1 test
+test crates/linux-kfd/src/lib.rs - KfdDevice::acquire_vm (line 273) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests kyanite_linux_uapi
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_model_format
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_runtime
+
+running 2 tests
+test crates/runtime/src/memory.rs - memory::GpuAllocation (line 401) - compile fail ... ok
+test crates/runtime/src/signal.rs - signal::SignalEvent (line 189) - compile fail ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests kyanite_target_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_target_gfx1032
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kyanite_target_synthetic
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
