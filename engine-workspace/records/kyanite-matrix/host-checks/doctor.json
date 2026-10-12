@@ -1,0 +1,46 @@
+{
+  "workspace": "/home/alex/TheRock-qwen38/engine-workspace",
+  "kernel": "6.18.55-1-lts",
+  "device_nodes": {
+    "/dev/kfd": {
+      "exists": true,
+      "read_write": true
+    },
+    "/dev/dri/renderD128": {
+      "exists": true,
+      "read_write": true
+    },
+    "/dev/dri/renderD129": {
+      "exists": true,
+      "read_write": true
+    }
+  },
+  "gpu_boundary_accessible": true,
+  "device_identity_verified": false,
+  "inference_tps": null,
+  "note": "Device visibility is not proof of gfx1032 identity or successful dispatch.",
+  "tools": {
+    "cargo": "/home/alex/.cargo/bin/cargo",
+    "rustc": "/home/alex/.cargo/bin/rustc",
+    "cmake": "/usr/bin/cmake",
+    "ninja": "/usr/bin/ninja",
+    "clang++": "/usr/bin/clang++"
+  },
+  "sources": {
+    "kyanite": "083c4e28f834107c6450b06320359d85decf18d0",
+    "llama.cpp": "5ecbe1ac17ec0484c5b44af0bd580cdc9c428ed4"
+  },
+  "models": {
+    "/home/alex/Downloads/Qwen3.8-27B-UD-Q4_K_M.gguf": {
+      "exists": true,
+      "bytes": 16464440224,
+      "sha256_verified_by_doctor": false
+    },
+    "/home/alex/Downloads/Qwen3.8-27B-DFlash2-Q4_K_M.gguf": {
+      "exists": true,
+      "bytes": 1143006752,
+      "sha256_verified_by_doctor": false
+    }
+  },
+  "free_disk_bytes": 5212639232
+}

@@ -1,0 +1,5 @@
+    Checking kyanite-target-gfx1032 v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/target-gfx1032)
+    Checking kyanite-bringup v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/bringup)
+    Checking kyanite-compiler v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/compiler)
+    Checking kyanite-kernels v0.1.0 (/home/alex/TheRock-qwen38/engine-workspace/sources/kyanite/crates/kernels)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.64s

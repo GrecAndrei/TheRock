@@ -63,8 +63,10 @@ dispatcher now owns that mapping/save-area arrangement and passes actual
 no-op, guarded fill and multi-workgroup vector-add, three cycles each. See
 `KYANITE_DISPATCH_PROGRESS.md` for the committed source and evidence, including
 earlier failures. Its six-stage cross-wave LDS reduction also passes the
-guarded physical fixture; see `KYANITE_REDUCTION_PROGRESS.md`. Matrix
-multiplication and model inference in Kyanite remain unproven.
+guarded physical fixture; see `KYANITE_REDUCTION_PROGRESS.md`. A restricted
+K=8 tiled matrix fixture now passes on silicon with padded strides and exact
+readback; see `KYANITE_MATRIX_PROGRESS.md`. General matrix execution, broader
+dispatch stress and model inference in Kyanite remain unproven.
 
 The 15.33 GiB target weights exceed the card's approximately 8 GiB VRAM before
 KV state and drafter storage. Weight residency, transfers, CPU/GPU partitioning,
