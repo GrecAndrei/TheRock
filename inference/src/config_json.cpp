@@ -384,6 +384,7 @@ ModelConfig ModelConfig::from_hf_json_string(const std::string& json_text) {
     if (const auto* v = pick("linear_num_value_heads")) mc.linear_num_value_heads = static_cast<int32_t>(v->as_i64());
     if (const auto* v = pick("linear_value_head_dim")) mc.linear_value_head_dim = static_cast<int32_t>(v->as_i64());
     if (const auto* v = pick("linear_conv_kernel_dim")) mc.linear_conv_kernel_dim = static_cast<int32_t>(v->as_i64(4));
+    if (const auto* v = pick("gdn_tiled_v_heads")) mc.gdn_tiled_v_heads = v->as_bool(false);
 
     // Per-layer schedule
     if (const auto* v = pick("layer_types"); v && v->is_array()) {

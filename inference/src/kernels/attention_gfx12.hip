@@ -14,8 +14,8 @@ using h2_t = __half2;
 using v2f16 = _Float16 __attribute__((ext_vector_type(2)));
 using v2f32 = float __attribute__((ext_vector_type(2)));
 
-__device__ __forceinline__ float silu_f32(float x) {
-    return x / (1.0f + __expf(-x));
+__device__ __forceinline__ float sigmoid_f32(float x) {
+    return 1.0f / (1.0f + __expf(-x));
 }
 
 __device__ __forceinline__ float fdot2_h2(h2_t a, h2_t b, float acc) {
@@ -477,7 +477,7 @@ void gqa_decode_reduce_kernel(const float* __restrict__ scratch,
     float val = (gl > 0.0f) ? (go / gl) : 0.0f;
     if (p.attn_output_gate && gate_src != nullptr) {
         const size_t gate_idx = (static_cast<size_t>(m) * H_q + hq) * (2 * D) + D + d;
-        val *= silu_f32(__half2float(gate_src[gate_idx]));
+        val *= sigmoid_f32(__half2float(gate_src[gate_idx]));
     }
     out[(static_cast<size_t>(m) * H_q + hq) * D + d] = __float2half(val);
 }
@@ -653,7 +653,7 @@ void flash_attention_prefill_kernel(const __half* __restrict__ q_in,
             for (int i = 0; i < ELEMS; ++i) {
                 float val = o_acc[qm][i] * inv_l;
                 if (gp != nullptr) {
-                    val *= silu_f32(__half2float(gp[i]));
+                    val *= sigmoid_f32(__half2float(gp[i]));
                 }
                 dst[i] = __float2half(val);
             }

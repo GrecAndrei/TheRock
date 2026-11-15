@@ -355,6 +355,10 @@ bool run_turn(rxinfer::InferenceEngine& engine,
     state.close_previous_turn = opts.chat_mode;
 
     Utf8StreamPrinter printer;
+    if (opts.chat_mode && opts.think_mode &&
+        tokenizer.token_to_id("<think>") >= 0 && tokenizer.token_to_id("</think>") >= 0) {
+        printer.push("<think>\n");
+    }
     int32_t generated = 0;
     int32_t decode_calls = 0;
     double decode_ms = 0.0;

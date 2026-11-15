@@ -572,8 +572,14 @@ Tokenizer Tokenizer::from_gguf(const std::string& gguf_path) {
             for (uint64_t j = 0; j < n; ++j) token_types.push_back(read_u32_any(et));
         } else if (key == "tokenizer.ggml.bos_token_id") {
             tk.bos_id_ = read_u32_any(vt);
-        } else if (key == "tokenizer.ggml.eos_token_id") {
-            tk.add_eos_id(read_u32_any(vt));
+        } else if (key == "tokenizer.ggml.eos_token_id" || key == "tokenizer.ggml.eot_token_id") {
+            if (vt == 9) {
+                const uint32_t et = read_u32();
+                const uint64_t n = read_u64();
+                for (uint64_t j = 0; j < n; ++j) tk.add_eos_id(read_u32_any(et));
+            } else {
+                tk.add_eos_id(read_u32_any(vt));
+            }
         } else if (key == "tokenizer.ggml.unknown_token_id") {
             tk.unk_id_ = read_u32_any(vt);
         } else {
@@ -1089,6 +1095,8 @@ std::string Tokenizer::format_chatml(const std::string& user_prompt,
         out += "<|im_start|>assistant\n";
         if (!enable_thinking && token_to_id("</think>") >= 0) {
             out += "<think>\n\n</think>\n\n";
+        } else if (enable_thinking && token_to_id("<think>") >= 0 && token_to_id("</think>") >= 0) {
+            out += "<think>\n";
         }
     }
     return out;
@@ -1142,6 +1150,8 @@ std::string Tokenizer::format_chat_turn(const std::string& user_prompt,
     out += "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
     if (!enable_thinking && token_to_id("</think>") >= 0) {
         out += "<think>\n\n</think>\n\n";
+    } else if (enable_thinking && token_to_id("<think>") >= 0 && token_to_id("</think>") >= 0) {
+        out += "<think>\n";
     }
     return out;
 }

@@ -73,6 +73,7 @@ void InferenceEngine::init_arenas() {
     gdn_params_.head_v_dim = c.linear_value_head_dim;
     gdn_params_.conv_kernel_size = c.linear_conv_kernel_dim;
     gdn_params_.rms_norm_eps = c.rms_norm_eps;
+    gdn_params_.tiled_v_heads = c.gdn_tiled_v_heads;
 
     attn_idx_map_.assign(L, -1);
     gdn_idx_map_.assign(L, -1);

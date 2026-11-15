@@ -5,6 +5,7 @@
 #include "rxinfer/common.hpp"
 #include "rxinfer/quant.hpp"
 #include "config_json.hpp"
+#include "gguf_iq_tables.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -361,6 +362,7 @@ std::string serialize_config_json(const ModelConfig& c) {
        << "  \"linear_num_value_heads\": " << c.linear_num_value_heads << ",\n"
        << "  \"linear_value_head_dim\": " << c.linear_value_head_dim << ",\n"
        << "  \"linear_conv_kernel_dim\": " << c.linear_conv_kernel_dim << ",\n"
+       << "  \"gdn_tiled_v_heads\": " << (c.gdn_tiled_v_heads ? "true" : "false") << ",\n"
        << "  \"mtp_num_hidden_layers\": " << c.mtp_num_hidden_layers << ",\n"
        << "  \"layer_types\": [";
     for (size_t i = 0; i < c.layer_types.size(); ++i) {
@@ -801,7 +803,7 @@ ModelWeights load_from_safetensors_dir(const std::string& model_dir,
     return w;
 }
 
-// Minimal GGUF reader supporting F32, F16, BF16, Q4_0, Q8_0 repacking -> R4_GFX12_G64.
+// Minimal GGUF reader supporting F32, F16, BF16, Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, IQ1..IQ4 repacking -> R4_GFX12_G64.
 namespace gguf_detail {
 struct Reader {
     const uint8_t* base;
@@ -840,6 +842,39 @@ struct Reader {
         }
     }
 };
+
+struct MetaVal {
+    uint32_t type = 0;
+    uint64_t u64 = 0;
+    int64_t i64 = 0;
+    double f64 = 0.0;
+    bool bval = false;
+    std::string sval;
+    std::vector<uint32_t> u32_arr;
+    std::vector<bool> bool_arr;
+
+    uint32_t as_u32(uint32_t def = 0) const {
+        if (type == 4 || type == 10 || type == 0 || type == 2) return static_cast<uint32_t>(u64);
+        if (type == 5 || type == 11 || type == 1 || type == 3) return static_cast<uint32_t>(i64);
+        return def;
+    }
+    float as_f32(float def = 0.0f) const {
+        if (type == 6 || type == 12) return static_cast<float>(f64);
+        return def;
+    }
+};
+
+inline uint16_t load_u16(const void* p) {
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+inline uint32_t load_u32(const void* p) {
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
 
 struct GGUFTensor {
     uint32_t n_dims = 0;
@@ -1032,6 +1067,342 @@ void decode_gguf_row(const GGUFTensor& t, int row, float* dst, int cols) {
                 }
             }
         }
+    } else if (t.type == 10) { // Q2_K: 84 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("Q2_K requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 84;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 84;
+            const uint8_t* scales = blk;
+            const uint8_t* q = blk + 16;
+            const float d = fp16_to_f32(load_u16(blk + 80));
+            const float dmin = fp16_to_f32(load_u16(blk + 82));
+            float* y = dst + b * 256;
+            int is = 0;
+            for (int n = 0; n < 256; n += 128) {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j) {
+                    uint8_t sc = scales[is++];
+                    float dl = d * static_cast<float>(sc & 0x0F);
+                    float ml = dmin * static_cast<float>(sc >> 4);
+                    for (int l = 0; l < 16; ++l) {
+                        *y++ = dl * static_cast<float>((q[l] >> shift) & 3) - ml;
+                    }
+                    sc = scales[is++];
+                    dl = d * static_cast<float>(sc & 0x0F);
+                    ml = dmin * static_cast<float>(sc >> 4);
+                    for (int l = 0; l < 16; ++l) {
+                        *y++ = dl * static_cast<float>((q[l + 16] >> shift) & 3) - ml;
+                    }
+                    shift += 2;
+                }
+                q += 32;
+            }
+        }
+    } else if (t.type == 11) { // Q3_K: 110 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("Q3_K requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 110;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 110;
+            const uint8_t* hm = blk;
+            const uint8_t* q = blk + 32;
+            uint32_t aux[4]{};
+            std::memcpy(aux, blk + 96, 12);
+            const uint32_t tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);
+            aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);
+            aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);
+            aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);
+            const float d_all = fp16_to_f32(load_u16(blk + 108));
+            float* y = dst + b * 256;
+            uint8_t m = 1;
+            int is = 0;
+            auto get_sc = [&](int idx) -> int {
+                return static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>((aux[idx >> 2] >> (8 * (idx & 3))) & 0xFFu)));
+            };
+            for (int n = 0; n < 256; n += 128) {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j) {
+                    const float dl0 = d_all * static_cast<float>(get_sc(is++) - 32);
+                    for (int l = 0; l < 16; ++l) {
+                        *y++ = dl0 * static_cast<float>(static_cast<int>((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                    }
+                    const float dl1 = d_all * static_cast<float>(get_sc(is++) - 32);
+                    for (int l = 0; l < 16; ++l) {
+                        *y++ = dl1 * static_cast<float>(static_cast<int>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                    }
+                    shift += 2;
+                    m = static_cast<uint8_t>(m << 1);
+                }
+                q += 32;
+            }
+        }
+    } else if (t.type == 16) { // IQ2_XXS: 66 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ2_XXS requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 66;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 66;
+            const float d = fp16_to_f32(load_u16(blk));
+            float* y = dst + b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint32_t aux0 = load_u32(blk + 2 + 8 * ib32);
+                const uint32_t aux1 = load_u32(blk + 2 + 8 * ib32 + 4);
+                const float db = d * (0.5f + static_cast<float>(aux1 >> 28)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    const uint64_t grid = iq2xxs_grid[(aux0 >> (8 * l)) & 0xFFu];
+                    const uint8_t signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127u];
+                    for (int j = 0; j < 8; ++j) {
+                        const float gval = static_cast<float>((grid >> (8 * j)) & 0xFFu);
+                        y[j] = db * gval * ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                    }
+                    y += 8;
+                }
+            }
+        }
+    } else if (t.type == 17) { // IQ2_XS: 74 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ2_XS requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 74;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 74;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint8_t* qs = blk + 2;
+            const uint8_t* scales = blk + 66;
+            float* y = dst + b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const float db[2] = {
+                    d * (0.5f + static_cast<float>(scales[ib32] & 0x0Fu)) * 0.25f,
+                    d * (0.5f + static_cast<float>(scales[ib32] >> 4)) * 0.25f,
+                };
+                for (int l = 0; l < 4; ++l) {
+                    const uint16_t qval = load_u16(qs + (4 * ib32 + l) * 2);
+                    const uint64_t grid = iq2xs_grid[qval & 511u];
+                    const uint8_t signs = ksigns_iq2xs[qval >> 9];
+                    const float dl = db[l / 2];
+                    for (int j = 0; j < 8; ++j) {
+                        const float gval = static_cast<float>((grid >> (8 * j)) & 0xFFu);
+                        y[j] = dl * gval * ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                    }
+                    y += 8;
+                }
+            }
+        }
+    } else if (t.type == 18) { // IQ3_XXS: 98 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ3_XXS requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 98;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 98;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint8_t* qs = blk + 2;
+            const uint8_t* scales_and_signs = blk + 66;
+            float* y = dst + b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint32_t aux32 = load_u32(scales_and_signs + 4 * ib32);
+                const float db = d * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f;
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127u];
+                    const uint32_t grid1 = iq3xxs_grid[qs[2 * l + 0]];
+                    const uint32_t grid2 = iq3xxs_grid[qs[2 * l + 1]];
+                    for (int j = 0; j < 4; ++j) {
+                        y[j + 0] = db * static_cast<float>((grid1 >> (8 * j)) & 0xFFu) *
+                                   ((signs & kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                        y[j + 4] = db * static_cast<float>((grid2 >> (8 * j)) & 0xFFu) *
+                                   ((signs & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                    }
+                    y += 8;
+                }
+                qs += 8;
+            }
+        }
+    } else if (t.type == 19) { // IQ1_S: 50 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ1_S requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 50;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 50;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint8_t* qs = blk + 2;
+            const uint8_t* qh = blk + 34;
+            float* y = dst + b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const uint16_t qhv = load_u16(qh + 2 * ib);
+                const float dl = d * static_cast<float>(2 * ((qhv >> 12) & 7) + 1);
+                const float delta = (qhv & 0x8000u) ? -kIQ1SDelta : kIQ1SDelta;
+                for (int l = 0; l < 4; ++l) {
+                    const uint64_t grid = iq1s_grid[qs[l] | (((static_cast<uint32_t>(qhv) >> (3 * l)) & 7u) << 8)];
+                    for (int j = 0; j < 8; ++j) {
+                        const int8_t gv = static_cast<int8_t>(static_cast<uint8_t>((grid >> (8 * j)) & 0xFFu));
+                        y[j] = dl * (static_cast<float>(gv) + delta);
+                    }
+                    y += 8;
+                }
+                qs += 4;
+            }
+        }
+    } else if (t.type == 20) { // IQ4_NL: 18 bytes / 32 weights
+        if (cols % 32 != 0) throw std::runtime_error("IQ4_NL requires cols % 32 == 0");
+        const int blocks_per_row = cols / 32;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 18;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 18;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint8_t* qs = blk + 2;
+            float* y = dst + b * 32;
+            for (int j = 0; j < 16; ++j) {
+                y[j + 0] = d * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0Fu]);
+                y[j + 16] = d * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+            }
+        }
+    } else if (t.type == 21) { // IQ3_S: 110 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ3_S requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 110;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 110;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint8_t* qs = blk + 2;
+            const uint8_t* qh = blk + 66;
+            const uint8_t* signs = blk + 74;
+            const uint8_t* scales = blk + 106;
+            float* y = dst + b * 256;
+            for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+                const float db1 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] & 0x0Fu));
+                const float db2 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] >> 4));
+                for (int l = 0; l < 4; ++l) {
+                    const uint32_t grid1 = iq3s_grid[qs[2 * l + 0] | ((static_cast<uint32_t>(qh[0]) << (8 - 2 * l)) & 256u)];
+                    const uint32_t grid2 = iq3s_grid[qs[2 * l + 1] | ((static_cast<uint32_t>(qh[0]) << (7 - 2 * l)) & 256u)];
+                    for (int j = 0; j < 4; ++j) {
+                        y[j + 0] = db1 * static_cast<float>((grid1 >> (8 * j)) & 0xFFu) *
+                                   ((signs[l] & kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                        y[j + 4] = db1 * static_cast<float>((grid2 >> (8 * j)) & 0xFFu) *
+                                   ((signs[l] & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                    }
+                    y += 8;
+                }
+                qs += 8;
+                signs += 4;
+                for (int l = 0; l < 4; ++l) {
+                    const uint32_t grid1 = iq3s_grid[qs[2 * l + 0] | ((static_cast<uint32_t>(qh[1]) << (8 - 2 * l)) & 256u)];
+                    const uint32_t grid2 = iq3s_grid[qs[2 * l + 1] | ((static_cast<uint32_t>(qh[1]) << (7 - 2 * l)) & 256u)];
+                    for (int j = 0; j < 4; ++j) {
+                        y[j + 0] = db2 * static_cast<float>((grid1 >> (8 * j)) & 0xFFu) *
+                                   ((signs[l] & kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                        y[j + 4] = db2 * static_cast<float>((grid2 >> (8 * j)) & 0xFFu) *
+                                   ((signs[l] & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                    }
+                    y += 8;
+                }
+                qh += 2;
+                qs += 8;
+                signs += 4;
+            }
+        }
+    } else if (t.type == 22) { // IQ2_S: 82 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ2_S requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 82;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 82;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint8_t* qs = blk + 2;
+            const uint8_t* signs = qs + 32;
+            const uint8_t* qh = blk + 66;
+            const uint8_t* scales = blk + 74;
+            float* y = dst + b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const float db[2] = {
+                    d * (0.5f + static_cast<float>(scales[ib32] & 0x0Fu)) * 0.25f,
+                    d * (0.5f + static_cast<float>(scales[ib32] >> 4)) * 0.25f,
+                };
+                for (int l = 0; l < 4; ++l) {
+                    const float dl = db[l / 2];
+                    const uint64_t grid = iq2s_grid[qs[l] | ((static_cast<uint32_t>(qh[ib32]) << (8 - 2 * l)) & 0x300u)];
+                    for (int j = 0; j < 8; ++j) {
+                        y[j] = dl * static_cast<float>((grid >> (8 * j)) & 0xFFu) *
+                               ((signs[l] & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                    }
+                    y += 8;
+                }
+                qs += 4;
+                signs += 4;
+            }
+        }
+    } else if (t.type == 23) { // IQ4_XS: 136 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ4_XS requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 136;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 136;
+            const float d = fp16_to_f32(load_u16(blk));
+            const uint16_t scales_h = load_u16(blk + 2);
+            const uint8_t* scales_l = blk + 4;
+            const uint8_t* qs = blk + 8;
+            float* y = dst + b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F) |
+                               (((scales_h >> (2 * ib)) & 3) << 4);
+                const float dl = d * static_cast<float>(ls - 32);
+                for (int j = 0; j < 16; ++j) {
+                    y[j + 0] = dl * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0Fu]);
+                    y[j + 16] = dl * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+                }
+                y += 32;
+                qs += 16;
+            }
+        }
+    } else if (t.type == 29) { // IQ1_M: 56 bytes / 256 weights
+        if (cols % 256 != 0) throw std::runtime_error("IQ1_M requires cols % 256 == 0");
+        const int blocks_per_row = cols / 256;
+        const uint8_t* row_p = t.ptr + static_cast<size_t>(row) * blocks_per_row * 56;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row_p + b * 56;
+            const uint8_t* qs = blk;
+            const uint8_t* qh = blk + 32;
+            const uint16_t sc[4] = {
+                load_u16(blk + 48), load_u16(blk + 50), load_u16(blk + 52), load_u16(blk + 54),
+            };
+            const uint16_t d_bits = static_cast<uint16_t>(
+                (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0u) | ((sc[2] >> 4) & 0x0F00u) | (sc[3] & 0xF000u));
+            const float d = fp16_to_f32(d_bits);
+            float* y = dst + b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const float dl1 = d * static_cast<float>(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+                const float dl2 = d * static_cast<float>(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+                const uint16_t idx[4] = {
+                    static_cast<uint16_t>(qs[0] | ((static_cast<uint16_t>(qh[0]) << 8) & 0x700u)),
+                    static_cast<uint16_t>(qs[1] | ((static_cast<uint16_t>(qh[0]) << 4) & 0x700u)),
+                    static_cast<uint16_t>(qs[2] | ((static_cast<uint16_t>(qh[1]) << 8) & 0x700u)),
+                    static_cast<uint16_t>(qs[3] | ((static_cast<uint16_t>(qh[1]) << 4) & 0x700u)),
+                };
+                const float delta[4] = {
+                    (qh[0] & 0x08u) ? -kIQ1SDelta : kIQ1SDelta,
+                    (qh[0] & 0x80u) ? -kIQ1SDelta : kIQ1SDelta,
+                    (qh[1] & 0x08u) ? -kIQ1SDelta : kIQ1SDelta,
+                    (qh[1] & 0x80u) ? -kIQ1SDelta : kIQ1SDelta,
+                };
+                for (int l = 0; l < 2; ++l) {
+                    const uint64_t grid = iq1s_grid[idx[l]];
+                    for (int j = 0; j < 8; ++j) {
+                        const int8_t gv = static_cast<int8_t>(static_cast<uint8_t>((grid >> (8 * j)) & 0xFFu));
+                        y[j] = dl1 * (static_cast<float>(gv) + delta[l]);
+                    }
+                    y += 8;
+                }
+                for (int l = 2; l < 4; ++l) {
+                    const uint64_t grid = iq1s_grid[idx[l]];
+                    for (int j = 0; j < 8; ++j) {
+                        const int8_t gv = static_cast<int8_t>(static_cast<uint8_t>((grid >> (8 * j)) & 0xFFu));
+                        y[j] = dl2 * (static_cast<float>(gv) + delta[l]);
+                    }
+                    y += 8;
+                }
+                qs += 4;
+                qh += 2;
+            }
+        }
     } else {
         throw std::runtime_error("Unsupported GGUF tensor type: " + std::to_string(t.type));
     }
@@ -1052,58 +1423,106 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
     ModelConfig cfg{};
     uint64_t alignment = 32;
     std::string arch = "llama";
-    uint32_t rope_dim_count = 0;
-
-    auto read_u32_any = [&](uint32_t vt) -> uint32_t {
-        if (vt == 4) return rd.read<uint32_t>();
-        if (vt == 5) return static_cast<uint32_t>(rd.read<int32_t>());
-        if (vt == 10) return static_cast<uint32_t>(rd.read<uint64_t>());
-        rd.skip_value(vt);
-        return 0;
-    };
-    auto read_f32_any = [&](uint32_t vt) -> float {
-        if (vt == 6) return rd.read<float>();
-        if (vt == 12) return static_cast<float>(rd.read<double>());
-        rd.skip_value(vt);
-        return 0.0f;
-    };
+    std::unordered_map<std::string, gguf_detail::MetaVal> meta;
 
     for (uint64_t i = 0; i < n_kv; ++i) {
         const std::string key = rd.read_str();
         const uint32_t vt = rd.read<uint32_t>();
-        if (key == "general.alignment") {
-            alignment = read_u32_any(vt);
-        } else if (key == "general.architecture" && vt == 8) {
-            arch = rd.read_str();
-            cfg.model_type = arch;
-        } else if (key == arch + ".block_count") {
-            cfg.num_hidden_layers = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".embedding_length") {
-            cfg.hidden_size = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".feed_forward_length") {
-            cfg.intermediate_size = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".attention.head_count") {
-            cfg.num_attention_heads = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".attention.head_count_kv") {
-            cfg.num_key_value_heads = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".attention.key_length") {
-            cfg.head_dim = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".context_length") {
-            cfg.max_position_embeddings = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == arch + ".attention.layer_norm_rms_epsilon") {
-            cfg.rms_norm_eps = read_f32_any(vt);
-        } else if (key == arch + ".rope.freq_base") {
-            cfg.rope_theta = read_f32_any(vt);
-        } else if (key == arch + ".rope.dimension_count") {
-            rope_dim_count = read_u32_any(vt);
-        } else if (key == "tokenizer.ggml.bos_token_id") {
-            cfg.bos_token_id = static_cast<int32_t>(read_u32_any(vt));
-        } else if (key == "tokenizer.ggml.eos_token_id") {
-            cfg.eos_token_ids.push_back(static_cast<int32_t>(read_u32_any(vt)));
-        } else {
+
+        // Skip huge tokenizer tables here (parsed in Tokenizer::from_gguf)
+        if (key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.merges" ||
+            key == "tokenizer.ggml.token_type" || key == "tokenizer.ggml.scores" ||
+            key == "tokenizer.chat_template") {
             rd.skip_value(vt);
+            continue;
+        }
+
+        gguf_detail::MetaVal mv;
+        mv.type = vt;
+        switch (vt) {
+            case 0: mv.u64 = rd.read<uint8_t>(); break;
+            case 1: mv.i64 = rd.read<int8_t>(); break;
+            case 2: mv.u64 = rd.read<uint16_t>(); break;
+            case 3: mv.i64 = rd.read<int16_t>(); break;
+            case 4: mv.u64 = rd.read<uint32_t>(); break;
+            case 5: mv.i64 = rd.read<int32_t>(); break;
+            case 6: mv.f64 = rd.read<float>(); break;
+            case 7: mv.bval = (rd.read<uint8_t>() != 0); break;
+            case 8: mv.sval = rd.read_str(); break;
+            case 10: mv.u64 = rd.read<uint64_t>(); break;
+            case 11: mv.i64 = rd.read<int64_t>(); break;
+            case 12: mv.f64 = rd.read<double>(); break;
+            case 9: {
+                const uint32_t et = rd.read<uint32_t>();
+                const uint64_t n = rd.read<uint64_t>();
+                if (n <= 4096 && (et == 4 || et == 5 || et == 10 || et == 11 || et == 7)) {
+                    for (uint64_t j = 0; j < n; ++j) {
+                        if (et == 7) mv.bool_arr.push_back(rd.read<uint8_t>() != 0);
+                        else if (et == 4) mv.u32_arr.push_back(rd.read<uint32_t>());
+                        else if (et == 5) mv.u32_arr.push_back(static_cast<uint32_t>(rd.read<int32_t>()));
+                        else if (et == 10) mv.u32_arr.push_back(static_cast<uint32_t>(rd.read<uint64_t>()));
+                        else if (et == 11) mv.u32_arr.push_back(static_cast<uint32_t>(rd.read<int64_t>()));
+                    }
+                } else {
+                    for (uint64_t j = 0; j < n; ++j) rd.skip_value(et);
+                }
+                break;
+            }
+            default:
+                throw std::runtime_error("Unknown GGUF metadata type");
+        }
+        meta.emplace(key, std::move(mv));
+    }
+
+    auto find_meta = [&](const std::string& k) -> const gguf_detail::MetaVal* {
+        auto it = meta.find(k);
+        return (it != meta.end()) ? &it->second : nullptr;
+    };
+    if (const auto* mv = find_meta("general.alignment")) alignment = std::max<uint64_t>(1, mv->as_u32(32));
+    if (const auto* mv = find_meta("general.architecture"); mv && mv->type == 8) arch = mv->sval;
+    cfg.model_type = arch;
+
+    uint32_t rope_dim_count = 0;
+    uint32_t nextn_predict_layers = 0;
+    uint32_t full_attn_interval = 0;
+    uint32_t ssm_state_size = 0;
+    uint32_t ssm_inner_size = 0;
+    std::vector<bool> recurrent_layers;
+
+    if (const auto* mv = find_meta(arch + ".block_count")) cfg.num_hidden_layers = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".embedding_length")) cfg.hidden_size = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".feed_forward_length")) cfg.intermediate_size = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".attention.head_count")) cfg.num_attention_heads = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".attention.head_count_kv")) cfg.num_key_value_heads = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".attention.key_length")) cfg.head_dim = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".context_length")) cfg.max_position_embeddings = static_cast<int32_t>(mv->as_u32(32768));
+    if (const auto* mv = find_meta(arch + ".attention.layer_norm_rms_epsilon")) cfg.rms_norm_eps = mv->as_f32(1e-6f);
+    if (const auto* mv = find_meta(arch + ".rope.freq_base")) cfg.rope_theta = mv->as_f32(10000.0f);
+    if (const auto* mv = find_meta(arch + ".rope.dimension_count")) rope_dim_count = mv->as_u32();
+    if (const auto* mv = find_meta(arch + ".rope.dimension_sections")) {
+        for (size_t j = 0; j < 3 && j < mv->u32_arr.size(); ++j) {
+            cfg.mrope_section.push_back(static_cast<int32_t>(mv->u32_arr[j]));
         }
     }
+    if (const auto* mv = find_meta(arch + ".nextn_predict_layers")) nextn_predict_layers = mv->as_u32();
+    if (const auto* mv = find_meta(arch + ".full_attention_interval")) full_attn_interval = mv->as_u32();
+    if (const auto* mv = find_meta(arch + ".attention.recurrent_layers")) recurrent_layers = mv->bool_arr;
+    if (const auto* mv = find_meta(arch + ".ssm.conv_kernel")) cfg.linear_conv_kernel_dim = static_cast<int32_t>(mv->as_u32(4));
+    if (const auto* mv = find_meta(arch + ".ssm.state_size")) ssm_state_size = mv->as_u32();
+    if (const auto* mv = find_meta(arch + ".ssm.group_count")) cfg.linear_num_key_heads = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".ssm.time_step_rank")) cfg.linear_num_value_heads = static_cast<int32_t>(mv->as_u32());
+    if (const auto* mv = find_meta(arch + ".ssm.inner_size")) ssm_inner_size = mv->as_u32();
+    if (const auto* mv = find_meta("tokenizer.ggml.bos_token_id")) cfg.bos_token_id = static_cast<int32_t>(mv->as_u32());
+    auto append_eos_meta = [&](const gguf_detail::MetaVal* mv) {
+        if (!mv) return;
+        if (!mv->u32_arr.empty()) {
+            for (uint32_t eid : mv->u32_arr) cfg.eos_token_ids.push_back(static_cast<int32_t>(eid));
+        } else {
+            cfg.eos_token_ids.push_back(static_cast<int32_t>(mv->as_u32()));
+        }
+    };
+    append_eos_meta(find_meta("tokenizer.ggml.eos_token_id"));
+    append_eos_meta(find_meta("tokenizer.ggml.eot_token_id"));
 
     std::unordered_map<std::string, gguf_detail::GGUFTensor> tmap;
     for (uint64_t i = 0; i < n_tensors; ++i) {
@@ -1121,6 +1540,9 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
         kv.second.ptr = mf.data + data_base + kv.second.offset;
     }
 
+    const bool is_qwen35 = (arch.find("qwen35") != std::string::npos || arch.find("qwen3_5") != std::string::npos);
+    const bool is_qwen3next = (arch.find("qwen3next") != std::string::npos || arch.find("qwen3_next") != std::string::npos);
+
     if (override_cfg) {
         cfg = *override_cfg;
     } else {
@@ -1134,23 +1556,67 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
         if (rope_dim_count > 0 && cfg.head_dim > 0) {
             cfg.partial_rotary_factor = static_cast<float>(rope_dim_count) / static_cast<float>(cfg.head_dim);
         }
-        if (arch.find("qwen35") != std::string::npos ||
-            arch.find("qwen3_5") != std::string::npos ||
-            arch.find("qwen3next") != std::string::npos ||
-            arch.find("qwen3_next") != std::string::npos) {
-            throw std::runtime_error("GGUF hybrid GDN architecture ('" + arch +
-                                     "') is not yet supported; load HuggingFace safetensors directory or .rxr4 instead.");
+
+        if (nextn_predict_layers > 0 && cfg.num_hidden_layers > static_cast<int32_t>(nextn_predict_layers)) {
+            cfg.mtp_num_hidden_layers = static_cast<int32_t>(nextn_predict_layers);
+            cfg.num_hidden_layers -= static_cast<int32_t>(nextn_predict_layers);
         }
-        if (arch == "llama") {
-            cfg.rope_kind = RopeKind::Interleaved;
-        } else {
-            cfg.rope_kind = RopeKind::NeoX;
+
+        if (ssm_state_size > 0) {
+            cfg.linear_key_head_dim = static_cast<int32_t>(ssm_state_size);
+            cfg.linear_value_head_dim =
+                (ssm_inner_size > 0 && cfg.linear_num_value_heads > 0)
+                    ? static_cast<int32_t>(ssm_inner_size / static_cast<uint32_t>(cfg.linear_num_value_heads))
+                    : static_cast<int32_t>(ssm_state_size);
         }
-        if (tmap.count("blk.0.attn_q_norm.weight")) cfg.qk_norm = true;
+
+        if (cfg.num_hidden_layers > 0) {
+            if (!recurrent_layers.empty() && static_cast<int32_t>(recurrent_layers.size()) >= cfg.num_hidden_layers) {
+                cfg.layer_types.resize(cfg.num_hidden_layers);
+                for (int32_t l = 0; l < cfg.num_hidden_layers; ++l) {
+                    cfg.layer_types[l] = recurrent_layers[l] ? LayerKind::LinearAttentionGDN
+                                                             : LayerKind::FullAttention;
+                }
+            } else if (full_attn_interval > 0 && cfg.linear_num_value_heads > 0) {
+                cfg.layer_types.resize(cfg.num_hidden_layers);
+                for (int32_t l = 0; l < cfg.num_hidden_layers; ++l) {
+                    cfg.layer_types[l] = (((l + 1) % static_cast<int32_t>(full_attn_interval)) == 0)
+                                             ? LayerKind::FullAttention
+                                             : LayerKind::LinearAttentionGDN;
+                }
+            } else {
+                cfg.layer_types.assign(cfg.num_hidden_layers, LayerKind::FullAttention);
+            }
+        }
+
+        // GGUF norm weights already include any +1.0 offset from HF conversion.
+        cfg.norm_kind = NormKind::RMSNorm;
+        cfg.rope_kind = (arch == "llama") ? RopeKind::Interleaved : RopeKind::NeoX;
+
+        if (is_qwen35) {
+            int32_t mrope_sum = 0;
+            for (int32_t s : cfg.mrope_section) mrope_sum += s;
+            if (mrope_sum > 0) cfg.mrope_interleaved = true;
+            if (cfg.linear_num_key_heads > 0 && cfg.linear_num_value_heads > cfg.linear_num_key_heads) {
+                const auto* mv_hg = find_meta("prism.hadamard.gdn_v_grouped");
+                const bool has_hadamard_grouped = (mv_hg && mv_hg->type == 7 && mv_hg->bval);
+                cfg.gdn_tiled_v_heads = !has_hadamard_grouped;
+            }
+        }
+
+        for (int32_t l = 0; l < cfg.num_hidden_layers; ++l) {
+            if (cfg.layer_types[l] == LayerKind::FullAttention) {
+                const std::string pfx = "blk." + std::to_string(l) + ".";
+                if (tmap.count(pfx + "attn_q_norm.weight")) cfg.qk_norm = true;
+                if (auto it = tmap.find(pfx + "attn_q.weight"); it != tmap.end() && it->second.n_dims >= 2) {
+                    const uint64_t q_dim = static_cast<uint64_t>(cfg.num_attention_heads) * cfg.head_dim;
+                    if (it->second.dims[1] == 2 * q_dim) cfg.attn_output_gate = true;
+                    else if (it->second.dims[1] == q_dim) cfg.attn_output_gate = false;
+                }
+                break;
+            }
+        }
         cfg.tie_word_embeddings = (tmap.count("output.weight") == 0);
-        if (cfg.layer_types.empty() && cfg.num_hidden_layers > 0) {
-            cfg.layer_types.assign(cfg.num_hidden_layers, LayerKind::FullAttention);
-        }
     }
 
     ModelWeights w;
@@ -1166,6 +1632,10 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
         auto it = tmap.find(name);
         if (it == tmap.end()) throw std::runtime_error("Missing GGUF tensor: " + name);
         return it->second;
+    };
+    auto try_get = [&](const std::string& name) -> const gguf_detail::GGUFTensor* {
+        auto it = tmap.find(name);
+        return (it != tmap.end()) ? &it->second : nullptr;
     };
 
     auto pack_g1 = [&](const R4Matrix& dst, const gguf_detail::GGUFTensor& src) {
@@ -1193,6 +1663,15 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
         for (int i = 0; i < n; ++i) h[i] = __float2half(tmp[i]);
         upload_f16_host_to_device(dst, h.data(), n);
     };
+    auto load_g_f16_rows = [&](const gguf_detail::GGUFTensor& src, int rows, int cols, std::vector<__half>& out) {
+        out.resize(static_cast<size_t>(rows) * cols);
+        std::vector<float> tmp(cols);
+        for (int r = 0; r < rows; ++r) {
+            gguf_detail::decode_gguf_row(src, r, tmp.data(), cols);
+            __half* dst_row = out.data() + static_cast<size_t>(r) * cols;
+            for (int c = 0; c < cols; ++c) dst_row[c] = __float2half(tmp[c]);
+        }
+    };
 
     pack_g1(w.embed_tokens, require("token_embd.weight"));
     load_g_f16(w.final_norm, require("output_norm.weight"), cfg.hidden_size);
@@ -1204,7 +1683,11 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
         LayerWeights& lw = w.layers[l];
         const std::string pfx = "blk." + std::to_string(l) + ".";
         load_g_f16(lw.input_norm, require(pfx + "attn_norm.weight"), cfg.hidden_size);
-        load_g_f16(lw.post_attn_norm, require(pfx + "ffn_norm.weight"), cfg.hidden_size);
+        if (const auto* pn = try_get(pfx + "post_attention_norm.weight")) {
+            load_g_f16(lw.post_attn_norm, *pn, cfg.hidden_size);
+        } else {
+            load_g_f16(lw.post_attn_norm, require(pfx + "ffn_norm.weight"), cfg.hidden_size);
+        }
         if (lw.kind == LayerKind::FullAttention) {
             pack_g1(lw.q_proj, require(pfx + "attn_q.weight"));
             pack_g2(lw.kv_proj, require(pfx + "attn_k.weight"),
@@ -1216,7 +1699,118 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
                 load_g_f16(lw.k_norm, require(pfx + "attn_k_norm.weight"), cfg.head_dim);
             }
         } else {
-            throw std::runtime_error("GGUF GDN layer loading not yet mapped for this GGUF variant; use safetensors or rxr4");
+            const int32_t Kh = cfg.linear_num_key_heads;
+            const int32_t Kd = cfg.linear_key_head_dim;
+            const int32_t Vh = cfg.linear_num_value_heads;
+            const int32_t Vd = cfg.linear_value_head_dim;
+            const int32_t key_dim = Kh * Kd;
+            const int32_t value_dim = Vh * Vd;
+            const int32_t conv_dim = 2 * key_dim + value_dim;
+            const int32_t conv_k = cfg.linear_conv_kernel_dim;
+            const int32_t H = cfg.hidden_size;
+
+            if (const auto* qkvz = try_get(pfx + "attn_qkvz.weight")) {
+                if (is_qwen3next && Kh > 0 && (Vh % Kh) == 0) {
+                    const int r_grp = Vh / Kh;
+                    const int grp_stride = 2 * Kd + 2 * r_grp * Vd;
+                    h_qs.resize(quant::r4_g64_qs_bytes(lw.in_proj_qkvz.N, lw.in_proj_qkvz.K));
+                    h_sc.resize(quant::r4_g64_scales_bytes(lw.in_proj_qkvz.N, lw.in_proj_qkvz.K) / sizeof(__half));
+                    pack_r4_parallel(lw.in_proj_qkvz.N, lw.in_proj_qkvz.K, h_qs.data(), h_sc.data(), num_threads,
+                                     [&](int row, float* row_out) {
+                                         int src_row = row;
+                                         if (row < key_dim) {
+                                             src_row = (row / Kd) * grp_stride + (row % Kd);
+                                         } else if (row < 2 * key_dim) {
+                                             const int ko = row - key_dim;
+                                             src_row = (ko / Kd) * grp_stride + Kd + (ko % Kd);
+                                         } else if (row < 2 * key_dim + value_dim) {
+                                             const int vo = row - 2 * key_dim;
+                                             src_row = (vo / (r_grp * Vd)) * grp_stride + 2 * Kd + (vo % (r_grp * Vd));
+                                         } else {
+                                             const int zo = row - (2 * key_dim + value_dim);
+                                             src_row = (zo / (r_grp * Vd)) * grp_stride + 2 * Kd + r_grp * Vd +
+                                                       (zo % (r_grp * Vd));
+                                         }
+                                         gguf_detail::decode_gguf_row(*qkvz, src_row, row_out, lw.in_proj_qkvz.K);
+                                     });
+                    upload_r4_host_to_device(lw.in_proj_qkvz, h_qs.data(), h_sc.data());
+                } else {
+                    pack_g1(lw.in_proj_qkvz, *qkvz);
+                }
+            } else if (const auto* qkv_gate = try_get(pfx + "attn_qkv_gate.weight")) {
+                pack_g1(lw.in_proj_qkvz, *qkv_gate);
+            } else {
+                pack_g2(lw.in_proj_qkvz,
+                        require(pfx + "attn_qkv.weight"), conv_dim,
+                        require(pfx + "attn_gate.weight"));
+            }
+
+            const auto* ba_merged = try_get(pfx + "ssm_beta_alpha.weight");
+            if (!ba_merged) ba_merged = try_get(pfx + "ssm_ba.weight");
+            if (ba_merged != nullptr) {
+                std::vector<__half> ba_raw;
+                load_g_f16_rows(*ba_merged, 2 * Vh, H, ba_raw);
+                if (is_qwen3next && Kh > 0 && (Vh % Kh) == 0) {
+                    const int r_grp = Vh / Kh;
+                    std::vector<__half> ba_f16(ba_raw.size());
+                    for (int g = 0; g < Kh; ++g) {
+                        for (int i = 0; i < r_grp; ++i) {
+                            const int b_dst = g * r_grp + i;
+                            const int a_dst = Vh + g * r_grp + i;
+                            const int b_src = g * (2 * r_grp) + i;
+                            const int a_src = g * (2 * r_grp) + r_grp + i;
+                            std::memcpy(ba_f16.data() + static_cast<size_t>(b_dst) * H,
+                                        ba_raw.data() + static_cast<size_t>(b_src) * H,
+                                        static_cast<size_t>(H) * sizeof(__half));
+                            std::memcpy(ba_f16.data() + static_cast<size_t>(a_dst) * H,
+                                        ba_raw.data() + static_cast<size_t>(a_src) * H,
+                                        static_cast<size_t>(H) * sizeof(__half));
+                        }
+                    }
+                    upload_f16_host_to_device(lw.in_proj_ba, ba_f16.data(), ba_f16.size());
+                } else {
+                    upload_f16_host_to_device(lw.in_proj_ba, ba_raw.data(), ba_raw.size());
+                }
+            } else {
+                std::vector<__half> b_f16, a_f16;
+                load_g_f16_rows(require(pfx + "ssm_beta.weight"), Vh, H, b_f16);
+                load_g_f16_rows(require(pfx + "ssm_alpha.weight"), Vh, H, a_f16);
+                std::vector<__half> ba_f16;
+                ba_f16.reserve(b_f16.size() + a_f16.size());
+                ba_f16.insert(ba_f16.end(), b_f16.begin(), b_f16.end());
+                ba_f16.insert(ba_f16.end(), a_f16.begin(), a_f16.end());
+                upload_f16_host_to_device(lw.in_proj_ba, ba_f16.data(), ba_f16.size());
+            }
+
+            // Transpose conv1d weight [conv_dim, conv_k] -> [conv_k, conv_dim] for coalesced access
+            const auto& conv_t = require(pfx + "ssm_conv1d.weight");
+            std::vector<__half> cw_t(static_cast<size_t>(conv_k) * conv_dim);
+            std::vector<float> crow(conv_k);
+            for (int c = 0; c < conv_dim; ++c) {
+                gguf_detail::decode_gguf_row(conv_t, c, crow.data(), conv_k);
+                for (int k = 0; k < conv_k; ++k) {
+                    cw_t[static_cast<size_t>(k) * conv_dim + c] = __float2half(crow[k]);
+                }
+            }
+            upload_f16_host_to_device(lw.conv_w, cw_t.data(), cw_t.size());
+
+            // GGUF ssm_a stores -exp(A_log); convert back to A_log = log(-ssm_a).
+            std::vector<float> ssm_a(Vh);
+            gguf_detail::decode_gguf_row(require(pfx + "ssm_a"), 0, ssm_a.data(), Vh);
+            for (int h = 0; h < Vh; ++h) {
+                if (!(ssm_a[h] < 0.0f)) {
+                    throw std::runtime_error("Invalid non-negative ssm_a in GGUF layer " + std::to_string(l));
+                }
+                ssm_a[h] = std::log(-ssm_a[h]);
+            }
+            upload_f32_host_to_device(lw.A_log, ssm_a.data(), Vh);
+
+            std::vector<float> dtb(Vh);
+            gguf_detail::decode_gguf_row(require(pfx + "ssm_dt.bias"), 0, dtb.data(), Vh);
+            upload_f32_host_to_device(lw.dt_bias, dtb.data(), Vh);
+
+            load_g_f16(lw.gdn_norm_w, require(pfx + "ssm_norm.weight"), Vd);
+            pack_g1(lw.out_proj, require(pfx + "ssm_out.weight"));
         }
         pack_g2(lw.gate_up_proj, require(pfx + "ffn_gate.weight"), cfg.intermediate_size,
                 require(pfx + "ffn_up.weight"));

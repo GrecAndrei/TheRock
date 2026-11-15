@@ -163,7 +163,7 @@ void gdn_fused_128x128_kernel(const __half* __restrict__ qkv,
 
     const int h = blockIdx.x;
     const int gqa_ratio = p.num_v_heads / p.num_k_heads;
-    const int hk = h / gqa_ratio;
+    const int hk = p.tiled_v_heads ? (h % p.num_k_heads) : (h / gqa_ratio);
     const int key_dim = p.key_dim();
     const int value_dim = p.value_dim();
     const int conv_dim = p.conv_dim();

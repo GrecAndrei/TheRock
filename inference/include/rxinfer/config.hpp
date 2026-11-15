@@ -50,7 +50,7 @@ struct ModelConfig {
     int32_t head_dim = 0;
     bool attention_bias = false;
     bool qk_norm = false;
-    bool attn_output_gate = false; // e.g. Qwen3.5/3.8 full attention swish output gate
+    bool attn_output_gate = false; // e.g. Qwen3.5/3.8 full attention sigmoid output gate
 
     // RoPE parameters
     RopeKind rope_kind = RopeKind::NeoX;
@@ -65,6 +65,7 @@ struct ModelConfig {
     int32_t linear_num_value_heads = 0;
     int32_t linear_value_head_dim = 0;
     int32_t linear_conv_kernel_dim = 4;
+    bool gdn_tiled_v_heads = false; // True when V heads are in GGML tiled order [n_v/n_k, n_k]
 
     // Layer schedule (empty -> all FullAttention)
     std::vector<LayerKind> layer_types;

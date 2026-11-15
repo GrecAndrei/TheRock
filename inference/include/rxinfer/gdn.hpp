@@ -20,6 +20,7 @@ struct GDNParams {
     int32_t head_v_dim = 128;
     int32_t conv_kernel_size = 4;
     float rms_norm_eps = 1e-6f;
+    bool tiled_v_heads = false; // false: HF grouped [K][V/K], true: GGML tiled [V/K][K]
 
     __host__ __device__ int32_t key_dim() const { return num_k_heads * head_k_dim; }
     __host__ __device__ int32_t value_dim() const { return num_v_heads * head_v_dim; }

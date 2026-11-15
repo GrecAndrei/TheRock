@@ -77,6 +77,10 @@ float silu_cpu(float x) {
     return x / (1.0f + std::exp(-x));
 }
 
+float sigmoid_cpu(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
 float softplus_cpu(float x) {
     return (x > 20.0f) ? x : std::log1p(std::exp(x));
 }
@@ -349,7 +353,7 @@ void test_attention(hipStream_t stream, int& failures) {
                     acc += (scores[t] / lsum) * ref_v_cache[(t * H_kv + hk) * D + d];
                 }
                 const float gate = __half2float(h_q_in[(m * H_q + hq) * 2 * D + D + d]);
-                const float val = acc * silu_cpu(gate);
+                const float val = acc * sigmoid_cpu(gate);
                 if (m < M_pre) ref_pre_out[(m * H_q + hq) * D + d] = val;
                 else ref_dec_out[hq * D + d] = val;
             }
@@ -458,8 +462,8 @@ void test_attention(hipStream_t stream, int& failures) {
     }
 }
 
-void test_gdn(hipStream_t stream, int& failures) {
-    std::mt19937 rng(999);
+void test_gdn_variant(hipStream_t stream, int& failures, bool tiled_v_heads) {
+    std::mt19937 rng(tiled_v_heads ? 1001u : 999u);
     std::normal_distribution<float> nd(0.0f, 0.3f);
 
     rxinfer::gdn::GDNParams p{};
@@ -469,6 +473,7 @@ void test_gdn(hipStream_t stream, int& failures) {
     p.head_v_dim = 128;
     p.conv_kernel_size = 4;
     p.rms_norm_eps = 1e-6f;
+    p.tiled_v_heads = tiled_v_heads;
 
     const int M_pre = 10;
     const int M_tot = M_pre + 1;
@@ -515,7 +520,7 @@ void test_gdn(hipStream_t stream, int& failures) {
         const int key_dim = p.key_dim();
         const int gqa = p.num_v_heads / p.num_k_heads;
         for (int h = 0; h < p.num_v_heads; ++h) {
-            const int hk = h / gqa;
+            const int hk = tiled_v_heads ? (h % p.num_k_heads) : (h / gqa);
             float q[128], k[128], v[128], z[128];
             float q2 = 0.0f, k2 = 0.0f;
             for (int i = 0; i < 128; ++i) {
@@ -621,7 +626,8 @@ void test_gdn(hipStream_t stream, int& failures) {
             d_A_log, d_dt_bias, d_norm_w, d_S, d_out, p, 1, stream);
     }, stream);
 
-    std::printf("[GDN 48x128x128] out cos=%.6f rel=%.5f | S cos=%.6f | M=1 conv=%.1fus + gdn=%.1fus\n",
+    std::printf("[GDN 48x128x128 %-7s] out cos=%.6f rel=%.5f | S cos=%.6f | M=1 conv=%.1fus + gdn=%.1fus\n",
+                tiled_v_heads ? "tiled" : "grouped",
                 m_out.cos_sim, m_out.rel_rmse, m_S.cos_sim, us_conv, us_gdn);
     if (m_out.cos_sim < 0.9995 || m_S.cos_sim < 0.9999) ++failures;
 
@@ -635,6 +641,11 @@ void test_gdn(hipStream_t stream, int& failures) {
     RX_HIP_CHECK(hipFree(d_A_log));
     RX_HIP_CHECK(hipFree(d_dt_bias));
     RX_HIP_CHECK(hipFree(d_S));
+}
+
+void test_gdn(hipStream_t stream, int& failures) {
+    test_gdn_variant(stream, failures, false);
+    test_gdn_variant(stream, failures, true);
 }
 
 } // namespace

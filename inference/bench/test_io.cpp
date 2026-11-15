@@ -726,6 +726,303 @@ int test_gguf_q4k_q6k_tokenizer_e2e() {
     return 0;
 }
 
+int test_gguf_qwen35_iq_and_rxr4_e2e() {
+    const std::string gguf_path = test_tmp_path("mock_qwen35_iq.gguf");
+    const int V = 320, H = 256, I = 256, L = 2, Hq = 4, Hkv = 2, D = 64;
+    const int Kh = 2, Kd = 128, Vh = 4, Vd = 128;
+    const int key_dim = Kh * Kd;
+    const int val_dim = Vh * Vd;
+    const int conv_dim = 2 * key_dim + val_dim;
+    auto b2u = gpt2_byte_unicode();
+
+    std::vector<std::string> vocab;
+    for (int b = 0; b < 256; ++b) vocab.push_back(b2u[b]);
+    vocab.push_back("hello");
+    while (static_cast<int>(vocab.size()) < V - 5) vocab.push_back("q35_" + std::to_string(vocab.size()));
+    vocab.push_back("<|endoftext|>");
+    vocab.push_back("<|im_start|>");
+    vocab.push_back("<|im_end|>");
+    vocab.push_back("<think>");
+    vocab.push_back("</think>");
+    std::vector<int32_t> tok_types(V, 1);
+    tok_types[V - 5] = 3;
+    tok_types[V - 4] = 3;
+    tok_types[V - 3] = 3;
+    tok_types[V - 2] = 4;
+    tok_types[V - 1] = 4;
+
+    struct GRec {
+        std::string name;
+        uint32_t type;
+        std::vector<uint64_t> dims;
+        std::vector<uint8_t> data;
+    };
+    std::vector<GRec> recs;
+
+    uint32_t seed = 2026u;
+    auto next_u8 = [&]() -> uint8_t {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<uint8_t>(seed >> 24);
+    };
+
+    auto add_f32_vec = [&](const std::string& name, int n, float val) {
+        GRec r{name, 0, {static_cast<uint64_t>(n)}, std::vector<uint8_t>(static_cast<size_t>(n) * 4)};
+        auto* p = reinterpret_cast<float*>(r.data.data());
+        for (int i = 0; i < n; ++i) p[i] = val;
+        recs.push_back(std::move(r));
+    };
+    auto add_f32_2d = [&](const std::string& name, int c0, int c1, float val) {
+        GRec r{name, 0, {static_cast<uint64_t>(c0), static_cast<uint64_t>(c1)},
+               std::vector<uint8_t>(static_cast<size_t>(c0) * c1 * 4)};
+        auto* p = reinterpret_cast<float*>(r.data.data());
+        for (int i = 0; i < c0 * c1; ++i) p[i] = val;
+        recs.push_back(std::move(r));
+    };
+    auto add_f16_vec = [&](const std::string& name, int n, float val) {
+        GRec r{name, 1, {static_cast<uint64_t>(n)}, std::vector<uint8_t>(static_cast<size_t>(n) * 2)};
+        auto* p = reinterpret_cast<uint16_t*>(r.data.data());
+        for (int i = 0; i < n; ++i) p[i] = f32_to_fp16(val);
+        recs.push_back(std::move(r));
+    };
+    auto add_bf16_vec = [&](const std::string& name, int n, float val) {
+        GRec r{name, 30, {static_cast<uint64_t>(n)}, std::vector<uint8_t>(static_cast<size_t>(n) * 2)};
+        auto* p = reinterpret_cast<uint16_t*>(r.data.data());
+        for (int i = 0; i < n; ++i) p[i] = f32_to_bf16(val);
+        recs.push_back(std::move(r));
+    };
+    auto add_qblock = [&](const std::string& name, uint32_t ggml_type, int rows, int cols, int blk_elems, int blk_bytes) {
+        const int blocks = cols / blk_elems;
+        GRec r{name, ggml_type, {static_cast<uint64_t>(cols), static_cast<uint64_t>(rows)},
+               std::vector<uint8_t>(static_cast<size_t>(rows) * blocks * blk_bytes)};
+        const uint16_t d16 = f32_to_fp16(0.005f);
+        for (int row = 0; row < rows; ++row) {
+            for (int b = 0; b < blocks; ++b) {
+                uint8_t* blk = r.data.data() + (static_cast<size_t>(row) * blocks + b) * blk_bytes;
+                for (int i = 0; i < blk_bytes; ++i) blk[i] = next_u8();
+                if (ggml_type == 10) { // Q2_K: d @ 80, dmin @ 82
+                    std::memcpy(blk + 80, &d16, 2);
+                    std::memcpy(blk + 82, &d16, 2);
+                } else if (ggml_type == 11) { // Q3_K: d @ 108
+                    std::memcpy(blk + 108, &d16, 2);
+                } else if (ggml_type == 12 || ggml_type == 13) { // Q4_K / Q5_K: d @ 0, dmin @ 2
+                    std::memcpy(blk + 0, &d16, 2);
+                    std::memcpy(blk + 2, &d16, 2);
+                } else if (ggml_type == 14) { // Q6_K: d @ 208
+                    std::memcpy(blk + 208, &d16, 2);
+                } else if (ggml_type == 29) { // IQ1_M: 4x uint16 scales at +48..54 whose top nibbles encode d16
+                    for (int s = 0; s < 4; ++s) {
+                        const uint16_t sc_lo = static_cast<uint16_t>(next_u8() | ((next_u8() & 0x0Fu) << 8));
+                        const uint16_t nib = static_cast<uint16_t>(((d16 >> (4 * s)) & 0x0Fu) << 12);
+                        const uint16_t scv = static_cast<uint16_t>(sc_lo | nib);
+                        std::memcpy(blk + 48 + s * 2, &scv, 2);
+                    }
+                } else { // Q4_0, Q5_0, Q8_0, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS: d @ 0
+                    std::memcpy(blk, &d16, 2);
+                }
+            }
+        }
+        recs.push_back(std::move(r));
+    };
+
+    // Exercise ALL GGML quant types: Q4_0(2), Q5_0(6), Q8_0(8), Q2_K(10), Q3_K(11), Q4_K(12), Q5_K(13), Q6_K(14),
+    // IQ2_XXS(16), IQ2_XS(17), IQ3_XXS(18), IQ1_S(19), IQ4_NL(20), IQ3_S(21), IQ2_S(22), IQ4_XS(23), IQ1_M(29),
+    // plus F32(0), F16(1), BF16(30)!
+    add_qblock("token_embd.weight", 23, V, H, 256, 136); // IQ4_XS
+    add_f32_vec("output_norm.weight", H, 1.0f);
+    add_qblock("output.weight", 29, V, H, 256, 56);      // IQ1_M
+
+    // blk.0: GDN layer
+    add_f32_vec("blk.0.attn_norm.weight", H, 1.0f);
+    add_f32_vec("blk.0.post_attention_norm.weight", H, 1.0f);
+    add_qblock("blk.0.attn_qkv.weight", 21, conv_dim, H, 256, 110); // IQ3_S
+    add_qblock("blk.0.attn_gate.weight", 22, val_dim, H, 256, 82);  // IQ2_S
+    add_qblock("blk.0.ssm_beta.weight", 20, Vh, H, 32, 18);         // IQ4_NL
+    add_qblock("blk.0.ssm_alpha.weight", 10, Vh, H, 256, 84);       // Q2_K
+    add_f32_2d("blk.0.ssm_conv1d.weight", 4, conv_dim, 0.02f);      // F32
+    add_f32_vec("blk.0.ssm_a", Vh, -0.5f);                          // F32
+    add_f32_vec("blk.0.ssm_dt.bias", Vh, 0.1f);                     // F32
+    add_bf16_vec("blk.0.ssm_norm.weight", Vd, 1.0f);                // BF16
+    add_qblock("blk.0.ssm_out.weight", 18, H, val_dim, 256, 98);    // IQ3_XXS
+    add_qblock("blk.0.ffn_gate.weight", 11, I, H, 256, 110);        // Q3_K
+    add_qblock("blk.0.ffn_up.weight", 17, I, H, 256, 74);           // IQ2_XS
+    add_qblock("blk.0.ffn_down.weight", 16, H, I, 256, 66);         // IQ2_XXS
+
+    // blk.1: FullAttention layer (with attn_output_gate=true + qk_norm=true)
+    add_f32_vec("blk.1.attn_norm.weight", H, 1.0f);
+    add_f32_vec("blk.1.post_attention_norm.weight", H, 1.0f);
+    add_qblock("blk.1.attn_q.weight", 19, 2 * Hq * D, H, 256, 50);  // IQ1_S
+    add_qblock("blk.1.attn_k.weight", 13, Hkv * D, H, 256, 176);    // Q5_K
+    add_qblock("blk.1.attn_v.weight", 2, Hkv * D, H, 32, 18);       // Q4_0
+    add_qblock("blk.1.attn_output.weight", 6, H, Hq * D, 32, 22);   // Q5_0
+    add_f16_vec("blk.1.attn_q_norm.weight", D, 1.0f);               // F16
+    add_f32_vec("blk.1.attn_k_norm.weight", D, 1.0f);               // F32
+    add_qblock("blk.1.ffn_gate.weight", 12, I, H, 256, 144);        // Q4_K
+    add_qblock("blk.1.ffn_up.weight", 14, I, H, 256, 210);          // Q6_K
+    add_qblock("blk.1.ffn_down.weight", 8, H, I, 32, 34);           // Q8_0
+
+    // blk.2: MTP/NextN block (must be ignored by trunk!)
+    add_f32_vec("blk.2.attn_norm.weight", H, 1.0f);
+
+    auto write_q35_gguf = [&](const std::string& out_path, const std::vector<GRec>& grecs, bool use_merged_gdn) {
+        std::ofstream ofs(out_path, std::ios::binary);
+        auto w_u8 = [&](uint8_t v) { ofs.write(reinterpret_cast<const char*>(&v), 1); };
+        auto w_u32 = [&](uint32_t v) { ofs.write(reinterpret_cast<const char*>(&v), 4); };
+        auto w_i32 = [&](int32_t v) { ofs.write(reinterpret_cast<const char*>(&v), 4); };
+        auto w_u64 = [&](uint64_t v) { ofs.write(reinterpret_cast<const char*>(&v), 8); };
+        auto w_f32 = [&](float v) { ofs.write(reinterpret_cast<const char*>(&v), 4); };
+        auto w_str = [&](const std::string& s) {
+            w_u64(s.size());
+            ofs.write(s.data(), s.size());
+        };
+        auto kv_str = [&](const std::string& k, const std::string& v) { w_str(k); w_u32(8); w_str(v); };
+        auto kv_u32 = [&](const std::string& k, uint32_t v) { w_str(k); w_u32(4); w_u32(v); };
+        auto kv_f32 = [&](const std::string& k, float v) { w_str(k); w_u32(6); w_f32(v); };
+        auto kv_bool = [&](const std::string& k, bool v) { w_str(k); w_u32(7); w_u8(v ? 1 : 0); };
+
+        w_u32(0x46554747u);
+        w_u32(3);
+        w_u64(grecs.size());
+        w_u64(28); // n_kv
+
+        kv_str("general.architecture", "qwen35");
+        kv_u32("qwen35.block_count", L + 1); // includes 1 MTP layer
+        kv_u32("qwen35.nextn_predict_layers", 1);
+        kv_u32("qwen35.embedding_length", H);
+        kv_u32("qwen35.feed_forward_length", I);
+        kv_u32("qwen35.attention.head_count", Hq);
+        kv_u32("qwen35.attention.head_count_kv", Hkv);
+        kv_u32("qwen35.attention.key_length", D);
+        kv_u32("qwen35.context_length", 1024);
+        kv_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
+        kv_f32("qwen35.rope.freq_base", 10000000.0f);
+        kv_u32("qwen35.rope.dimension_count", 32);
+        w_str("qwen35.rope.dimension_sections"); w_u32(9); w_u32(4); w_u64(4);
+        w_u32(6); w_u32(5); w_u32(5); w_u32(0);
+        kv_u32("qwen35.full_attention_interval", 2);
+        w_str("qwen35.attention.recurrent_layers"); w_u32(9); w_u32(7); w_u64(3);
+        w_u8(1); w_u8(0); w_u8(0);
+        kv_u32("qwen35.ssm.conv_kernel", 4);
+        kv_u32("qwen35.ssm.state_size", Kd);
+        kv_u32("qwen35.ssm.group_count", Kh);
+        kv_u32("qwen35.ssm.time_step_rank", Vh);
+        kv_u32("qwen35.ssm.inner_size", val_dim);
+        kv_str("tokenizer.ggml.model", "gpt2");
+        kv_str("tokenizer.ggml.pre", "qwen35");
+        kv_bool("tokenizer.ggml.add_bos_token", false);
+        kv_u32("tokenizer.ggml.bos_token_id", static_cast<uint32_t>(V - 5));
+        if (use_merged_gdn) {
+            w_str("tokenizer.ggml.eos_token_id"); w_u32(9); w_u32(4); w_u64(2);
+            w_u32(static_cast<uint32_t>(V - 5));
+            w_u32(static_cast<uint32_t>(V - 3));
+        } else {
+            kv_u32("tokenizer.ggml.eos_token_id", static_cast<uint32_t>(V - 3));
+        }
+        kv_u32("tokenizer.ggml.eot_token_id", static_cast<uint32_t>(V - 5));
+
+        w_str("tokenizer.ggml.tokens"); w_u32(9); w_u32(8); w_u64(vocab.size());
+        for (const auto& t : vocab) w_str(t);
+        w_str("tokenizer.ggml.token_type"); w_u32(9); w_u32(5); w_u64(tok_types.size());
+        for (int32_t tt : tok_types) w_i32(tt);
+
+        uint64_t cur_off = 0;
+        for (const auto& r : grecs) {
+            w_str(r.name);
+            w_u32(static_cast<uint32_t>(r.dims.size()));
+            for (uint64_t d : r.dims) w_u64(d);
+            w_u32(r.type);
+            w_u64(cur_off);
+            cur_off = (cur_off + r.data.size() + 31ULL) & ~31ULL;
+        }
+        while (static_cast<uint64_t>(ofs.tellp()) % 32ULL != 0) ofs.put(0);
+        for (const auto& r : grecs) {
+            ofs.write(reinterpret_cast<const char*>(r.data.data()), r.data.size());
+            const size_t pad = ((r.data.size() + 31ULL) & ~31ULL) - r.data.size();
+            for (size_t p = 0; p < pad; ++p) ofs.put(0);
+        }
+    };
+
+    write_q35_gguf(gguf_path, recs, false);
+
+    auto w_q35 = rxinfer::load_from_gguf(gguf_path);
+    auto tk_q35 = rxinfer::Tokenizer::from_gguf(gguf_path);
+    const auto& cfg = w_q35.config;
+    if (cfg.num_hidden_layers != 2 || cfg.mtp_num_hidden_layers != 1 ||
+        !cfg.gdn_tiled_v_heads || !cfg.mrope_interleaved ||
+        !cfg.attn_output_gate || !cfg.qk_norm ||
+        cfg.norm_kind != rxinfer::NormKind::RMSNorm ||
+        !tk_q35.is_eos(V - 3) || !tk_q35.is_eos(V - 5)) {
+        std::printf("[FAIL] qwen35 GGUF metadata/config mismatch (L=%d mtp=%d tiled=%d mrope=%d gate=%d eot=%d)\n",
+                    cfg.num_hidden_layers, cfg.mtp_num_hidden_layers,
+                    cfg.gdn_tiled_v_heads ? 1 : 0, cfg.mrope_interleaved ? 1 : 0,
+                    cfg.attn_output_gate ? 1 : 0, tk_q35.is_eos(V - 5) ? 1 : 0);
+        return 1;
+    }
+
+    const std::string rxr4_path = test_tmp_path("mock_qwen35_iq.rxr4");
+    rxinfer::save_rxr4_checkpoint(w_q35, rxr4_path);
+    auto w_rx = rxinfer::load_from_rxr4(rxr4_path);
+    if (!w_rx.config.gdn_tiled_v_heads || !w_rx.config.mrope_interleaved ||
+        w_rx.config.norm_kind != rxinfer::NormKind::RMSNorm) {
+        std::printf("[FAIL] qwen35 RXR4 config roundtrip lost gdn_tiled_v_heads/mrope\n");
+        return 1;
+    }
+
+    rxinfer::EngineOptions eopts{};
+    eopts.max_seq_len = 256;
+    rxinfer::InferenceEngine eng_g(std::move(w_q35), eopts);
+    rxinfer::InferenceEngine eng_r(std::move(w_rx), eopts);
+    const std::vector<int32_t> toks = {10, 42, 77, 128};
+    const auto logits_g = eng_g.forward_logits(toks);
+    const auto logits_r = eng_r.forward_logits(toks);
+    for (float v : logits_g) {
+        if (!std::isfinite(v)) {
+            std::printf("[FAIL] qwen35 GGUF produced non-finite logit!\n");
+            return 1;
+        }
+    }
+    const double cos_rx = cosine_sim(logits_g, logits_r);
+    if (cos_rx < 0.999999) {
+        std::printf("[FAIL] qwen35 GGUF vs RXR4 logits mismatch cos=%.8f\n", cos_rx);
+        return 1;
+    }
+
+    // Verify merged attn_qkv_gate.weight + ssm_ba.weight + array eos_token_id path too (all F32 so exact!)
+    const std::string gguf_merged_path = test_tmp_path("mock_qwen35_merged.gguf");
+    std::vector<GRec> mrecs;
+    for (const auto& r : recs) {
+        if (r.name == "blk.0.attn_qkv.weight" || r.name == "blk.0.attn_gate.weight" ||
+            r.name == "blk.0.ssm_beta.weight" || r.name == "blk.0.ssm_alpha.weight") {
+            continue;
+        }
+        mrecs.push_back(r);
+    }
+    GRec qkv_gate{"blk.0.attn_qkv_gate.weight", 0, {static_cast<uint64_t>(H), static_cast<uint64_t>(conv_dim + val_dim)},
+                  std::vector<uint8_t>(static_cast<size_t>(conv_dim + val_dim) * H * 4, 0)};
+    GRec ssm_ba{"blk.0.ssm_ba.weight", 0, {static_cast<uint64_t>(H), static_cast<uint64_t>(2 * Vh)},
+                std::vector<uint8_t>(static_cast<size_t>(2 * Vh) * H * 4, 0)};
+    mrecs.push_back(std::move(qkv_gate));
+    mrecs.push_back(std::move(ssm_ba));
+    write_q35_gguf(gguf_merged_path, mrecs, true);
+    auto w_m = rxinfer::load_from_gguf(gguf_merged_path);
+    auto tk_m = rxinfer::Tokenizer::from_gguf(gguf_merged_path);
+    if (!tk_m.is_eos(V - 5) || !tk_m.is_eos(V - 3) || !w_m.config.gdn_tiled_v_heads) {
+        std::printf("[FAIL] qwen35 merged GGUF array eos or tiled check failed\n");
+        return 1;
+    }
+    rxinfer::InferenceEngine eng_m(std::move(w_m), eopts);
+    const auto logits_m = eng_m.forward_logits(toks);
+    for (float v : logits_m) {
+        if (!std::isfinite(v)) {
+            std::printf("[FAIL] qwen35 merged GGUF produced non-finite logit!\n");
+            return 1;
+        }
+    }
+
+    std::printf("[PASS] GGUF v3 Qwen3.5 (all K/IQ/F16/BF16/Q4_0/Q5_0 quants + MTP + GDN tiled + RXR4 cos=%.6f)\n",
+                cos_rx);
+    return 0;
+}
+
 int test_sampler_and_multiturn_chat() {
     // 1. Sampler tests: greedy, FP16 bits LUT, repeat penalty, seeded stochastic top_k/top_p/min_p
     {
@@ -820,6 +1117,16 @@ int test_sampler_and_multiturn_chat() {
                         inc_ids.size(), full_ids.size());
             return 1;
         }
+
+        const std::string th_on_1 = tk.format_chatml(u1, sys, true, true);
+        const std::string th_on_t = tk.format_chat_turn(u1, sys, true, false, true);
+        const std::string th_off_t = tk.format_chat_turn(u1, sys, true, false, false);
+        if (th_on_1 != th_on_t ||
+            th_on_t.find("<|im_start|>assistant\n<think>\n") == std::string::npos ||
+            th_off_t.find("<|im_start|>assistant\n<think>\n\n</think>\n\n") == std::string::npos) {
+            std::printf("[FAIL] --think ChatML prefix mismatch\n");
+            return 1;
+        }
     }
 
     // 3. Llama3 chat format detection & multi-turn delta test
@@ -863,6 +1170,7 @@ int main() {
     if (test_sampler_and_multiturn_chat() != 0) return 1;
     if (test_safetensors_hf_qwen35_e2e() != 0) return 1;
     if (test_gguf_q4k_q6k_tokenizer_e2e() != 0) return 1;
+    if (test_gguf_qwen35_iq_and_rxr4_e2e() != 0) return 1;
     std::printf("\nALL IO / TOKENIZER TESTS PASSED!\n");
     return 0;
 }
