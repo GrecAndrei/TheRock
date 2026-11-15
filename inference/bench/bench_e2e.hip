@@ -389,6 +389,87 @@ int test_prompt_cache_and_tiered_gtt(const char* label, const rxinfer::ModelConf
     return 0;
 }
 
+int test_periodic_checkpoints_and_restore() {
+    auto cfg = make_small_hybrid_test_config();
+    rxinfer::LoaderOptions lo{};
+    auto w1 = rxinfer::load_synthetic_model(cfg, 321, lo);
+    auto w2 = rxinfer::load_synthetic_model(cfg, 321, lo);
+
+    rxinfer::EngineOptions eo{};
+    eo.max_seq_len = 8192;
+    eo.max_batch_tokens = 256;
+    eo.kv_dtype = rxinfer::DType::FP4_E2M1_G16;
+    eo.enable_hip_graph = false;
+    eo.max_prefix_snapshots = 4;
+
+    rxinfer::InferenceEngine eng(std::move(w1), eo);
+    rxinfer::InferenceEngine eng_ref(std::move(w2), eo);
+
+    std::vector<int32_t> long_toks(4600);
+    for (int i = 0; i < 4600; ++i) {
+        long_toks[i] = (i * 19 + 5) % cfg.vocab_size;
+    }
+    std::vector<int32_t> sys_toks(long_toks.begin(), long_toks.begin() + 32);
+    std::vector<int32_t> grid_4096(long_toks.begin(), long_toks.begin() + 4096);
+    std::vector<int32_t> branch_4104(long_toks.begin(), long_toks.begin() + 4104);
+    for (int i = 4096; i < 4104; ++i) branch_4104[i] = (i * 7 + 1) % cfg.vocab_size;
+
+    // 1. Pin system prompt snapshot
+    eng.prefill_cached(sys_toks, true);
+    eng.save_prefix_checkpoint(true);
+
+    // 2. Prefill > 4096 tokens: should auto-record periodic 4096-grid checkpoint
+    auto r_long = eng.prefill_cached(long_toks, true);
+    if (r_long.matched_prefix_tokens != 32 || r_long.evaluated_tokens != 4568) {
+        std::printf("  [FAIL] System prefix reuse mismatch (matched=%d eval=%d)\n",
+                    r_long.matched_prefix_tokens, r_long.evaluated_tokens);
+        return 1;
+    }
+
+    // 3. Rewind directly to 4096 via restore_prefix -> must be O(1) hit!
+    if (!eng.restore_prefix(grid_4096) || eng.position() != 4096) {
+        std::printf("  [FAIL] Periodic 4096-grid GDN checkpoint was not hit by restore_prefix()\n");
+        return 1;
+    }
+
+    // 4. Branch from 4096 to 4104 tokens -> must match 4096 cached tokens and match fresh reference logits
+    auto r_branch = eng.prefill_cached(branch_4104, false);
+    std::vector<float> logits_branch, logits_ref;
+    eng.copy_last_logits(logits_branch);
+    logits_ref = eng_ref.forward_logits(branch_4104);
+    const double cos_grid = cosine_sim(logits_ref, logits_branch);
+    if (r_branch.matched_prefix_tokens != 4096 || r_branch.evaluated_tokens != 8 || cos_grid < 0.999999) {
+        std::printf("  [FAIL] 4096-grid branch parity failed (matched=%d eval=%d cos=%.7f)\n",
+                    r_branch.matched_prefix_tokens, r_branch.evaluated_tokens, cos_grid);
+        return 1;
+    }
+
+    // 5. Fill 6 more unpinned checkpoints (exceeding max_prefix_snapshots=4) and verify pinned sys_toks survives!
+    for (int k = 0; k < 6; ++k) {
+        std::vector<int32_t> tmp(sys_toks);
+        for (int j = 0; j < 12 + k; ++j) tmp.push_back((k * 31 + j + 7) % cfg.vocab_size);
+        eng.prefill_cached(tmp, true);
+    }
+    if (!eng.restore_prefix(sys_toks)) {
+        std::printf("  [FAIL] Pinned system snapshot was evicted!\n");
+        return 1;
+    }
+
+    // 6. Save .rxprompt atomically and verify inspect_prompt_cache()
+    const std::string pcache = "/tmp/rxinfer_periodic_test.rxprompt";
+    eng.save_prompt_cache(pcache);
+    auto info = rxinfer::inspect_prompt_cache(pcache, true);
+    std::remove(pcache.c_str());
+    if (info.position != 32 || info.kv_dtype != rxinfer::DType::FP4_E2M1_G16 || info.tokens != sys_toks) {
+        std::printf("  [FAIL] inspect_prompt_cache mismatch (pos=%d kv=%d toks=%zu)\n",
+                    info.position, static_cast<int>(info.kv_dtype), info.tokens.size());
+        return 1;
+    }
+
+    std::printf("  [PASS] Periodic 4096-grid GDN checkpoints + Pinned Sys + restore_prefix + inspect_prompt_cache\n");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -420,6 +501,7 @@ int main(int argc, char** argv) {
     failures += test_prompt_cache_and_tiered_gtt("Hybrid-GDN-FP4", make_small_hybrid_test_config(), rxinfer::DType::FP4_E2M1_G16);
 
     failures += test_rxr4_roundtrip();
+    failures += test_periodic_checkpoints_and_restore();
 
     if (failures != 0) {
         std::printf("\nParity tests failed (%d)!\n", failures);

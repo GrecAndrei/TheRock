@@ -29,6 +29,7 @@ add_library(rxinfer_core STATIC
     src/arena.cpp
     src/config_json.cpp
     src/loader.cpp
+    src/markdown.cpp
     src/sampler.cpp
     src/tokenizer.cpp
     src/engine.cpp

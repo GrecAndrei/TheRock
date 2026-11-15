@@ -25,8 +25,18 @@ struct EngineOptions {
     bool enable_hip_graph = true;
     double kv_vram_gb = -1.0;          // < 0: auto VRAM cap with GTT spillover; 0: all GTT; > 0: explicit VRAM cap (GiB)
     int32_t decode_attn_splits = 0;    // 0: auto (32 for short ctx, 64 for >= 16k ctx)
-    int32_t max_prefix_snapshots = 2;  // Max host GDN checkpoints in RAM for in-memory LCP rollback
+    int32_t max_prefix_snapshots = 8;  // Max host GDN checkpoints in RAM for in-memory LCP rollback
 };
+
+struct PromptCacheInfo {
+    std::string signature;
+    int32_t position = 0;
+    int32_t last_next_token = -1;
+    DType kv_dtype = DType::F16;
+    std::vector<int32_t> tokens;
+};
+
+PromptCacheInfo inspect_prompt_cache(const std::string& path, bool load_tokens = false);
 
 struct PrefillCacheResult {
     int32_t next_token = 0;
@@ -84,7 +94,9 @@ public:
     PrefillCacheResult prefill_cached(const std::vector<int32_t>& tokens, bool save_checkpoint = true);
 
     // In-memory GDN prefix checkpoints & persistent disk prompt cache (.rxprompt)
-    void save_prefix_checkpoint();
+    void save_prefix_checkpoint(bool pin = false);
+    void unpin_prefix_checkpoints();
+    bool restore_prefix(const std::vector<int32_t>& tokens);
     void clear_prefix_cache();
     void save_prompt_cache(const std::string& path) const;
     int32_t load_prompt_cache(const std::string& path);
@@ -124,7 +136,9 @@ public:
     const ModelWeights& weights() const { return weights_; }
     const EngineOptions& options() const { return opts_; }
     int32_t position() const { return cur_pos_; }
+    int32_t last_next_token() const { return last_next_token_; }
     const std::vector<int32_t>& cached_tokens() const { return cached_tokens_; }
+    std::string cache_signature() const;
     int32_t num_prefix_checkpoints() const { return static_cast<int32_t>(prefix_snapshots_.size()); }
     size_t kv_vram_bytes() const { return kv_vram_bytes_; }
     size_t kv_gtt_bytes() const { return kv_gtt_bytes_; }
@@ -140,11 +154,12 @@ private:
     struct PrefixSnapshot {
         std::vector<int32_t> tokens;
         std::vector<uint8_t> gdn_state;
+        bool pinned = false;
     };
 
     void init_arenas();
     void ensure_speculative_buffers();
-    void record_prefix_snapshot();
+    void record_prefix_snapshot(bool pin = false);
     void capture_decode_graph();
     hipGraphExec_t get_or_capture_verify_graph(int M);
     void run_layer_decode(int32_t layer_idx);

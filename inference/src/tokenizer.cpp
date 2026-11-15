@@ -1120,6 +1120,14 @@ const char* Tokenizer::chat_format_name(ChatFormat fmt) {
     return "ChatML";
 }
 
+std::string Tokenizer::format_system_prefix(const std::string& system_prompt) const {
+    if (system_prompt.empty()) return {};
+    if (detect_chat_format() == ChatFormat::Llama3) {
+        return "<|start_header_id|>system<|end_header_id|>\n\n" + system_prompt + "<|eot_id|>";
+    }
+    return "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+}
+
 std::string Tokenizer::format_chat_turn(const std::string& user_prompt,
                                         const std::string& system_prompt,
                                         bool is_first_turn,

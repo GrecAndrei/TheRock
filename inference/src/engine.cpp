@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -57,7 +58,63 @@ std::string build_cache_signature(const ModelConfig& c, DType kv_dt) {
     return oss.str();
 }
 
+DType parse_kv_dtype_from_sig(const std::string& sig) {
+    const size_t pos = sig.find(";kvdt=");
+    if (pos != std::string::npos) {
+        const int v = std::atoi(sig.c_str() + pos + 6);
+        if (v == static_cast<int>(DType::F16)) return DType::F16;
+        if (v == static_cast<int>(DType::FP8_E4M3)) return DType::FP8_E4M3;
+        if (v == static_cast<int>(DType::FP4_E2M1_G16)) return DType::FP4_E2M1_G16;
+    }
+    return DType::F16;
+}
+
 } // namespace
+
+PromptCacheInfo inspect_prompt_cache(const std::string& path, bool load_tokens) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open prompt cache file: " + path);
+    }
+
+    char magic[4]{};
+    uint32_t version = 0;
+    uint64_t sig_len = 0, gdn_bytes = 0, page_bytes = 0;
+    int32_t pos = 0, last_tok = -1, n_attn = 0, active_pages = 0;
+
+    ifs.read(magic, 4);
+    ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
+    ifs.read(reinterpret_cast<char*>(&sig_len), sizeof(sig_len));
+    ifs.read(reinterpret_cast<char*>(&pos), sizeof(pos));
+    ifs.read(reinterpret_cast<char*>(&last_tok), sizeof(last_tok));
+    ifs.read(reinterpret_cast<char*>(&gdn_bytes), sizeof(gdn_bytes));
+    ifs.read(reinterpret_cast<char*>(&n_attn), sizeof(n_attn));
+    ifs.read(reinterpret_cast<char*>(&active_pages), sizeof(active_pages));
+    ifs.read(reinterpret_cast<char*>(&page_bytes), sizeof(page_bytes));
+
+    if (!ifs || std::memcmp(magic, "RXPC", 4) != 0 || version != 1 || sig_len > (1ULL << 20) || pos < 0) {
+        throw std::runtime_error("Invalid RXPC prompt cache header: " + path);
+    }
+
+    PromptCacheInfo info;
+    info.signature.assign(sig_len, '\0');
+    ifs.read(info.signature.data(), sig_len);
+    if (!ifs) {
+        throw std::runtime_error("Truncated RXPC prompt cache header: " + path);
+    }
+    info.position = pos;
+    info.last_next_token = last_tok;
+    info.kv_dtype = parse_kv_dtype_from_sig(info.signature);
+
+    if (load_tokens && pos > 0) {
+        info.tokens.resize(pos);
+        ifs.read(reinterpret_cast<char*>(info.tokens.data()), static_cast<size_t>(pos) * sizeof(int32_t));
+        if (!ifs) {
+            throw std::runtime_error("Truncated RXPC prompt cache tokens: " + path);
+        }
+    }
+    return info;
+}
 
 InferenceEngine::InferenceEngine(ModelWeights weights, EngineOptions opts)
     : weights_(std::move(weights)), opts_(opts) {
@@ -375,11 +432,16 @@ void InferenceEngine::clear_prefix_cache() {
     prefix_snapshots_.clear();
 }
 
-void InferenceEngine::record_prefix_snapshot() {
+std::string InferenceEngine::cache_signature() const {
+    return build_cache_signature(weights_.config, opts_.kv_dtype);
+}
+
+void InferenceEngine::record_prefix_snapshot(bool pin) {
     if (opts_.max_prefix_snapshots <= 0 || cached_tokens_.empty() || gdn_total_bytes_ == 0) return;
 
     for (size_t i = 0; i < prefix_snapshots_.size(); ++i) {
         if (prefix_snapshots_[i].tokens == cached_tokens_) {
+            prefix_snapshots_[i].pinned = prefix_snapshots_[i].pinned || pin;
             if (i + 1 < prefix_snapshots_.size()) {
                 auto snap = std::move(prefix_snapshots_[i]);
                 prefix_snapshots_.erase(prefix_snapshots_.begin() + i);
@@ -393,17 +455,87 @@ void InferenceEngine::record_prefix_snapshot() {
     PrefixSnapshot snap;
     snap.tokens = cached_tokens_;
     snap.gdn_state.resize(gdn_total_bytes_);
+    snap.pinned = pin;
     RX_HIP_CHECK(hipMemcpy(snap.gdn_state.data(), d_gdn_base_, gdn_total_bytes_, hipMemcpyDeviceToHost));
 
-    if (static_cast<int32_t>(prefix_snapshots_.size()) >= opts_.max_prefix_snapshots) {
-        prefix_snapshots_.erase(prefix_snapshots_.begin());
+    if (pin) {
+        for (auto& existing : prefix_snapshots_) {
+            existing.pinned = false;
+        }
+    }
+
+    while (static_cast<int32_t>(prefix_snapshots_.size()) >= opts_.max_prefix_snapshots) {
+        auto victim = prefix_snapshots_.begin();
+        while (victim != prefix_snapshots_.end() && victim->pinned) {
+            ++victim;
+        }
+        if (victim == prefix_snapshots_.end()) {
+            victim = prefix_snapshots_.begin();
+        }
+        prefix_snapshots_.erase(victim);
     }
     prefix_snapshots_.push_back(std::move(snap));
 }
 
-void InferenceEngine::save_prefix_checkpoint() {
+void InferenceEngine::save_prefix_checkpoint(bool pin) {
     if (opts_.max_prefix_snapshots <= 0 || cached_tokens_.empty() || gdn_total_bytes_ == 0) return;
-    record_prefix_snapshot();
+    record_prefix_snapshot(pin);
+}
+
+void InferenceEngine::unpin_prefix_checkpoints() {
+    for (auto& snap : prefix_snapshots_) {
+        snap.pinned = false;
+    }
+}
+
+bool InferenceEngine::restore_prefix(const std::vector<int32_t>& tokens) {
+    if (tokens.empty()) {
+        reset_state();
+        return true;
+    }
+    if (static_cast<int64_t>(tokens.size()) > opts_.max_seq_len) {
+        throw std::runtime_error("Context length exceeds engine max_seq_len");
+    }
+
+    if (cur_pos_ == static_cast<int32_t>(tokens.size()) &&
+        cached_tokens_.size() == tokens.size() &&
+        std::equal(cached_tokens_.begin(), cached_tokens_.end(), tokens.begin())) {
+        return true;
+    }
+
+    size_t kv_lcp = 0;
+    while (kv_lcp < kv_resident_tokens_.size() &&
+           kv_lcp < tokens.size() &&
+           kv_resident_tokens_[kv_lcp] == tokens[kv_lcp]) {
+        ++kv_lcp;
+    }
+
+    if (kv_lcp == tokens.size()) {
+        if (gdn_total_bytes_ == 0) {
+            cur_pos_ = static_cast<int32_t>(tokens.size());
+            cached_tokens_ = tokens;
+            last_next_token_ = -1;
+            return true;
+        }
+        for (size_t i = 0; i < prefix_snapshots_.size(); ++i) {
+            if (prefix_snapshots_[i].tokens.size() == tokens.size() &&
+                std::equal(prefix_snapshots_[i].tokens.begin(), prefix_snapshots_[i].tokens.end(), tokens.begin())) {
+                PrefixSnapshot snap = std::move(prefix_snapshots_[i]);
+                prefix_snapshots_.erase(prefix_snapshots_.begin() + i);
+                RX_HIP_CHECK(hipMemcpyAsync(d_gdn_base_, snap.gdn_state.data(), gdn_total_bytes_,
+                                            hipMemcpyHostToDevice, stream_));
+                RX_HIP_CHECK(hipStreamSynchronize(stream_));
+                prefix_snapshots_.push_back(std::move(snap));
+                cur_pos_ = static_cast<int32_t>(tokens.size());
+                cached_tokens_ = tokens;
+                last_next_token_ = -1;
+                return true;
+            }
+        }
+    }
+
+    prefill_cached(tokens, false);
+    return false;
 }
 
 void InferenceEngine::run_layer_decode(int32_t l) {
@@ -739,12 +871,42 @@ PrefillCacheResult InferenceEngine::prefill_cached(const std::vector<int32_t>& t
     }
 
     const size_t total = tokens.size();
+    std::vector<size_t> milestones;
+    if (save_checkpoint && opts_.max_prefix_snapshots > 0 && gdn_total_bytes_ > 0 &&
+        total > static_cast<size_t>(best_p) + 4096) {
+        const size_t span = total - static_cast<size_t>(best_p);
+        const size_t avail_slots = std::max<size_t>(1, (opts_.max_prefix_snapshots > 2) ? (opts_.max_prefix_snapshots - 2) : 1);
+        size_t stride = 4096;
+        while ((span / stride) > avail_slots) {
+            stride *= 2;
+        }
+        for (size_t m = ((static_cast<size_t>(best_p) / stride) + 1) * stride; m < total; m += stride) {
+            milestones.push_back(m);
+        }
+        const size_t last_grid = ((total - 1) / 4096) * 4096;
+        if (last_grid > static_cast<size_t>(best_p) && last_grid < total) {
+            if (std::find(milestones.begin(), milestones.end(), last_grid) == milestones.end()) {
+                milestones.push_back(last_grid);
+                std::sort(milestones.begin(), milestones.end());
+            }
+        }
+    }
+
+    size_t ms_idx = 0;
     size_t off = static_cast<size_t>(best_p);
     while (off < total) {
-        const int chunk = static_cast<int>(std::min<size_t>(opts_.max_batch_tokens, total - off));
+        while (ms_idx < milestones.size() && milestones[ms_idx] <= off) {
+            ++ms_idx;
+        }
+        const size_t stop = (ms_idx < milestones.size()) ? milestones[ms_idx] : total;
+        const int chunk = static_cast<int>(std::min<size_t>(opts_.max_batch_tokens, stop - off));
         const bool is_last = (off + chunk == total);
         run_forward_batch(tokens.data() + off, chunk, is_last);
         off += chunk;
+        if (off == stop && off < total) {
+            record_prefix_snapshot(false);
+            ++ms_idx;
+        }
     }
 
     int32_t next_tok = 0;
@@ -752,8 +914,8 @@ PrefillCacheResult InferenceEngine::prefill_cached(const std::vector<int32_t>& t
     RX_HIP_CHECK(hipStreamSynchronize(stream_));
     last_next_token_ = next_tok;
 
-    if (save_checkpoint && opts_.max_prefix_snapshots > 0 && tokens.size() >= 64) {
-        record_prefix_snapshot();
+    if (save_checkpoint && opts_.max_prefix_snapshots > 0 && tokens.size() >= 8) {
+        record_prefix_snapshot(false);
     }
 
     PrefillCacheResult res;
@@ -766,7 +928,8 @@ PrefillCacheResult InferenceEngine::prefill_cached(const std::vector<int32_t>& t
 
 void InferenceEngine::save_prompt_cache(const std::string& path) const {
     RX_HIP_CHECK(hipStreamSynchronize(stream_));
-    std::ofstream ofs(path, std::ios::binary);
+    const std::string tmp_path = path + ".rxtmp";
+    std::ofstream ofs(tmp_path, std::ios::binary);
     if (!ofs) {
         throw std::runtime_error("Failed to open prompt cache output file: " + path);
     }
@@ -832,7 +995,14 @@ void InferenceEngine::save_prompt_cache(const std::string& path) const {
 
     ofs.flush();
     if (!ofs) {
+        ofs.close();
+        (void)std::remove(tmp_path.c_str());
         throw std::runtime_error("Failed writing prompt cache file: " + path);
+    }
+    ofs.close();
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        (void)std::remove(tmp_path.c_str());
+        throw std::runtime_error("Failed finalizing prompt cache file: " + path);
     }
 }
 
@@ -935,8 +1105,15 @@ int32_t InferenceEngine::load_prompt_cache(const std::string& path) {
         PrefixSnapshot snap;
         snap.tokens = cached_tokens_;
         snap.gdn_state = std::move(gdn_host);
-        if (static_cast<int32_t>(prefix_snapshots_.size()) >= opts_.max_prefix_snapshots) {
-            prefix_snapshots_.erase(prefix_snapshots_.begin());
+        while (static_cast<int32_t>(prefix_snapshots_.size()) >= opts_.max_prefix_snapshots) {
+            auto victim = prefix_snapshots_.begin();
+            while (victim != prefix_snapshots_.end() && victim->pinned) {
+                ++victim;
+            }
+            if (victim == prefix_snapshots_.end()) {
+                victim = prefix_snapshots_.begin();
+            }
+            prefix_snapshots_.erase(victim);
         }
         prefix_snapshots_.push_back(std::move(snap));
     }

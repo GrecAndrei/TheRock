@@ -45,6 +45,7 @@ public:
 
     // Format either Turn 0 (is_first_turn=true) or an incremental Turn N>0 delta
     // (closing the previous assistant turn when close_previous_turn=true).
+    std::string format_system_prefix(const std::string& system_prompt) const;
     std::string format_chat_turn(const std::string& user_prompt,
                                  const std::string& system_prompt = "",
                                  bool is_first_turn = true,

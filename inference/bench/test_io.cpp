@@ -4,6 +4,7 @@
 #include "rxinfer/config.hpp"
 #include "rxinfer/engine.hpp"
 #include "rxinfer/loader.hpp"
+#include "rxinfer/markdown.hpp"
 #include "rxinfer/sampler.hpp"
 #include "rxinfer/tokenizer.hpp"
 
@@ -1163,11 +1164,127 @@ int test_sampler_and_multiturn_chat() {
     return 0;
 }
 
+std::string strip_ansi_sgr(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == '\x1b' && i + 1 < s.size() && s[i + 1] == '[') {
+            size_t j = i + 2;
+            while (j < s.size() && s[j] != 'm') ++j;
+            if (j < s.size() && s[j] == 'm') {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push_back(s[i++]);
+    }
+    return out;
+}
+
+std::string render_markdown_chunks(const std::string& src, bool enabled, size_t chunk_sz) {
+    std::string out;
+    rxinfer::MarkdownStreamFormatter fmt(enabled, [&](std::string_view sv) { out.append(sv); });
+    if (chunk_sz == 0) {
+        fmt.push(src);
+    } else {
+        for (size_t i = 0; i < src.size(); i += chunk_sz) {
+            fmt.push(std::string_view(src).substr(i, std::min(chunk_sz, src.size() - i)));
+        }
+    }
+    fmt.finish();
+    return out;
+}
+
+int test_markdown_formatter() {
+    const std::string doc =
+        "<think>\nLet's check *reasoning* and **nested bold** plus 3 * 4.\n</think>\n\n"
+        "# Heading One\n"
+        "## Sub Heading\n\n"
+        "Here is *italic*, **bold**, ***bold italic***, ~~strike~~, `inline_code`, and \\*escaped\\*.\n"
+        "Math: 3 * 4 = 12 and 2*x + 3*y and snake_case_var stay untouched.\n\n"
+        "*   **Item One:** Bullet with nested **bold**.\n"
+        "    - Sub-bullet with *emphasis*.\n"
+        "1. Ordered first\n"
+        "2. Ordered second\n\n"
+        "> Quoted *text* here\n"
+        "---\n"
+        "```cpp\n"
+        "int a = 3 * 4; // **not bold** inside code fence\n"
+        "```\n"
+        "Unicode UTF-8: café 🚀 日本語\n";
+
+    // 1. Raw pass-through mode across 1-byte chunks preserves exact UTF-8 bytes
+    const std::string raw_1 = render_markdown_chunks(doc, false, 1);
+    const std::string raw_all = render_markdown_chunks(doc, false, 0);
+    if (raw_1 != doc || raw_all != doc) {
+        std::printf("[FAIL] Markdown disabled pass-through altered text\n");
+        return 1;
+    }
+
+    // 2. Formatted mode across whole-doc, 1-byte, 2-byte, 3-byte, and 5-byte streams
+    const std::string f_all = render_markdown_chunks(doc, true, 0);
+    const std::string f_1 = render_markdown_chunks(doc, true, 1);
+    const std::string f_2 = render_markdown_chunks(doc, true, 2);
+    const std::string f_3 = render_markdown_chunks(doc, true, 3);
+    const std::string f_5 = render_markdown_chunks(doc, true, 5);
+
+    if (f_1 != f_all || f_2 != f_all || f_3 != f_all || f_5 != f_all) {
+        std::printf("[FAIL] Markdown streaming chunk-size invariance mismatch!\n");
+        std::printf("--- f_all ---\n%s\n--- f_1 ---\n%s\n", strip_ansi_sgr(f_all).c_str(), strip_ansi_sgr(f_1).c_str());
+        return 1;
+    }
+
+    const std::string plain = strip_ansi_sgr(f_all);
+    // Check ANSI codes are present and end cleanly with SGR reset (if any style was used)
+    if (f_all.find("\x1b[") == std::string::npos) {
+        std::printf("[FAIL] Markdown formatter produced no ANSI SGR escapes\n");
+        return 1;
+    }
+    // Verify ** / * markers inside prose were stripped while literal math/code/escapes remain intact
+    if (plain.find("italic, bold, bold italic, strike, inline_code, and *escaped*.") == std::string::npos) {
+        std::printf("[FAIL] Markdown inline formatting plain text mismatch:\n%s\n", plain.c_str());
+        return 1;
+    }
+    if (plain.find("3 * 4 = 12 and 2*x + 3*y and snake_case_var") == std::string::npos) {
+        std::printf("[FAIL] Markdown math/snake_case got mangled:\n%s\n", plain.c_str());
+        return 1;
+    }
+    if (plain.find("int a = 3 * 4; // **not bold** inside code fence") == std::string::npos) {
+        std::printf("[FAIL] Markdown code fence altered code content:\n%s\n", plain.c_str());
+        return 1;
+    }
+    if (plain.find("• Item One: Bullet with nested bold.") == std::string::npos ||
+        plain.find("▪ Sub-bullet with emphasis.") == std::string::npos) {
+        std::printf("[FAIL] Markdown bullet + bold colon formatting mismatch:\n%s\n", plain.c_str());
+        return 1;
+    }
+    if (plain.find("café 🚀 日本語") == std::string::npos) {
+        std::printf("[FAIL] Markdown UTF-8 text corrupted:\n%s\n", plain.c_str());
+        return 1;
+    }
+    // Check unclosed italic SGR cleanup + pending trailing delimiter flush on finish()
+    const std::string unclosed_italic = render_markdown_chunks("hello *world", true, 1);
+    if (strip_ansi_sgr(unclosed_italic) != "hello world" ||
+        unclosed_italic.rfind("\x1b[0m") == std::string::npos) {
+        std::printf("[FAIL] Unclosed italic SGR cleanup mismatch: '%s'\n", unclosed_italic.c_str());
+        return 1;
+    }
+    const std::string trailing_star = strip_ansi_sgr(render_markdown_chunks("hello *", true, 1));
+    if (trailing_star != "hello *") {
+        std::printf("[FAIL] Trailing asterisk flush mismatch: '%s'\n", trailing_star.c_str());
+        return 1;
+    }
+
+    std::printf("[PASS] MarkdownStreamFormatter (streaming byte/chunk invariance, SGR, UTF-8, math, fences, <think>)\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
     if (test_tokenizer() != 0) return 1;
     if (test_sampler_and_multiturn_chat() != 0) return 1;
+    if (test_markdown_formatter() != 0) return 1;
     if (test_safetensors_hf_qwen35_e2e() != 0) return 1;
     if (test_gguf_q4k_q6k_tokenizer_e2e() != 0) return 1;
     if (test_gguf_qwen35_iq_and_rxr4_e2e() != 0) return 1;
