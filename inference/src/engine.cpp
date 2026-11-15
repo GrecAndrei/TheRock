@@ -8,18 +8,65 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
 namespace rxinfer {
+namespace {
+
+std::string build_cache_signature(const ModelConfig& c, DType kv_dt) {
+    std::ostringstream oss;
+    oss << "type=" << c.model_type
+        << ";V=" << c.vocab_size
+        << ";H=" << c.hidden_size
+        << ";I=" << c.intermediate_size
+        << ";L=" << c.num_hidden_layers
+        << ";norm=" << static_cast<int>(c.norm_kind)
+        << ";eps=" << c.rms_norm_eps
+        << ";Hq=" << c.num_attention_heads
+        << ";Hkv=" << c.num_key_value_heads
+        << ";D=" << c.head_dim
+        << ";qkn=" << (c.qk_norm ? 1 : 0)
+        << ";og=" << (c.attn_output_gate ? 1 : 0)
+        << ";rk=" << static_cast<int>(c.rope_kind)
+        << ";rt=" << c.rope_theta
+        << ";prf=" << c.partial_rotary_factor
+        << ";mri=" << (c.mrope_interleaved ? 1 : 0)
+        << ";mrs=";
+    for (size_t i = 0; i < c.mrope_section.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << c.mrope_section[i];
+    }
+    oss << ";lkh=" << c.linear_num_key_heads
+        << ";lkd=" << c.linear_key_head_dim
+        << ";lvh=" << c.linear_num_value_heads
+        << ";lvd=" << c.linear_value_head_dim
+        << ";lck=" << c.linear_conv_kernel_dim
+        << ";ltv=" << (c.gdn_tiled_v_heads ? 1 : 0)
+        << ";kvdt=" << static_cast<int>(kv_dt)
+        << ";pg=" << attn::KV_PAGE_TOKENS
+        << ";lt=";
+    for (int32_t l = 0; l < c.num_hidden_layers; ++l) {
+        const auto k =
+            (l < static_cast<int32_t>(c.layer_types.size())) ? c.layer_types[l] : LayerKind::FullAttention;
+        oss << ((k == LayerKind::FullAttention) ? 'A' : 'G');
+    }
+    return oss.str();
+}
+
+} // namespace
 
 InferenceEngine::InferenceEngine(ModelWeights weights, EngineOptions opts)
     : weights_(std::move(weights)), opts_(opts) {
     if (opts_.max_seq_len <= 0) opts_.max_seq_len = weights_.config.max_position_embeddings;
     if (opts_.max_verify_tokens < 1) opts_.max_verify_tokens = 1;
     if (opts_.max_verify_tokens > 16) opts_.max_verify_tokens = 16;
-    if (opts_.max_batch_tokens <= 0) opts_.max_batch_tokens = 256;
+    if (opts_.max_batch_tokens <= 0) opts_.max_batch_tokens = 512;
     if (opts_.max_batch_tokens < opts_.max_verify_tokens) opts_.max_batch_tokens = opts_.max_verify_tokens;
+    if (opts_.max_prefix_snapshots < 0) opts_.max_prefix_snapshots = 0;
 
     RX_HIP_CHECK(hipStreamCreate(&stream_));
     init_arenas();
@@ -39,6 +86,11 @@ InferenceEngine::~InferenceEngine() {
     if (decode_graph_exec_) (void)hipGraphExecDestroy(decode_graph_exec_);
     if (decode_graph_) (void)hipGraphDestroy(decode_graph_);
     if (stream_) (void)hipStreamDestroy(stream_);
+
+    if (d_gdn_backup_) (void)hipFree(d_gdn_backup_);
+    if (d_gdn_replay_qkv_) (void)hipFree(d_gdn_replay_qkv_);
+    if (d_gdn_replay_ba_) (void)hipFree(d_gdn_replay_ba_);
+    if (h_kv_gtt_pool_) (void)hipHostFree(h_kv_gtt_pool_);
 }
 
 void InferenceEngine::init_arenas() {
@@ -48,6 +100,7 @@ void InferenceEngine::init_arenas() {
     const int32_t V = c.vocab_size;
     const int32_t L = c.num_hidden_layers;
     const int32_t B = opts_.max_batch_tokens;
+    const int32_t MV = opts_.max_verify_tokens;
 
     attn_params_.num_q_heads = c.num_attention_heads;
     attn_params_.num_kv_heads = c.num_key_value_heads;
@@ -88,45 +141,22 @@ void InferenceEngine::init_arenas() {
         }
     }
 
-    // 1. State Arena: KV caches + contiguous GDN conv/recurrent state (+ optional speculative backup)
-    const size_t kv_data_b = (n_attn > 0) ? attn::kv_cache_data_bytes(attn_params_) : 0;
-    const size_t kv_sc_b = (n_attn > 0) ? attn::kv_cache_scales_bytes(attn_params_) : 0;
+    if (opts_.decode_attn_splits > 0) {
+        decode_splits_ = std::max(1, std::min(256, opts_.decode_attn_splits));
+    } else {
+        decode_splits_ = (opts_.max_seq_len >= 16384) ? 64 : 32;
+    }
+
+    const int32_t prefill_sub_m = std::min<int32_t>(B, 512);
+    const int32_t prefill_split_kv = (opts_.max_seq_len >= 16384) ? 8 : 4;
+
+    // Compute GDN active state budget (speculative backup & replay buffers are allocated lazily)
     const size_t gdn_conv_b = (n_gdn > 0) ? gdn::gdn_conv_state_bytes(gdn_params_) : 0;
     const size_t gdn_rec_b = (n_gdn > 0) ? gdn::gdn_recurrent_state_bytes(gdn_params_) : 0;
-
-    const size_t per_attn_bytes = 2 * align_up(kv_data_b, 256) + 2 * align_up(kv_sc_b, 256);
     const size_t per_gdn_bytes = align_up(gdn_conv_b, 256) + align_up(gdn_rec_b, 256);
     gdn_total_bytes_ = static_cast<size_t>(n_gdn) * per_gdn_bytes;
-    const bool alloc_gdn_backup = (n_gdn > 0 && opts_.max_verify_tokens > 1);
-    const size_t state_total = static_cast<size_t>(n_attn) * per_attn_bytes +
-                               gdn_total_bytes_ +
-                               (alloc_gdn_backup ? gdn_total_bytes_ : 0) + 4096;
 
-    state_arena_.init(state_total, "state");
-    kv_caches_.resize(n_attn);
-    for (int32_t i = 0; i < n_attn; ++i) {
-        kv_caches_[i].k_data = state_arena_.alloc(kv_data_b, 256);
-        kv_caches_[i].v_data = state_arena_.alloc(kv_data_b, 256);
-        kv_caches_[i].k_scales = (kv_sc_b > 0) ? state_arena_.alloc(kv_sc_b, 256) : nullptr;
-        kv_caches_[i].v_scales = (kv_sc_b > 0) ? state_arena_.alloc(kv_sc_b, 256) : nullptr;
-    }
-    gdn_states_.resize(n_gdn);
-    if (n_gdn > 0) {
-        d_gdn_base_ = state_arena_.alloc(gdn_total_bytes_, 256);
-        uint8_t* ptr = static_cast<uint8_t*>(d_gdn_base_);
-        for (int32_t i = 0; i < n_gdn; ++i) {
-            gdn_states_[i].conv_state = reinterpret_cast<__half*>(ptr);
-            ptr += align_up(gdn_conv_b, 256);
-            gdn_states_[i].recurrent_state = reinterpret_cast<float*>(ptr);
-            ptr += align_up(gdn_rec_b, 256);
-        }
-        if (alloc_gdn_backup) {
-            d_gdn_backup_ = state_arena_.alloc(gdn_total_bytes_, 256);
-        }
-    }
-
-    // 2. Scratch Arena: reusable activation buffers + GEMM split-K + logits + verify replay
-    const int32_t MV = opts_.max_verify_tokens;
+    // Compute base Scratch Arena size (without optional GTT staging buffer)
     const int32_t q_dim = (n_attn > 0) ? (c.num_attention_heads * c.head_dim) : 0;
     const int32_t q_out = q_dim * (c.attn_output_gate ? 2 : 1);
     const int32_t kv_out = (n_attn > 0) ? (2 * c.num_key_value_heads * c.head_dim) : 0;
@@ -139,14 +169,16 @@ void InferenceEngine::init_arenas() {
     const int32_t max_attn_dim = std::max({q_dim, gdn_val_dim, 1});
     const int32_t max_small_gemm_N = std::max({H, q_out, kv_out, 2 * I, gdn_val_dim, (V < 16384 ? V : 1), 1});
 
-    const size_t split_bytes = (n_attn > 0) ? attn::decode_splitk_scratch_bytes(attn_params_, 16, 16) : 256;
-    const size_t tmp_bytes = quant::r4_g64_tmp_bytes(16, max_small_gemm_N);
+    const size_t decode_split_bytes =
+        (n_attn > 0) ? attn::decode_splitk_scratch_bytes(attn_params_, MV, decode_splits_) : 256;
+    const size_t prefill_split_bytes =
+        (n_attn > 0) ? attn::prefill_splitk_scratch_bytes(attn_params_, B, prefill_sub_m, prefill_split_kv) : 256;
+    const size_t attn_split_bytes = std::max(decode_split_bytes, prefill_split_bytes);
+    const size_t tmp_bytes = quant::r4_g64_tmp_bytes(MV, max_small_gemm_N);
     const size_t logits_bytes = align_up(static_cast<size_t>(MV) * static_cast<size_t>(V) * sizeof(__half), 256);
     const size_t argmax_b = ops::argmax_tmp_bytes(MV);
-    const size_t replay_qkv_b = alloc_gdn_backup ? (static_cast<size_t>(n_gdn) * MV * gdn_conv_dim * sizeof(__half)) : 0;
-    const size_t replay_ba_b = alloc_gdn_backup ? (static_cast<size_t>(n_gdn) * MV * (2 * c.linear_num_value_heads) * sizeof(__half)) : 0;
 
-    const size_t scratch_total =
+    const size_t scratch_base_total =
         align_up(sizeof(StepParams), 256) +
         align_up(static_cast<size_t>(MV) * sizeof(int32_t), 256) +
         align_up(static_cast<size_t>(B) * sizeof(int32_t), 256) +
@@ -156,14 +188,126 @@ void InferenceEngine::init_arenas() {
         align_up(static_cast<size_t>(B) * max_attn_dim * sizeof(__half), 256) +
         align_up(static_cast<size_t>(B) * max_attn_dim * sizeof(__half), 256) +
         align_up(static_cast<size_t>(B) * std::max(1, 2 * c.linear_num_value_heads) * sizeof(__half), 256) +
-        align_up(split_bytes, 256) +
+        align_up(attn_split_bytes, 256) +
         align_up(tmp_bytes, 256) +
         align_up(logits_bytes, 256) +
         align_up(argmax_b, 256) +
-        align_up(replay_qkv_b, 256) +
-        align_up(replay_ba_b, 256) +
         4096;
 
+    // Tiered Paged KV Cache split (VRAM + mapped host GTT spillover)
+    kv_layout_ = (n_attn > 0) ? attn::compute_kv_page_layout(attn_params_) : attn::KVPageLayout{};
+    kv_total_pages_ = (n_attn > 0) ? static_cast<int32_t>(div_ceil(opts_.max_seq_len, attn::KV_PAGE_TOKENS)) : 0;
+    vram_kv_pages_ = 0;
+    gtt_kv_pages_ = 0;
+    kv_vram_bytes_ = 0;
+    kv_gtt_bytes_ = 0;
+
+    const size_t page_table_sec_bytes =
+        (n_attn > 0) ? static_cast<size_t>(n_attn) * align_up(static_cast<size_t>(kv_total_pages_) * sizeof(uint8_t*), 256)
+                     : 0;
+
+    int32_t stage_pages = 0;
+    size_t stage_bytes = 0;
+
+    if (n_attn > 0 && kv_total_pages_ > 0) {
+        const size_t per_step_page_bytes = static_cast<size_t>(n_attn) * kv_layout_.page_bytes;
+        if (opts_.kv_vram_gb == 0.0) {
+            vram_kv_pages_ = 0;
+        } else if (opts_.kv_vram_gb > 0.0) {
+            const size_t cap_bytes = static_cast<size_t>(opts_.kv_vram_gb * double(1ULL << 30));
+            vram_kv_pages_ = std::min<int32_t>(
+                kv_total_pages_, static_cast<int32_t>(cap_bytes / per_step_page_bytes));
+        } else {
+            int cur_dev = 0;
+            RX_HIP_CHECK(hipGetDevice(&cur_dev));
+            const size_t free_vram = query_device_info(cur_dev).free_vram_bytes;
+            const size_t fixed_non_kv = gdn_total_bytes_ + scratch_base_total + page_table_sec_bytes;
+            const size_t fit_all_headroom = 192ULL << 20;
+            const size_t total_kv_needed = static_cast<size_t>(kv_total_pages_) * per_step_page_bytes;
+            if (free_vram > fixed_non_kv + fit_all_headroom &&
+                total_kv_needed <= (free_vram - fixed_non_kv - fit_all_headroom)) {
+                vram_kv_pages_ = kv_total_pages_;
+            } else {
+                const size_t spillover_reserve = fixed_non_kv + (24ULL << 20) + (256ULL << 20);
+                const size_t avail_kv = (free_vram > spillover_reserve) ? (free_vram - spillover_reserve) : 0;
+                vram_kv_pages_ = std::min<int32_t>(
+                    kv_total_pages_, static_cast<int32_t>(avail_kv / per_step_page_bytes));
+            }
+        }
+        gtt_kv_pages_ = kv_total_pages_ - vram_kv_pages_;
+        kv_vram_bytes_ = static_cast<size_t>(n_attn) * vram_kv_pages_ * kv_layout_.page_bytes;
+        kv_gtt_bytes_ = static_cast<size_t>(n_attn) * gtt_kv_pages_ * kv_layout_.page_bytes;
+
+        if (gtt_kv_pages_ > 0) {
+            const size_t target_stage = 20ULL << 20;
+            stage_pages = std::min<int32_t>(
+                gtt_kv_pages_,
+                std::max<int32_t>(16, static_cast<int32_t>(target_stage / std::max<size_t>(1, kv_layout_.page_bytes))));
+            stage_bytes = static_cast<size_t>(stage_pages) * kv_layout_.page_bytes;
+        }
+    }
+
+    // 1. State Arena: GDN state + VRAM KV page pool + device page tables
+    const size_t state_total = gdn_total_bytes_ + align_up(kv_vram_bytes_, 256) + page_table_sec_bytes + 4096;
+    state_arena_.init(state_total, "state");
+
+    gdn_states_.resize(n_gdn);
+    if (n_gdn > 0) {
+        d_gdn_base_ = state_arena_.alloc(gdn_total_bytes_, 256);
+        uint8_t* ptr = static_cast<uint8_t*>(d_gdn_base_);
+        for (int32_t i = 0; i < n_gdn; ++i) {
+            gdn_states_[i].conv_state = reinterpret_cast<__half*>(ptr);
+            ptr += align_up(gdn_conv_b, 256);
+            gdn_states_[i].recurrent_state = reinterpret_cast<float*>(ptr);
+            ptr += align_up(gdn_rec_b, 256);
+        }
+    }
+
+    if (kv_vram_bytes_ > 0) {
+        d_kv_vram_pool_ = state_arena_.alloc(kv_vram_bytes_, 256);
+    }
+
+    if (kv_gtt_bytes_ > 0) {
+        const hipError_t herr = hipHostMalloc(&h_kv_gtt_pool_, kv_gtt_bytes_, hipHostMallocMapped);
+        if (herr != hipSuccess) {
+            throw std::runtime_error(
+                "Failed to allocate " +
+                std::to_string(kv_gtt_bytes_ / (1024.0 * 1024.0 * 1024.0)) +
+                " GiB pinned host GTT KV pool (" + std::string(hipGetErrorString(herr)) +
+                "). Try --kv-dtype fp4 or fp8, or reduce --max-seq-len.");
+        }
+        RX_HIP_CHECK(hipHostGetDevicePointer(&d_kv_gtt_pool_, h_kv_gtt_pool_, 0));
+    }
+
+    kv_caches_.resize(n_attn);
+    d_page_tables_.resize(n_attn, nullptr);
+    if (n_attn > 0) {
+        std::vector<uint8_t*> h_ptrs(kv_total_pages_);
+        for (int32_t i = 0; i < n_attn; ++i) {
+            for (int32_t p = 0; p < kv_total_pages_; ++p) {
+                if (p < vram_kv_pages_) {
+                    h_ptrs[p] = static_cast<uint8_t*>(d_kv_vram_pool_) +
+                                (static_cast<size_t>(i) * vram_kv_pages_ + p) * kv_layout_.page_bytes;
+                } else {
+                    h_ptrs[p] = static_cast<uint8_t*>(d_kv_gtt_pool_) +
+                                (static_cast<size_t>(i) * gtt_kv_pages_ + (p - vram_kv_pages_)) * kv_layout_.page_bytes;
+                }
+            }
+            const size_t pt_bytes = static_cast<size_t>(kv_total_pages_) * sizeof(uint8_t*);
+            d_page_tables_[i] = static_cast<uint8_t**>(state_arena_.alloc(pt_bytes, 256));
+            RX_HIP_CHECK(hipMemcpy(d_page_tables_[i], h_ptrs.data(), pt_bytes, hipMemcpyHostToDevice));
+
+            kv_caches_[i].page_ptrs = d_page_tables_[i];
+            kv_caches_[i].num_pages = kv_total_pages_;
+            kv_caches_[i].num_vram_pages = vram_kv_pages_;
+            kv_caches_[i].page_bytes = kv_layout_.page_bytes;
+            kv_caches_[i].data_sec_bytes = kv_layout_.data_sec_bytes;
+            kv_caches_[i].sc_sec_bytes = kv_layout_.sc_sec_bytes;
+        }
+    }
+
+    // 2. Scratch Arena: reusable activations + split-KV attention + GEMM split-K + logits + GTT stage buffer
+    const size_t scratch_total = scratch_base_total + align_up(stage_bytes, 256);
     scratch_arena_.init(scratch_total, "scratch");
     d_step_ = static_cast<StepParams*>(scratch_arena_.alloc(sizeof(StepParams), 256));
     d_out_token_ = static_cast<int32_t*>(scratch_arena_.alloc(static_cast<size_t>(MV) * sizeof(int32_t), 256));
@@ -177,23 +321,89 @@ void InferenceEngine::init_arenas() {
     d_attn_out_ = static_cast<__half*>(scratch_arena_.alloc(static_cast<size_t>(B) * max_attn_dim * sizeof(__half), 256));
     d_ba_buf_ = static_cast<__half*>(
         scratch_arena_.alloc(static_cast<size_t>(B) * std::max(1, 2 * c.linear_num_value_heads) * sizeof(__half), 256));
-    d_attn_split_ = scratch_arena_.alloc(split_bytes, 256);
+    d_attn_split_ = scratch_arena_.alloc(attn_split_bytes, 256);
     d_gemm_tmp_ = static_cast<float*>(scratch_arena_.alloc(tmp_bytes, 256));
     d_logits_ = static_cast<__half*>(scratch_arena_.alloc(logits_bytes, 256));
     d_argmax_tmp_ = scratch_arena_.alloc(argmax_b, 256);
-    if (alloc_gdn_backup) {
-        d_gdn_replay_qkv_ = static_cast<__half*>(scratch_arena_.alloc(replay_qkv_b, 256));
-        d_gdn_replay_ba_ = static_cast<__half*>(scratch_arena_.alloc(replay_ba_b, 256));
+
+    uint8_t* stage_ptr = (stage_bytes > 0) ? static_cast<uint8_t*>(scratch_arena_.alloc(stage_bytes, 256)) : nullptr;
+    prefill_scratch_.split_scratch = static_cast<float*>(d_attn_split_);
+    prefill_scratch_.max_M = B;
+    prefill_scratch_.sub_m = prefill_sub_m;
+    prefill_scratch_.split_kv = prefill_split_kv;
+    prefill_scratch_.stage_buf = stage_ptr;
+    prefill_scratch_.stage_pages = stage_pages;
+}
+
+void InferenceEngine::ensure_speculative_buffers() {
+    const size_t n_gdn = gdn_states_.size();
+    if (n_gdn == 0 || opts_.max_verify_tokens <= 1 || d_gdn_backup_ != nullptr) return;
+
+    const int32_t MV = opts_.max_verify_tokens;
+    const int32_t conv_dim = gdn_params_.conv_dim();
+    const int32_t Hv = gdn_params_.num_v_heads;
+    const size_t replay_qkv_b = align_up(n_gdn * MV * conv_dim * sizeof(__half), 256);
+    const size_t replay_ba_b = align_up(n_gdn * MV * (2 * Hv) * sizeof(__half), 256);
+
+    RX_HIP_CHECK(hipMalloc(&d_gdn_backup_, gdn_total_bytes_));
+    RX_HIP_CHECK(hipMalloc(&d_gdn_replay_qkv_, replay_qkv_b));
+    RX_HIP_CHECK(hipMalloc(&d_gdn_replay_ba_, replay_ba_b));
+    speculative_vram_bytes_ = gdn_total_bytes_ + replay_qkv_b + replay_ba_b;
+
+    // Re-capture any verify graphs previously captured without GDN replay saving.
+    for (auto& kv : verify_graph_execs_) {
+        if (kv.second) (void)hipGraphExecDestroy(kv.second);
     }
+    for (auto& kv : verify_graphs_) {
+        if (kv.second) (void)hipGraphDestroy(kv.second);
+    }
+    verify_graph_execs_.clear();
+    verify_graphs_.clear();
 }
 
 void InferenceEngine::reset_state() {
     cur_pos_ = 0;
-    for (const auto& gs : gdn_states_) {
-        RX_HIP_CHECK(hipMemsetAsync(gs.conv_state, 0, gdn::gdn_conv_state_bytes(gdn_params_), stream_));
-        RX_HIP_CHECK(hipMemsetAsync(gs.recurrent_state, 0, gdn::gdn_recurrent_state_bytes(gdn_params_), stream_));
+    last_next_token_ = -1;
+    cached_tokens_.clear();
+    if (gdn_total_bytes_ > 0 && d_gdn_base_ != nullptr) {
+        RX_HIP_CHECK(hipMemsetAsync(d_gdn_base_, 0, gdn_total_bytes_, stream_));
     }
     RX_HIP_CHECK(hipStreamSynchronize(stream_));
+}
+
+void InferenceEngine::clear_prefix_cache() {
+    prefix_snapshots_.clear();
+}
+
+void InferenceEngine::record_prefix_snapshot() {
+    if (opts_.max_prefix_snapshots <= 0 || cached_tokens_.empty() || gdn_total_bytes_ == 0) return;
+
+    for (size_t i = 0; i < prefix_snapshots_.size(); ++i) {
+        if (prefix_snapshots_[i].tokens == cached_tokens_) {
+            if (i + 1 < prefix_snapshots_.size()) {
+                auto snap = std::move(prefix_snapshots_[i]);
+                prefix_snapshots_.erase(prefix_snapshots_.begin() + i);
+                prefix_snapshots_.push_back(std::move(snap));
+            }
+            return;
+        }
+    }
+
+    RX_HIP_CHECK(hipStreamSynchronize(stream_));
+    PrefixSnapshot snap;
+    snap.tokens = cached_tokens_;
+    snap.gdn_state.resize(gdn_total_bytes_);
+    RX_HIP_CHECK(hipMemcpy(snap.gdn_state.data(), d_gdn_base_, gdn_total_bytes_, hipMemcpyDeviceToHost));
+
+    if (static_cast<int32_t>(prefix_snapshots_.size()) >= opts_.max_prefix_snapshots) {
+        prefix_snapshots_.erase(prefix_snapshots_.begin());
+    }
+    prefix_snapshots_.push_back(std::move(snap));
+}
+
+void InferenceEngine::save_prefix_checkpoint() {
+    if (opts_.max_prefix_snapshots <= 0 || cached_tokens_.empty() || gdn_total_bytes_ == 0) return;
+    record_prefix_snapshot();
 }
 
 void InferenceEngine::run_layer_decode(int32_t l) {
@@ -229,7 +439,7 @@ void InferenceEngine::run_layer_decode_step(int32_t l, int M, bool save_gdn_repl
 
         attn::gqa_decode_attention(d_proj_c_, c.attn_output_gate ? d_proj_a_ : nullptr,
                                    kv, d_attn_out_, d_attn_split_, attn_params_,
-                                   M, 0, d_step_, 16, stream_);
+                                   M, 0, d_step_, decode_splits_, stream_);
 
         quant::gemm_r4_gfx12_w4a16(d_attn_out_, lw.o_proj.qs, lw.o_proj.scales,
                                    d_x_, d_gemm_tmp_, M, H, lw.o_proj.K, stream_);
@@ -381,7 +591,7 @@ void InferenceEngine::run_forward_batch(const int32_t* h_tokens, int M, bool com
                                              M, cur_pos_, nullptr, stream_, 2 * kv_dim);
 
             attn::flash_attention_prefill(d_proj_c_, c.attn_output_gate ? d_proj_a_ : nullptr,
-                                          kv, d_attn_out_, attn_params_, M, cur_pos_, stream_);
+                                          kv, d_attn_out_, attn_params_, M, cur_pos_, &prefill_scratch_, stream_);
 
             quant::gemm_r4_gfx12_w4a16(d_attn_out_, lw.o_proj.qs, lw.o_proj.scales,
                                        d_x_, d_gemm_tmp_, M, H, lw.o_proj.K, stream_);
@@ -423,11 +633,15 @@ void InferenceEngine::run_forward_batch(const int32_t* h_tokens, int M, bool com
         quant::gemm_r4_gfx12_w4a16(last_hidden, weights_.lm_head.qs, weights_.lm_head.scales,
                                    d_logits_, d_gemm_tmp_, 1, V, H, stream_);
         ops::argmax_sample(d_logits_, V, d_argmax_tmp_, d_out_token_, d_step_, stream_);
-    } else {
-        // Still apply residual add for correctness? No need since chunking finishes at next embed,
-        // wait: each batch chunk starts at embed_lookup!
     }
 
+    if (static_cast<size_t>(cur_pos_) < kv_resident_tokens_.size()) {
+        kv_resident_tokens_.resize(cur_pos_);
+    }
+    if (static_cast<size_t>(cur_pos_) == kv_resident_tokens_.size()) {
+        kv_resident_tokens_.insert(kv_resident_tokens_.end(), h_tokens, h_tokens + M);
+    }
+    cached_tokens_.insert(cached_tokens_.end(), h_tokens, h_tokens + M);
     cur_pos_ += M;
 }
 
@@ -447,7 +661,287 @@ int32_t InferenceEngine::prefill(const std::vector<int32_t>& tokens) {
     int32_t next_tok = 0;
     RX_HIP_CHECK(hipMemcpyAsync(&next_tok, d_out_token_, sizeof(next_tok), hipMemcpyDeviceToHost, stream_));
     RX_HIP_CHECK(hipStreamSynchronize(stream_));
+    last_next_token_ = next_tok;
     return next_tok;
+}
+
+PrefillCacheResult InferenceEngine::prefill_cached(const std::vector<int32_t>& tokens, bool save_checkpoint) {
+    if (tokens.empty()) throw std::runtime_error("Empty prompt in prefill_cached");
+    if (static_cast<int64_t>(tokens.size()) > opts_.max_seq_len) {
+        throw std::runtime_error("Context length exceeds engine max_seq_len");
+    }
+
+    size_t kv_lcp = 0;
+    while (kv_lcp < kv_resident_tokens_.size() &&
+           kv_lcp < tokens.size() &&
+           kv_resident_tokens_[kv_lcp] == tokens[kv_lcp]) {
+        ++kv_lcp;
+    }
+
+    // Exact 100% live state match -> 0 tokens evaluated!
+    if (kv_lcp == tokens.size() &&
+        cur_pos_ == static_cast<int32_t>(tokens.size()) &&
+        cached_tokens_.size() == tokens.size() &&
+        std::equal(cached_tokens_.begin(), cached_tokens_.end(), tokens.begin()) &&
+        last_next_token_ >= 0) {
+        PrefillCacheResult res;
+        res.next_token = last_next_token_;
+        res.matched_prefix_tokens = static_cast<int32_t>(tokens.size());
+        res.evaluated_tokens = 0;
+        res.restored_gdn_snapshot = false;
+        return res;
+    }
+
+    const size_t p_limit = std::min(kv_lcp, tokens.size() - 1);
+    int32_t best_p = 0;
+    int32_t snap_idx = -1;
+
+    if (gdn_total_bytes_ == 0) {
+        // Pure FullAttention: any KV prefix up to p_limit is valid without GDN state restore.
+        best_p = static_cast<int32_t>(p_limit);
+    } else {
+        // Check live GDN + KV state first (zero restore cost).
+        if (cur_pos_ > 0 &&
+            static_cast<size_t>(cur_pos_) <= p_limit &&
+            cached_tokens_.size() == static_cast<size_t>(cur_pos_) &&
+            std::equal(cached_tokens_.begin(), cached_tokens_.end(), tokens.begin())) {
+            best_p = cur_pos_;
+        }
+        // Check in-memory GDN snapshots whose prefix tokens are still resident in KV cache.
+        for (size_t i = 0; i < prefix_snapshots_.size(); ++i) {
+            const auto& snap = prefix_snapshots_[i];
+            const size_t s_len = snap.tokens.size();
+            if (s_len > 0 &&
+                s_len <= p_limit &&
+                static_cast<int32_t>(s_len) > best_p &&
+                std::equal(snap.tokens.begin(), snap.tokens.end(), tokens.begin())) {
+                best_p = static_cast<int32_t>(s_len);
+                snap_idx = static_cast<int32_t>(i);
+            }
+        }
+    }
+
+    bool restored_gdn = false;
+    if (best_p == 0) {
+        reset_state();
+    } else if (gdn_total_bytes_ == 0) {
+        cur_pos_ = best_p;
+        cached_tokens_.assign(tokens.begin(), tokens.begin() + best_p);
+    } else if (snap_idx >= 0) {
+        PrefixSnapshot snap = std::move(prefix_snapshots_[snap_idx]);
+        prefix_snapshots_.erase(prefix_snapshots_.begin() + snap_idx);
+        RX_HIP_CHECK(hipMemcpyAsync(d_gdn_base_, snap.gdn_state.data(), gdn_total_bytes_,
+                                    hipMemcpyHostToDevice, stream_));
+        prefix_snapshots_.push_back(std::move(snap)); // Touch as MRU
+        cur_pos_ = best_p;
+        cached_tokens_.assign(tokens.begin(), tokens.begin() + best_p);
+        restored_gdn = true;
+    }
+
+    const size_t total = tokens.size();
+    size_t off = static_cast<size_t>(best_p);
+    while (off < total) {
+        const int chunk = static_cast<int>(std::min<size_t>(opts_.max_batch_tokens, total - off));
+        const bool is_last = (off + chunk == total);
+        run_forward_batch(tokens.data() + off, chunk, is_last);
+        off += chunk;
+    }
+
+    int32_t next_tok = 0;
+    RX_HIP_CHECK(hipMemcpyAsync(&next_tok, d_out_token_, sizeof(next_tok), hipMemcpyDeviceToHost, stream_));
+    RX_HIP_CHECK(hipStreamSynchronize(stream_));
+    last_next_token_ = next_tok;
+
+    if (save_checkpoint && opts_.max_prefix_snapshots > 0 && tokens.size() >= 64) {
+        record_prefix_snapshot();
+    }
+
+    PrefillCacheResult res;
+    res.next_token = next_tok;
+    res.matched_prefix_tokens = best_p;
+    res.evaluated_tokens = static_cast<int32_t>(total) - best_p;
+    res.restored_gdn_snapshot = restored_gdn;
+    return res;
+}
+
+void InferenceEngine::save_prompt_cache(const std::string& path) const {
+    RX_HIP_CHECK(hipStreamSynchronize(stream_));
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) {
+        throw std::runtime_error("Failed to open prompt cache output file: " + path);
+    }
+
+    const char magic[4] = {'R', 'X', 'P', 'C'};
+    const uint32_t version = 1;
+    const std::string sig = build_cache_signature(weights_.config, opts_.kv_dtype);
+    const uint64_t sig_len = sig.size();
+    const int32_t pos = cur_pos_;
+    const int32_t last_tok = last_next_token_;
+    const uint64_t gdn_bytes = gdn_total_bytes_;
+    const int32_t n_attn = static_cast<int32_t>(kv_caches_.size());
+    const int32_t active_pages = (pos > 0 && n_attn > 0) ? static_cast<int32_t>(div_ceil(pos, attn::KV_PAGE_TOKENS)) : 0;
+    const uint64_t page_bytes = kv_layout_.page_bytes;
+
+    ofs.write(magic, 4);
+    ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    ofs.write(reinterpret_cast<const char*>(&sig_len), sizeof(sig_len));
+    ofs.write(reinterpret_cast<const char*>(&pos), sizeof(pos));
+    ofs.write(reinterpret_cast<const char*>(&last_tok), sizeof(last_tok));
+    ofs.write(reinterpret_cast<const char*>(&gdn_bytes), sizeof(gdn_bytes));
+    ofs.write(reinterpret_cast<const char*>(&n_attn), sizeof(n_attn));
+    ofs.write(reinterpret_cast<const char*>(&active_pages), sizeof(active_pages));
+    ofs.write(reinterpret_cast<const char*>(&page_bytes), sizeof(page_bytes));
+    ofs.write(sig.data(), sig_len);
+
+    if (pos > 0) {
+        ofs.write(reinterpret_cast<const char*>(cached_tokens_.data()), static_cast<size_t>(pos) * sizeof(int32_t));
+    }
+
+    if (gdn_bytes > 0) {
+        std::vector<uint8_t> gdn_host(gdn_bytes);
+        RX_HIP_CHECK(hipMemcpy(gdn_host.data(), d_gdn_base_, gdn_bytes, hipMemcpyDeviceToHost));
+        ofs.write(reinterpret_cast<const char*>(gdn_host.data()), gdn_bytes);
+    }
+
+    if (active_pages > 0 && page_bytes > 0) {
+        constexpr size_t CHUNK = 16ULL << 20;
+        std::vector<uint8_t> buf(std::min(CHUNK, static_cast<size_t>(active_pages) * page_bytes));
+        for (int32_t a = 0; a < n_attn; ++a) {
+            const int32_t vram_act = std::min(active_pages, vram_kv_pages_);
+            const int32_t gtt_act = active_pages - vram_act;
+            if (vram_act > 0) {
+                const size_t total_vram_b = static_cast<size_t>(vram_act) * page_bytes;
+                const uint8_t* src = static_cast<const uint8_t*>(d_kv_vram_pool_) +
+                                     static_cast<size_t>(a) * vram_kv_pages_ * page_bytes;
+                size_t off = 0;
+                while (off < total_vram_b) {
+                    const size_t n = std::min(CHUNK, total_vram_b - off);
+                    RX_HIP_CHECK(hipMemcpy(buf.data(), src + off, n, hipMemcpyDeviceToHost));
+                    ofs.write(reinterpret_cast<const char*>(buf.data()), n);
+                    off += n;
+                }
+            }
+            if (gtt_act > 0) {
+                const size_t total_gtt_b = static_cast<size_t>(gtt_act) * page_bytes;
+                const uint8_t* src = static_cast<const uint8_t*>(h_kv_gtt_pool_) +
+                                     static_cast<size_t>(a) * gtt_kv_pages_ * page_bytes;
+                ofs.write(reinterpret_cast<const char*>(src), total_gtt_b);
+            }
+        }
+    }
+
+    ofs.flush();
+    if (!ofs) {
+        throw std::runtime_error("Failed writing prompt cache file: " + path);
+    }
+}
+
+int32_t InferenceEngine::load_prompt_cache(const std::string& path) {
+    RX_HIP_CHECK(hipStreamSynchronize(stream_));
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open prompt cache file: " + path);
+    }
+
+    char magic[4]{};
+    uint32_t version = 0;
+    uint64_t sig_len = 0, gdn_bytes = 0, page_bytes = 0;
+    int32_t pos = 0, last_tok = -1, n_attn = 0, active_pages = 0;
+
+    ifs.read(magic, 4);
+    ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
+    ifs.read(reinterpret_cast<char*>(&sig_len), sizeof(sig_len));
+    ifs.read(reinterpret_cast<char*>(&pos), sizeof(pos));
+    ifs.read(reinterpret_cast<char*>(&last_tok), sizeof(last_tok));
+    ifs.read(reinterpret_cast<char*>(&gdn_bytes), sizeof(gdn_bytes));
+    ifs.read(reinterpret_cast<char*>(&n_attn), sizeof(n_attn));
+    ifs.read(reinterpret_cast<char*>(&active_pages), sizeof(active_pages));
+    ifs.read(reinterpret_cast<char*>(&page_bytes), sizeof(page_bytes));
+
+    if (!ifs || std::memcmp(magic, "RXPC", 4) != 0 || version != 1 || sig_len > (1ULL << 20)) {
+        throw std::runtime_error("Invalid RXPC prompt cache header: " + path);
+    }
+
+    std::string sig(sig_len, '\0');
+    ifs.read(sig.data(), sig_len);
+    const std::string expected_sig = build_cache_signature(weights_.config, opts_.kv_dtype);
+    if (sig != expected_sig) {
+        throw std::runtime_error("Prompt cache signature mismatch (different model or --kv-dtype): " + path);
+    }
+
+    if (pos < 0 || pos > opts_.max_seq_len) {
+        throw std::runtime_error("Prompt cache length (" + std::to_string(pos) +
+                                 ") exceeds engine --max-seq-len (" + std::to_string(opts_.max_seq_len) + ")");
+    }
+    if (gdn_bytes != gdn_total_bytes_ || n_attn != static_cast<int32_t>(kv_caches_.size()) ||
+        page_bytes != kv_layout_.page_bytes) {
+        throw std::runtime_error("Prompt cache geometry mismatch: " + path);
+    }
+    const int32_t expected_pages =
+        (pos > 0 && n_attn > 0) ? static_cast<int32_t>(div_ceil(pos, attn::KV_PAGE_TOKENS)) : 0;
+    if (active_pages != expected_pages) {
+        throw std::runtime_error("Prompt cache active_pages mismatch: " + path);
+    }
+
+    std::vector<int32_t> tokens(pos);
+    if (pos > 0) {
+        ifs.read(reinterpret_cast<char*>(tokens.data()), static_cast<size_t>(pos) * sizeof(int32_t));
+    }
+
+    std::vector<uint8_t> gdn_host;
+    if (gdn_bytes > 0) {
+        gdn_host.resize(gdn_bytes);
+        ifs.read(reinterpret_cast<char*>(gdn_host.data()), gdn_bytes);
+        RX_HIP_CHECK(hipMemcpy(d_gdn_base_, gdn_host.data(), gdn_bytes, hipMemcpyHostToDevice));
+    }
+
+    if (active_pages > 0 && page_bytes > 0) {
+        constexpr size_t CHUNK = 16ULL << 20;
+        std::vector<uint8_t> buf(std::min(CHUNK, static_cast<size_t>(active_pages) * page_bytes));
+        for (int32_t a = 0; a < n_attn; ++a) {
+            const int32_t vram_act = std::min(active_pages, vram_kv_pages_);
+            const int32_t gtt_act = active_pages - vram_act;
+            if (vram_act > 0) {
+                const size_t total_vram_b = static_cast<size_t>(vram_act) * page_bytes;
+                uint8_t* dst = static_cast<uint8_t*>(d_kv_vram_pool_) +
+                               static_cast<size_t>(a) * vram_kv_pages_ * page_bytes;
+                size_t off = 0;
+                while (off < total_vram_b) {
+                    const size_t n = std::min(CHUNK, total_vram_b - off);
+                    ifs.read(reinterpret_cast<char*>(buf.data()), n);
+                    RX_HIP_CHECK(hipMemcpy(dst + off, buf.data(), n, hipMemcpyHostToDevice));
+                    off += n;
+                }
+            }
+            if (gtt_act > 0) {
+                const size_t total_gtt_b = static_cast<size_t>(gtt_act) * page_bytes;
+                uint8_t* dst = static_cast<uint8_t*>(h_kv_gtt_pool_) +
+                               static_cast<size_t>(a) * gtt_kv_pages_ * page_bytes;
+                ifs.read(reinterpret_cast<char*>(dst), total_gtt_b);
+            }
+        }
+    }
+
+    if (!ifs) {
+        throw std::runtime_error("Truncated prompt cache file: " + path);
+    }
+
+    cur_pos_ = pos;
+    last_next_token_ = last_tok;
+    cached_tokens_ = std::move(tokens);
+    kv_resident_tokens_ = cached_tokens_;
+
+    if (opts_.max_prefix_snapshots > 0 && pos > 0 && gdn_bytes > 0) {
+        PrefixSnapshot snap;
+        snap.tokens = cached_tokens_;
+        snap.gdn_state = std::move(gdn_host);
+        if (static_cast<int32_t>(prefix_snapshots_.size()) >= opts_.max_prefix_snapshots) {
+            prefix_snapshots_.erase(prefix_snapshots_.begin());
+        }
+        prefix_snapshots_.push_back(std::move(snap));
+    }
+
+    return cur_pos_;
 }
 
 int32_t InferenceEngine::decode_step(int32_t token_id) {
@@ -483,7 +977,16 @@ int32_t InferenceEngine::decode_step(int32_t token_id) {
     int32_t next_tok = 0;
     RX_HIP_CHECK(hipMemcpyAsync(&next_tok, d_out_token_, sizeof(next_tok), hipMemcpyDeviceToHost, stream_));
     RX_HIP_CHECK(hipStreamSynchronize(stream_));
+
+    if (static_cast<size_t>(cur_pos_) < kv_resident_tokens_.size()) {
+        kv_resident_tokens_.resize(cur_pos_);
+    }
+    if (static_cast<size_t>(cur_pos_) == kv_resident_tokens_.size()) {
+        kv_resident_tokens_.push_back(token_id);
+    }
+    cached_tokens_.push_back(token_id);
     cur_pos_++;
+    last_next_token_ = next_tok;
     return next_tok;
 }
 
@@ -535,7 +1038,16 @@ std::vector<int32_t> InferenceEngine::verify_tokens(const std::vector<int32_t>& 
     RX_HIP_CHECK(hipMemcpyAsync(preds.data(), d_out_token_, static_cast<size_t>(M) * sizeof(int32_t),
                                 hipMemcpyDeviceToHost, stream_));
     RX_HIP_CHECK(hipStreamSynchronize(stream_));
+
+    if (static_cast<size_t>(cur_pos_) < kv_resident_tokens_.size()) {
+        kv_resident_tokens_.resize(cur_pos_);
+    }
+    if (static_cast<size_t>(cur_pos_) == kv_resident_tokens_.size()) {
+        kv_resident_tokens_.insert(kv_resident_tokens_.end(), tokens.begin(), tokens.end());
+    }
+    cached_tokens_.insert(cached_tokens_.end(), tokens.begin(), tokens.end());
     cur_pos_ += M;
+    last_next_token_ = preds.back();
     return preds;
 }
 
@@ -551,6 +1063,8 @@ SpeculativeVerifyResult InferenceEngine::speculative_verify(const std::vector<in
     if (M > opts_.max_verify_tokens) {
         throw std::runtime_error("Draft length exceeds EngineOptions::max_verify_tokens");
     }
+
+    ensure_speculative_buffers();
 
     const int32_t old_pos = cur_pos_;
     if (d_gdn_backup_ != nullptr && gdn_total_bytes_ > 0) {
@@ -597,7 +1111,12 @@ SpeculativeVerifyResult InferenceEngine::speculative_verify(const std::vector<in
             RX_HIP_CHECK(hipStreamSynchronize(stream_));
         }
         cur_pos_ = old_pos + accepted_prefix;
+        cached_tokens_.resize(cur_pos_);
+        if (static_cast<size_t>(cur_pos_) < kv_resident_tokens_.size()) {
+            kv_resident_tokens_.resize(cur_pos_);
+        }
     }
+    last_next_token_ = res.accepted_tokens.back();
 
     return res;
 }
@@ -704,6 +1223,16 @@ DecodeBreakdown InferenceEngine::profile_decode(int32_t kv_ctx_len, int steps, i
     const bool plus_one = (c.norm_kind == NormKind::RMSNormPlusOne);
     const int32_t ctx = std::min(std::max(1, kv_ctx_len), opts_.max_seq_len);
 
+    // Ensure KV pages have valid non-NaN zero contents when benchmarking arbitrary context lengths.
+    kv_resident_tokens_.clear();
+    prefix_snapshots_.clear();
+    if (kv_vram_bytes_ > 0 && d_kv_vram_pool_ != nullptr) {
+        RX_HIP_CHECK(hipMemsetAsync(d_kv_vram_pool_, 0, kv_vram_bytes_, stream_));
+    }
+    if (kv_gtt_bytes_ > 0 && h_kv_gtt_pool_ != nullptr) {
+        std::memset(h_kv_gtt_pool_, 0, kv_gtt_bytes_);
+    }
+
     reset_state();
     StepParams sp{};
     sp.token_id = 42;
@@ -755,7 +1284,7 @@ DecodeBreakdown InferenceEngine::profile_decode(int32_t kv_ctx_len, int steps, i
         bd.non_graph_wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / steps;
     }
 
-    // Fine-grained event profiling over 1 step (after warmup)
+    // Fine-grained event profiling over `steps` steps
     const int n_events = 2 + c.num_hidden_layers * 9 + 3;
     std::vector<hipEvent_t> ev(n_events);
     for (auto& e : ev) RX_HIP_CHECK(hipEventCreate(&e));
@@ -798,7 +1327,7 @@ DecodeBreakdown InferenceEngine::profile_decode(int32_t kv_ctx_len, int steps, i
                                                  1, 0, d_step_, stream_, 2 * kv_dim);
                 attn::gqa_decode_attention(d_proj_c_, c.attn_output_gate ? d_proj_a_ : nullptr,
                                            kv, d_attn_out_, d_attn_split_, attn_params_,
-                                           1, 0, d_step_, 16, stream_);
+                                           1, 0, d_step_, decode_splits_, stream_);
                 rec(ei++);
 
                 quant::gemm_r4_gfx12_w4a16(d_attn_out_, lw.o_proj.qs, lw.o_proj.scales,
@@ -834,7 +1363,7 @@ DecodeBreakdown InferenceEngine::profile_decode(int32_t kv_ctx_len, int steps, i
                 quant::gemv_r4_gfx12_w4a16_swiglu(d_norm_out_, lw.gate_up_proj.qs, lw.gate_up_proj.scales,
                                                   d_proj_b_, I, H, stream_);
                 rec(ei++);
-                rec(ei++); // fused mlp_act = 0
+                rec(ei++);
             } else {
                 quant::gemm_r4_gfx12_w4a16(d_norm_out_, lw.gate_up_proj.qs, lw.gate_up_proj.scales,
                                            d_proj_a_, d_gemm_tmp_, 1, 2 * I, H, stream_);
@@ -882,6 +1411,7 @@ DecodeBreakdown InferenceEngine::profile_decode(int32_t kv_ctx_len, int steps, i
     }
 
     for (auto& e : ev) RX_HIP_CHECK(hipEventDestroy(e));
+    reset_state();
 
     bd.embed_ms /= steps;
     bd.rmsnorm_ms /= steps;

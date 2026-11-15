@@ -360,13 +360,17 @@ void test_attention(hipStream_t stream, int& failures) {
         }
     }
 
-    // Test all 3 KV cache formats: F16, FP8_E4M3, and DeepSeek-V4.1 FP4_E2M1_G16!
+    // Test all 3 KV cache formats using paged head-major storage
     for (rxinfer::DType kv_dt : {rxinfer::DType::F16, rxinfer::DType::FP8_E4M3, rxinfer::DType::FP4_E2M1_G16}) {
         p.kv_dtype = kv_dt;
+        const auto lay = rxinfer::attn::compute_kv_page_layout(p);
+        const int32_t num_pages = rxinfer::div_ceil(p.max_seq_len, rxinfer::attn::KV_PAGE_TOKENS);
 
         __half *d_q_in, *d_k_in, *d_v_in, *d_qn_w, *d_kn_w, *d_q_out, *d_out;
         rxinfer::StepParams* d_step;
-        void *d_k_data, *d_v_data, *d_k_sc = nullptr, *d_v_sc = nullptr, *d_split;
+        uint8_t* d_kv_pool = nullptr;
+        uint8_t** d_page_table = nullptr;
+        void* d_split = nullptr;
 
         RX_HIP_CHECK(hipMalloc(&d_q_in, h_q_in.size() * sizeof(__half)));
         RX_HIP_CHECK(hipMalloc(&d_k_in, h_k_in.size() * sizeof(__half)));
@@ -376,16 +380,17 @@ void test_attention(hipStream_t stream, int& failures) {
         RX_HIP_CHECK(hipMalloc(&d_q_out, M_tot * H_q * D * sizeof(__half)));
         RX_HIP_CHECK(hipMalloc(&d_out, M_tot * H_q * D * sizeof(__half)));
         RX_HIP_CHECK(hipMalloc(&d_step, sizeof(rxinfer::StepParams)));
+        RX_HIP_CHECK(hipMalloc(&d_kv_pool, static_cast<size_t>(num_pages) * lay.page_bytes));
+        RX_HIP_CHECK(hipMalloc(&d_page_table, static_cast<size_t>(num_pages) * sizeof(uint8_t*)));
+        RX_HIP_CHECK(hipMemset(d_kv_pool, 0, static_cast<size_t>(num_pages) * lay.page_bytes));
+        RX_HIP_CHECK(hipMalloc(&d_split, rxinfer::attn::decode_splitk_scratch_bytes(p, 1, 32)));
 
-        const size_t data_bytes = rxinfer::attn::kv_cache_data_bytes(p);
-        const size_t sc_bytes = rxinfer::attn::kv_cache_scales_bytes(p);
-        RX_HIP_CHECK(hipMalloc(&d_k_data, data_bytes));
-        RX_HIP_CHECK(hipMalloc(&d_v_data, data_bytes));
-        if (sc_bytes > 0) {
-            RX_HIP_CHECK(hipMalloc(&d_k_sc, sc_bytes));
-            RX_HIP_CHECK(hipMalloc(&d_v_sc, sc_bytes));
+        std::vector<uint8_t*> h_ptrs(num_pages);
+        for (int32_t pg = 0; pg < num_pages; ++pg) {
+            h_ptrs[pg] = d_kv_pool + static_cast<size_t>(pg) * lay.page_bytes;
         }
-        RX_HIP_CHECK(hipMalloc(&d_split, rxinfer::attn::decode_splitk_scratch_bytes(p, 1, 16)));
+        RX_HIP_CHECK(hipMemcpy(d_page_table, h_ptrs.data(), static_cast<size_t>(num_pages) * sizeof(uint8_t*),
+                               hipMemcpyHostToDevice));
 
         RX_HIP_CHECK(hipMemcpy(d_q_in, h_q_in.data(), h_q_in.size() * sizeof(__half), hipMemcpyHostToDevice));
         RX_HIP_CHECK(hipMemcpy(d_k_in, h_k_in.data(), h_k_in.size() * sizeof(__half), hipMemcpyHostToDevice));
@@ -393,12 +398,13 @@ void test_attention(hipStream_t stream, int& failures) {
         RX_HIP_CHECK(hipMemcpy(d_qn_w, h_qn_w.data(), D * sizeof(__half), hipMemcpyHostToDevice));
         RX_HIP_CHECK(hipMemcpy(d_kn_w, h_kn_w.data(), D * sizeof(__half), hipMemcpyHostToDevice));
 
-        rxinfer::attn::KVCacheView kv{d_k_data, d_v_data, d_k_sc, d_v_sc};
+        rxinfer::attn::KVCacheView kv{
+            d_page_table, num_pages, num_pages, lay.page_bytes, lay.data_sec_bytes, lay.sc_sec_bytes};
 
         // Prefill M_pre tokens
         rxinfer::attn::fused_qknorm_rope_kv_write(d_q_in, d_k_in, d_v_in, d_qn_w, d_kn_w, d_q_out,
                                                   kv, p, M_pre, 0, nullptr, stream);
-        rxinfer::attn::flash_attention_prefill(d_q_out, d_q_in, kv, d_out, p, M_pre, 0, stream);
+        rxinfer::attn::flash_attention_prefill(d_q_out, d_q_in, kv, d_out, p, M_pre, 0, nullptr, stream);
 
         std::vector<__half> h_pre_out(M_pre * H_q * D);
         RX_HIP_CHECK(hipMemcpyAsync(h_pre_out.data(), d_out, h_pre_out.size() * sizeof(__half), hipMemcpyDeviceToHost, stream));
@@ -418,7 +424,7 @@ void test_attention(hipStream_t stream, int& failures) {
             d_v_in + M_pre * H_kv * D,
             d_qn_w, d_kn_w, d_q_out, kv, p, 1, 0, d_step, stream);
         rxinfer::attn::gqa_decode_attention(
-            d_q_out, d_q_in + M_pre * H_q * 2 * D, kv, d_out, d_split, p, 1, 0, d_step, 16, stream);
+            d_q_out, d_q_in + M_pre * H_q * 2 * D, kv, d_out, d_split, p, 1, 0, d_step, 32, stream);
         RX_HIP_CHECK(hipStreamEndCapture(stream, &graph));
         RX_HIP_CHECK(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
         RX_HIP_CHECK(hipGraphLaunch(graph_exec, stream));
@@ -454,11 +460,233 @@ void test_attention(hipStream_t stream, int& failures) {
         RX_HIP_CHECK(hipFree(d_q_out));
         RX_HIP_CHECK(hipFree(d_out));
         RX_HIP_CHECK(hipFree(d_step));
-        RX_HIP_CHECK(hipFree(d_k_data));
-        RX_HIP_CHECK(hipFree(d_v_data));
-        if (d_k_sc) RX_HIP_CHECK(hipFree(d_k_sc));
-        if (d_v_sc) RX_HIP_CHECK(hipFree(d_v_sc));
+        RX_HIP_CHECK(hipFree(d_kv_pool));
+        RX_HIP_CHECK(hipFree(d_page_table));
         RX_HIP_CHECK(hipFree(d_split));
+    }
+
+    // Tiered VRAM + GTT Paged Attention Test (1 VRAM page = 64 tok + 2 GTT pages = 128 tok, split-KV + stage_buf)
+    {
+        const int M_t_pre = 160; // Spans page 0 (VRAM), page 1 (GTT), page 2 (GTT)
+        const int M_t_tot = M_t_pre + 1;
+        const int32_t num_pages = 3;
+        const int32_t vram_pages = 1;
+        const int32_t gtt_pages = 2;
+
+        std::vector<__half> t_q(M_t_tot * H_q * 2 * D);
+        std::vector<__half> t_k(M_t_tot * H_kv * D);
+        std::vector<__half> t_v(M_t_tot * H_kv * D);
+        for (auto& v : t_q) v = __float2half(nd(rng));
+        for (auto& v : t_k) v = __float2half(nd(rng));
+        for (auto& v : t_v) v = __float2half(nd(rng));
+
+        std::vector<float> t_ref_k(M_t_tot * H_kv * D), t_ref_v(M_t_tot * H_kv * D);
+        std::vector<float> t_ref_q(M_t_tot * H_q * D), t_ref_pre(M_t_pre * H_q * D), t_ref_dec(H_q * D);
+        for (int m = 0; m < M_t_tot; ++m) {
+            for (int hq = 0; hq < H_q; ++hq) {
+                std::vector<float> qv;
+                apply_qknorm_rope(&t_q[(m * H_q + hq) * 2 * D], h_qn_w.data(), m, qv);
+                std::copy(qv.begin(), qv.end(), &t_ref_q[(m * H_q + hq) * D]);
+            }
+            for (int hk = 0; hk < H_kv; ++hk) {
+                std::vector<float> kv_vec;
+                apply_qknorm_rope(&t_k[(m * H_kv + hk) * D], h_kn_w.data(), m, kv_vec);
+                std::copy(kv_vec.begin(), kv_vec.end(), &t_ref_k[(m * H_kv + hk) * D]);
+                for (int d = 0; d < D; ++d) {
+                    t_ref_v[(m * H_kv + hk) * D + d] = __half2float(t_v[(m * H_kv + hk) * D + d]);
+                }
+            }
+        }
+        for (int m = 0; m < M_t_tot; ++m) {
+            for (int hq = 0; hq < H_q; ++hq) {
+                const int hk = hq / (H_q / H_kv);
+                std::vector<float> sc(m + 1);
+                float mx = -1e30f;
+                for (int t = 0; t <= m; ++t) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < D; ++d) dot += t_ref_q[(m * H_q + hq) * D + d] * t_ref_k[(t * H_kv + hk) * D + d];
+                    sc[t] = dot * scale;
+                    mx = std::max(mx, sc[t]);
+                }
+                float ls = 0.0f;
+                for (int t = 0; t <= m; ++t) { sc[t] = std::exp(sc[t] - mx); ls += sc[t]; }
+                for (int d = 0; d < D; ++d) {
+                    float acc = 0.0f;
+                    for (int t = 0; t <= m; ++t) acc += (sc[t] / ls) * t_ref_v[(t * H_kv + hk) * D + d];
+                    const float gate = __half2float(t_q[(m * H_q + hq) * 2 * D + D + d]);
+                    const float val = acc * sigmoid_cpu(gate);
+                    if (m < M_t_pre) t_ref_pre[(m * H_q + hq) * D + d] = val;
+                    else t_ref_dec[hq * D + d] = val;
+                }
+            }
+        }
+
+        for (rxinfer::DType kv_dt : {rxinfer::DType::F16, rxinfer::DType::FP4_E2M1_G16}) {
+            p.kv_dtype = kv_dt;
+            const auto lay = rxinfer::attn::compute_kv_page_layout(p);
+
+            __half *d_q_in, *d_k_in, *d_v_in, *d_qn_w, *d_kn_w, *d_q_out, *d_out;
+            uint8_t *d_vram_pool = nullptr, *d_gtt_pool = nullptr, *d_stage = nullptr;
+            void *h_gtt_pool = nullptr, *d_split = nullptr;
+            uint8_t** d_pt = nullptr;
+
+            RX_HIP_CHECK(hipMalloc(&d_q_in, t_q.size() * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_k_in, t_k.size() * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_v_in, t_v.size() * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_qn_w, D * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_kn_w, D * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_q_out, M_t_tot * H_q * D * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_out, M_t_tot * H_q * D * sizeof(__half)));
+            RX_HIP_CHECK(hipMalloc(&d_vram_pool, static_cast<size_t>(vram_pages) * lay.page_bytes));
+            RX_HIP_CHECK(hipHostMalloc(&h_gtt_pool, static_cast<size_t>(gtt_pages) * lay.page_bytes, hipHostMallocMapped));
+            RX_HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&d_gtt_pool), h_gtt_pool, 0));
+            RX_HIP_CHECK(hipMalloc(&d_stage, lay.page_bytes)); // Force 1-page staging rounds across 2 GTT pages!
+            RX_HIP_CHECK(hipMalloc(&d_pt, static_cast<size_t>(num_pages) * sizeof(uint8_t*)));
+
+            const size_t dec_sb = rxinfer::attn::decode_splitk_scratch_bytes(p, 1, 64);
+            const size_t pre_sb = rxinfer::attn::prefill_splitk_scratch_bytes(p, M_t_pre, 64, 4);
+            RX_HIP_CHECK(hipMalloc(&d_split, std::max(dec_sb, pre_sb)));
+
+            std::vector<uint8_t*> h_ptrs = {
+                d_vram_pool,
+                d_gtt_pool,
+                d_gtt_pool + lay.page_bytes,
+            };
+            RX_HIP_CHECK(hipMemcpy(d_pt, h_ptrs.data(), static_cast<size_t>(num_pages) * sizeof(uint8_t*),
+                                   hipMemcpyHostToDevice));
+            RX_HIP_CHECK(hipMemcpy(d_q_in, t_q.data(), t_q.size() * sizeof(__half), hipMemcpyHostToDevice));
+            RX_HIP_CHECK(hipMemcpy(d_k_in, t_k.data(), t_k.size() * sizeof(__half), hipMemcpyHostToDevice));
+            RX_HIP_CHECK(hipMemcpy(d_v_in, t_v.data(), t_v.size() * sizeof(__half), hipMemcpyHostToDevice));
+            RX_HIP_CHECK(hipMemcpy(d_qn_w, h_qn_w.data(), D * sizeof(__half), hipMemcpyHostToDevice));
+            RX_HIP_CHECK(hipMemcpy(d_kn_w, h_kn_w.data(), D * sizeof(__half), hipMemcpyHostToDevice));
+
+            rxinfer::attn::KVCacheView kv{
+                d_pt, num_pages, vram_pages, lay.page_bytes, lay.data_sec_bytes, lay.sc_sec_bytes};
+            rxinfer::attn::PrefillScratch pscratch{
+                static_cast<float*>(d_split), M_t_pre, 64, 4, d_stage, 1};
+
+            rxinfer::attn::fused_qknorm_rope_kv_write(d_q_in, d_k_in, d_v_in, d_qn_w, d_kn_w, d_q_out,
+                                                      kv, p, M_t_pre, 0, nullptr, stream);
+            rxinfer::attn::flash_attention_prefill(d_q_out, d_q_in, kv, d_out, p, M_t_pre, 0, &pscratch, stream);
+
+            std::vector<__half> h_pre(M_t_pre * H_q * D);
+            RX_HIP_CHECK(hipMemcpyAsync(h_pre.data(), d_out, h_pre.size() * sizeof(__half), hipMemcpyDeviceToHost, stream));
+
+            rxinfer::attn::fused_qknorm_rope_kv_write(
+                d_q_in + M_t_pre * H_q * 2 * D,
+                d_k_in + M_t_pre * H_kv * D,
+                d_v_in + M_t_pre * H_kv * D,
+                d_qn_w, d_kn_w, d_q_out, kv, p, 1, M_t_pre, nullptr, stream);
+            rxinfer::attn::gqa_decode_attention(
+                d_q_out, d_q_in + M_t_pre * H_q * 2 * D, kv, d_out, d_split, p, 1, M_t_tot, nullptr, 64, stream);
+
+            std::vector<__half> h_dec(H_q * D);
+            RX_HIP_CHECK(hipMemcpyAsync(h_dec.data(), d_out, h_dec.size() * sizeof(__half), hipMemcpyDeviceToHost, stream));
+            RX_HIP_CHECK(hipStreamSynchronize(stream));
+
+            auto mt_pre = eval_f16_vs_f32(t_ref_pre, h_pre);
+            auto mt_dec = eval_f16_vs_f32(t_ref_dec, h_dec);
+            std::printf("[Tiered VRAM+GTT %-12s] prefill(160) cos=%.5f | decode(161) cos=%.5f\n",
+                        std::string(rxinfer::dtype_name(kv_dt)).c_str(), mt_pre.cos_sim, mt_dec.cos_sim);
+            const double min_cos = (kv_dt == rxinfer::DType::FP4_E2M1_G16) ? 0.985 : 0.999;
+            if (mt_pre.cos_sim < min_cos || mt_dec.cos_sim < min_cos) ++failures;
+
+            RX_HIP_CHECK(hipFree(d_q_in));
+            RX_HIP_CHECK(hipFree(d_k_in));
+            RX_HIP_CHECK(hipFree(d_v_in));
+            RX_HIP_CHECK(hipFree(d_qn_w));
+            RX_HIP_CHECK(hipFree(d_kn_w));
+            RX_HIP_CHECK(hipFree(d_q_out));
+            RX_HIP_CHECK(hipFree(d_out));
+            RX_HIP_CHECK(hipFree(d_vram_pool));
+            RX_HIP_CHECK(hipHostFree(h_gtt_pool));
+            RX_HIP_CHECK(hipFree(d_stage));
+            RX_HIP_CHECK(hipFree(d_pt));
+            RX_HIP_CHECK(hipFree(d_split));
+        }
+    }
+
+    // Long-Context RoPE Precision Test (pos = 200000, double-precision freq + 2*pi reduction)
+    {
+        const int32_t test_pos = 200000;
+        p.kv_dtype = rxinfer::DType::F16;
+        const auto lay = rxinfer::attn::compute_kv_page_layout(p);
+        std::vector<float> ref_q_200k(H_q * D);
+        for (int hq = 0; hq < H_q; ++hq) {
+            std::vector<float> qv(D);
+            float ss = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                qv[d] = __half2float(h_q_in[hq * 2 * D + d]);
+                ss += qv[d] * qv[d];
+            }
+            const float inv = 1.0f / std::sqrt(ss / D + p.rms_norm_eps);
+            for (int d = 0; d < D; ++d) qv[d] *= inv * (1.0f + __half2float(h_qn_w[d]));
+            const int hr = p.rotary_dim / 2;
+            for (int i = 0; i < hr; ++i) {
+                const double inv_freq = std::pow(static_cast<double>(p.rope_theta),
+                                                 -2.0 * static_cast<double>(i) / static_cast<double>(p.rotary_dim));
+                const double ang = static_cast<double>(test_pos) * inv_freq;
+                const double c = std::cos(ang), s = std::sin(ang);
+                const double x0 = qv[i], x1 = qv[i + hr];
+                qv[i] = static_cast<float>(x0 * c - x1 * s);
+                qv[i + hr] = static_cast<float>(x1 * c + x0 * s);
+            }
+            std::copy(qv.begin(), qv.end(), &ref_q_200k[hq * D]);
+        }
+
+        __half *d_q_in, *d_k_in, *d_v_in, *d_qn_w, *d_kn_w, *d_q_out;
+        uint8_t* d_pg = nullptr;
+        uint8_t** d_pt = nullptr;
+        rxinfer::StepParams* d_step = nullptr;
+        const int32_t pg_idx = test_pos / rxinfer::attn::KV_PAGE_TOKENS;
+        std::vector<uint8_t*> h_pt(pg_idx + 1, nullptr);
+
+        RX_HIP_CHECK(hipMalloc(&d_q_in, H_q * 2 * D * sizeof(__half)));
+        RX_HIP_CHECK(hipMalloc(&d_k_in, H_kv * D * sizeof(__half)));
+        RX_HIP_CHECK(hipMalloc(&d_v_in, H_kv * D * sizeof(__half)));
+        RX_HIP_CHECK(hipMalloc(&d_qn_w, D * sizeof(__half)));
+        RX_HIP_CHECK(hipMalloc(&d_kn_w, D * sizeof(__half)));
+        RX_HIP_CHECK(hipMalloc(&d_q_out, H_q * D * sizeof(__half)));
+        RX_HIP_CHECK(hipMalloc(&d_pg, lay.page_bytes));
+        RX_HIP_CHECK(hipMalloc(&d_pt, static_cast<size_t>(pg_idx + 1) * sizeof(uint8_t*)));
+        RX_HIP_CHECK(hipMalloc(&d_step, sizeof(rxinfer::StepParams)));
+        h_pt[pg_idx] = d_pg;
+
+        RX_HIP_CHECK(hipMemcpy(d_pt, h_pt.data(), static_cast<size_t>(pg_idx + 1) * sizeof(uint8_t*),
+                               hipMemcpyHostToDevice));
+        RX_HIP_CHECK(hipMemcpy(d_q_in, h_q_in.data(), H_q * 2 * D * sizeof(__half), hipMemcpyHostToDevice));
+        RX_HIP_CHECK(hipMemcpy(d_k_in, h_k_in.data(), H_kv * D * sizeof(__half), hipMemcpyHostToDevice));
+        RX_HIP_CHECK(hipMemcpy(d_v_in, h_v_in.data(), H_kv * D * sizeof(__half), hipMemcpyHostToDevice));
+        RX_HIP_CHECK(hipMemcpy(d_qn_w, h_qn_w.data(), D * sizeof(__half), hipMemcpyHostToDevice));
+        RX_HIP_CHECK(hipMemcpy(d_kn_w, h_kn_w.data(), D * sizeof(__half), hipMemcpyHostToDevice));
+
+        rxinfer::StepParams sp{};
+        sp.pos = test_pos;
+        sp.kv_seq_len = test_pos + 1;
+        RX_HIP_CHECK(hipMemcpy(d_step, &sp, sizeof(sp), hipMemcpyHostToDevice));
+
+        rxinfer::attn::KVCacheView kv{
+            d_pt, pg_idx + 1, pg_idx + 1, lay.page_bytes, lay.data_sec_bytes, lay.sc_sec_bytes};
+        rxinfer::attn::fused_qknorm_rope_kv_write(d_q_in, d_k_in, d_v_in, d_qn_w, d_kn_w, d_q_out,
+                                                  kv, p, 1, 0, d_step, stream);
+        std::vector<__half> h_q200k(H_q * D);
+        RX_HIP_CHECK(hipMemcpyAsync(h_q200k.data(), d_q_out, h_q200k.size() * sizeof(__half),
+                                    hipMemcpyDeviceToHost, stream));
+        RX_HIP_CHECK(hipStreamSynchronize(stream));
+
+        auto m_200k = eval_f16_vs_f32(ref_q_200k, h_q200k);
+        std::printf("[RoPE pos=200000] cos=%.7f max_abs=%.6f\n", m_200k.cos_sim, m_200k.max_abs);
+        if (m_200k.cos_sim < 0.99999) ++failures;
+
+        RX_HIP_CHECK(hipFree(d_q_in));
+        RX_HIP_CHECK(hipFree(d_k_in));
+        RX_HIP_CHECK(hipFree(d_v_in));
+        RX_HIP_CHECK(hipFree(d_qn_w));
+        RX_HIP_CHECK(hipFree(d_kn_w));
+        RX_HIP_CHECK(hipFree(d_q_out));
+        RX_HIP_CHECK(hipFree(d_pg));
+        RX_HIP_CHECK(hipFree(d_pt));
+        RX_HIP_CHECK(hipFree(d_step));
     }
 }
 

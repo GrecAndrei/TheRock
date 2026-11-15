@@ -297,6 +297,98 @@ int test_multichunk_and_multiturn_parity(const char* label, const rxinfer::Model
     return 0;
 }
 
+int test_prompt_cache_and_tiered_gtt(const char* label, const rxinfer::ModelConfig& cfg, rxinfer::DType kv_dt) {
+    auto w1 = rxinfer::load_synthetic_model(cfg, 313);
+    auto w2 = rxinfer::load_synthetic_model(cfg, 313);
+    auto w3 = rxinfer::load_synthetic_model(cfg, 313);
+
+    rxinfer::EngineOptions opts_vram{};
+    opts_vram.max_seq_len = 512;
+    opts_vram.max_batch_tokens = 64;
+    opts_vram.kv_dtype = kv_dt;
+    opts_vram.enable_hip_graph = true;
+
+    rxinfer::EngineOptions opts_gtt = opts_vram;
+    opts_gtt.kv_vram_gb = 0.0; // Force 100% mapped host GTT KV cache!
+
+    rxinfer::InferenceEngine eng_vram(std::move(w1), opts_vram);
+    rxinfer::InferenceEngine eng_gtt(std::move(w2), opts_gtt);
+    rxinfer::InferenceEngine eng_ref(std::move(w3), opts_vram);
+
+    // 1. Build shared 140-token prefix + two branching suffixes (to span multiple 64-tok pages!)
+    std::vector<int32_t> prefix(140);
+    for (int i = 0; i < 140; ++i) prefix[i] = (i * 29 + 5) % cfg.vocab_size;
+
+    std::vector<int32_t> prompt_a = prefix;
+    for (int i = 0; i < 36; ++i) prompt_a.push_back((i * 17 + 91) % cfg.vocab_size);
+
+    std::vector<int32_t> prompt_b = prefix;
+    for (int i = 0; i < 42; ++i) prompt_b.push_back((i * 31 + 123) % cfg.vocab_size);
+
+    // Save prefix checkpoint into eng_vram, extend with prompt_a, generate 4 tokens, then branch to prompt_b!
+    auto r_pre = eng_vram.prefill_cached(prefix, true);
+    if (r_pre.matched_prefix_tokens != 0 || r_pre.evaluated_tokens != 140) {
+        std::printf("  [FAIL] Unexpected initial prefill_cached stats on %s\n", label);
+        return 1;
+    }
+    const std::string cache_path =
+        (std::filesystem::temp_directory_path() / "rxinfer_test_prefix.rxprompt").string();
+    eng_vram.save_prompt_cache(cache_path);
+
+    auto r_hit = eng_vram.prefill_cached(prefix, true);
+    if (r_hit.matched_prefix_tokens != 140 || r_hit.evaluated_tokens != 0 || r_hit.next_token != r_pre.next_token) {
+        std::printf("  [FAIL] Exact 100%% cache hit mismatch on %s\n", label);
+        return 1;
+    }
+
+    auto r_a = eng_vram.prefill_cached(prompt_a, true);
+    if (r_a.matched_prefix_tokens != 140 || r_a.evaluated_tokens != 36) {
+        std::printf("  [FAIL] Prefix extension mismatch on %s (matched=%d eval=%d)\n",
+                    label, r_a.matched_prefix_tokens, r_a.evaluated_tokens);
+        return 1;
+    }
+    int32_t t_a = r_a.next_token;
+    for (int s = 0; s < 4; ++s) t_a = eng_vram.decode_step(t_a);
+
+    // Branch to prompt_b (must rewind via GDN snapshot for hybrid or LCP KV for dense!)
+    auto r_b = eng_vram.prefill_cached(prompt_b, true);
+    std::vector<float> logits_b_cached;
+    eng_vram.copy_last_logits(logits_b_cached);
+
+    auto logits_b_ref = eng_ref.forward_logits(prompt_b);
+    const double cos_branch = cosine_sim(logits_b_ref, logits_b_cached);
+    if (r_b.matched_prefix_tokens != 140 || r_b.evaluated_tokens != 42 || cos_branch < 0.999999) {
+        std::printf("  [FAIL] LCP branch parity on %s (matched=%d eval=%d cos=%.7f)\n",
+                    label, r_b.matched_prefix_tokens, r_b.evaluated_tokens, cos_branch);
+        return 1;
+    }
+
+    // 2. Load VRAM-saved .rxprompt into 100%-GTT engine (tests cross-tier .rxprompt + GTT staging prefill + decode!)
+    const int32_t loaded_pos = eng_gtt.load_prompt_cache(cache_path);
+    auto r_gtt_b = eng_gtt.prefill_cached(prompt_b, false);
+    std::vector<float> logits_gtt_b;
+    eng_gtt.copy_last_logits(logits_gtt_b);
+    const double cos_gtt_b = cosine_sim(logits_b_ref, logits_gtt_b);
+
+    const int32_t dec_gtt = eng_gtt.decode_step(r_gtt_b.next_token);
+    const int32_t dec_ref = eng_ref.decode_step(r_gtt_b.next_token);
+    std::vector<float> logits_dec_gtt, logits_dec_ref;
+    eng_gtt.copy_last_logits(logits_dec_gtt);
+    eng_ref.copy_last_logits(logits_dec_ref);
+    const double cos_gtt_dec = cosine_sim(logits_dec_ref, logits_dec_gtt);
+
+    std::printf("[PromptCache+GTT %-16s kv=%-12s] lcp_cos=%.7f disk_gtt_cos=%.7f dec_gtt_cos=%.7f tok=(%d vs %d)\n",
+                label, std::string(rxinfer::dtype_name(kv_dt)).c_str(),
+                cos_branch, cos_gtt_b, cos_gtt_dec, dec_gtt, dec_ref);
+
+    if (loaded_pos != 140 || r_gtt_b.matched_prefix_tokens != 140 ||
+        cos_gtt_b < 0.999999 || cos_gtt_dec < 0.999999 || dec_gtt != dec_ref) {
+        std::printf("  [FAIL] Cross-tier .rxprompt/GTT mismatch on %s\n", label);
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -323,6 +415,10 @@ int main(int argc, char** argv) {
     failures += test_multichunk_and_multiturn_parity("Hybrid-GDN-F16", make_small_hybrid_test_config(), rxinfer::DType::F16);
     failures += test_multichunk_and_multiturn_parity("Hybrid-GDN-FP4", make_small_hybrid_test_config(), rxinfer::DType::FP4_E2M1_G16);
 
+    failures += test_prompt_cache_and_tiered_gtt("Qwen3-Dense-F16", make_small_llama_test_config(), rxinfer::DType::F16);
+    failures += test_prompt_cache_and_tiered_gtt("Hybrid-GDN-F16", make_small_hybrid_test_config(), rxinfer::DType::F16);
+    failures += test_prompt_cache_and_tiered_gtt("Hybrid-GDN-FP4", make_small_hybrid_test_config(), rxinfer::DType::FP4_E2M1_G16);
+
     failures += test_rxr4_roundtrip();
 
     if (failures != 0) {
@@ -346,17 +442,20 @@ int main(int argc, char** argv) {
 
         auto w27 = rxinfer::load_synthetic_model(cfg27, 42, lopts);
         rxinfer::EngineOptions eopts{};
-        eopts.max_seq_len = 4096;
-        eopts.max_batch_tokens = 256;
+        eopts.max_seq_len = 200000;
+        eopts.max_batch_tokens = 512;
         eopts.kv_dtype = rxinfer::DType::FP4_E2M1_G16;
         eopts.enable_hip_graph = true;
 
         rxinfer::InferenceEngine eng27(std::move(w27), eopts);
-        std::printf("Allocated VRAM total: %.2f GiB (weights %.2f GiB, state %.1f MB, scratch %.1f MB)\n",
+        std::printf("Allocated VRAM total: %.2f GiB (weights %.2f GiB, state %.1f MB, scratch %.1f MB)\n"
+                    "KV Pool (200k FP4): VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok)\n",
                     eng27.total_vram_used_bytes() / (1024.0 * 1024.0 * 1024.0),
                     eng27.weights().weight_arena.used() / (1024.0 * 1024.0 * 1024.0),
                     eng27.state_vram_bytes() / (1024.0 * 1024.0),
-                    eng27.scratch_vram_bytes() / (1024.0 * 1024.0));
+                    eng27.scratch_vram_bytes() / (1024.0 * 1024.0),
+                    eng27.kv_vram_bytes() / (1024.0 * 1024.0 * 1024.0), eng27.vram_kv_tokens(),
+                    eng27.kv_gtt_bytes() / (1024.0 * 1024.0 * 1024.0), eng27.gtt_kv_tokens());
 
         auto pre_res = eng27.benchmark_prefill(512, 1);
         std::printf("Prefill (512 tokens):   %.1f ms | %.1f tok/s\n", pre_res.elapsed_ms, pre_res.tok_per_sec);
@@ -371,6 +470,13 @@ int main(int argc, char** argv) {
         auto ver8_res = eng27.benchmark_verify(8, 25, 5);
         std::printf("Verify  (hipGraph M=8): %.2f ms/step | %.2f tok/s (100%% accept; ~%.2f tok/s @5/8)\n",
                     ver8_res.ms_per_tok * 8.0, ver8_res.tok_per_sec, ver8_res.tok_per_sec * 0.625);
+
+        for (int32_t ctx_len : {512, 32768, 98304, 150000, 200000}) {
+            auto bd_ctx = eng27.profile_decode(ctx_len, 4, 2);
+            std::printf("Decode @ ctx=%6d: non-graph=%.3f ms | hipGraph=%.3f ms (%.2f tok/s, attn=%.3f ms)\n",
+                        ctx_len, bd_ctx.non_graph_wall_ms, bd_ctx.graph_wall_ms,
+                        1000.0 / bd_ctx.graph_wall_ms, bd_ctx.attn_op_ms);
+        }
 
         auto bd = eng27.profile_decode(512, 6, 2);
         const double sum_gpu = bd.embed_ms + bd.rmsnorm_ms + bd.qkv_proj_ms + bd.attn_op_ms +

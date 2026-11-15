@@ -3,10 +3,58 @@
 
 #include "rxinfer/arena.hpp"
 
+#include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace rxinfer {
+namespace {
+
+bool query_drm_free_vram_bytes(const hipDeviceProp_t& prop, size_t& out_free_bytes) {
+    std::error_code ec;
+    const std::filesystem::path drm_dir("/sys/class/drm");
+    if (!std::filesystem::exists(drm_dir, ec)) return false;
+
+    char pci_slot[32];
+    std::snprintf(pci_slot, sizeof(pci_slot), "%04x:%02x:%02x.0",
+                  static_cast<unsigned>(prop.pciDomainID),
+                  static_cast<unsigned>(prop.pciBusID),
+                  static_cast<unsigned>(prop.pciDeviceID));
+
+    for (const auto& entry : std::filesystem::directory_iterator(drm_dir, ec)) {
+        const auto name = entry.path().filename().string();
+        if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) continue;
+
+        const auto dev_dir = entry.path() / "device";
+        std::ifstream uev(dev_dir / "uevent");
+        if (!uev) continue;
+
+        bool matched = false;
+        std::string line;
+        while (std::getline(uev, line)) {
+            if (line.rfind("PCI_SLOT_NAME=", 0) == 0 && line.substr(14) == pci_slot) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) continue;
+
+        uint64_t vram_total = 0, vram_used = 0;
+        std::ifstream ftot(dev_dir / "mem_info_vram_total");
+        std::ifstream fuse(dev_dir / "mem_info_vram_used");
+        if ((ftot >> vram_total) && (fuse >> vram_used) && vram_total > 0) {
+            out_free_bytes = (vram_total > vram_used) ? static_cast<size_t>(vram_total - vram_used) : 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
 
 DeviceInfo query_device_info(int device_id) {
     hipDeviceProp_t prop{};
@@ -21,11 +69,17 @@ DeviceInfo query_device_info(int device_id) {
         RX_HIP_CHECK(hipSetDevice(prev_dev));
     }
 
+    size_t drm_free = 0;
+    if (query_drm_free_vram_bytes(prop, drm_free)) {
+        free_bytes = std::min(free_bytes, drm_free);
+    }
+
     DeviceInfo info;
     info.device_id = device_id;
     info.name = prop.name;
     info.gcn_arch_name = prop.gcnArchName;
     info.total_vram_bytes = total_bytes;
+    info.free_vram_bytes = free_bytes;
     info.multiprocessor_count = prop.multiProcessorCount;
     info.warp_size = prop.warpSize;
     info.shared_mem_per_block = prop.sharedMemPerBlock;

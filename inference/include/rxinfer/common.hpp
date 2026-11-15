@@ -36,6 +36,7 @@ struct DeviceInfo {
     std::string name;
     std::string gcn_arch_name;
     size_t total_vram_bytes = 0;
+    size_t free_vram_bytes = 0;
     int multiprocessor_count = 0;
     int warp_size = 32;
     size_t shared_mem_per_block = 0;

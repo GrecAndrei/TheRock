@@ -139,8 +139,12 @@ void print_usage(const char* argv0) {
                  "  --think                   Enable <think> mode in chat template\n"
                  "  --max-tokens <N>          Max new tokens per turn (default: 256, or 1024 in -i)\n"
                  "  --max-seq-len <N>         Max context length (default: 4096)\n"
-                 "  --max-batch-tokens <N>    Prefill chunk size (default: 256)\n"
+                 "  --max-batch-tokens <N>    Prefill chunk size (default: 512)\n"
                  "  --kv-dtype <f16|fp8|fp4>  KV cache dtype (default: f16)\n"
+                 "  --kv-vram-gb <F>          KV VRAM cap in GiB (-1=auto GTT spillover, 0=all GTT, default: -1)\n"
+                 "  --decode-splits <N>       Split-K partitions for decode attention (0=auto, default: 0)\n"
+                 "  --prompt-cache <path>     Persistent .rxprompt cache file (load if exists; save on create/exit)\n"
+                 "  --save-prompt-cache <p>   Always save prompt cache to <p> (after prefill or on -i exit)\n"
                  "  --temp <F>                Sampling temperature (0 = greedy GPU argmax, default: 0.0)\n"
                  "  --top-k <N>               Top-K cutoff when --temp > 0 (0 = off, default: 40)\n"
                  "  --top-p <F>               Nucleus Top-P when --temp > 0 (default: 0.95)\n"
@@ -163,8 +167,12 @@ void print_interactive_help() {
     std::fprintf(stderr,
                  "\nInteractive commands:\n"
                  "  /help, /?               Show this help\n"
-                 "  /reset, /clear          Clear KV + GDN state and start a new conversation\n"
-                 "  /stats                  Show context usage, VRAM, and true TPS stats\n"
+                 "  /reset, /clear          Clear active state and start a new conversation (keeps LCP snapshots)\n"
+                 "  /save-cache <path>      Save live KV + GDN prompt state to .rxprompt file\n"
+                 "  /load-cache <path>      Restore KV + GDN prompt state from .rxprompt file\n"
+                 "  /cache                  Show prompt cache, LCP snapshots, and VRAM/GTT KV tier status\n"
+                 "  /clear-cache            Free in-memory GDN prefix checkpoints\n"
+                 "  /stats                  Show context usage, VRAM/GTT, and true TPS stats\n"
                  "  /think [on|off]         Toggle or set <think> mode\n"
                  "  /system <text>          Set system prompt (resets conversation)\n"
                  "  /temp <F>               Set sampling temperature (0 = greedy GPU argmax)\n"
@@ -254,6 +262,7 @@ struct TurnOptions {
     int32_t max_tokens = 256;
     int32_t max_seq_len = 4096;
     std::string system_prompt;
+    std::string save_prompt_cache_after_prefill;
 };
 
 void print_session_stats(const ChatSessionState& st,
@@ -269,6 +278,7 @@ void print_session_stats(const ChatSessionState& st,
 
     std::fprintf(stderr,
                  "\n[Stats] Context: %d / %d tokens (%.1f%%) | VRAM: %.2f GiB (W=%.2f S=%.2f X=%.2f)\n"
+                 "        KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | Prefix snaps: %d\n"
                  "        Sampler: temp=%.2f top_k=%d top_p=%.2f min_p=%.2f rep=%.2f path=%s\n"
                  "        Session: %d turns | prompt=%lld tok (%.1f tok/s) | gen=%lld tok | decode=%lld steps (%.2f tok/s, %.2f ms/tok)\n",
                  engine.position(), engine.options().max_seq_len,
@@ -277,6 +287,9 @@ void print_session_stats(const ChatSessionState& st,
                  engine.weights().weight_arena.used() / double(1ULL << 30),
                  engine.state_vram_bytes() / double(1ULL << 30),
                  engine.scratch_vram_bytes() / double(1ULL << 30),
+                 engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
+                 engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
+                 engine.num_prefix_checkpoints(),
                  sc.temperature, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty,
                  sc.uses_host_logits() ? "host-sample" : "gpu-argmax",
                  st.turns,
@@ -320,35 +333,73 @@ bool run_turn(rxinfer::InferenceEngine& engine,
     std::vector<int32_t> turn_ids = state.pending_tokens;
     turn_ids.insert(turn_ids.end(), encoded.begin(), encoded.end());
 
-    if (turn_ids.empty()) {
-        if (opts.interactive) {
-            std::fprintf(stderr, "[Empty turn; nothing to prefill]\n");
-            return false;
+    if (state.is_first_turn) {
+        if (turn_ids.empty()) {
+            if (opts.interactive) {
+                std::fprintf(stderr, "[Empty turn; nothing to prefill]\n");
+                return false;
+            }
+            throw std::runtime_error("Prompt tokenized to 0 tokens");
         }
-        throw std::runtime_error("Prompt tokenized to 0 tokens");
-    }
-
-    if (engine.position() + static_cast<int32_t>(turn_ids.size()) >= opts.max_seq_len) {
-        if (opts.interactive) {
-            std::fprintf(stderr,
-                         "[Context limit reached (%d + %zu >= %d). Use /reset to start a new conversation.]\n",
-                         engine.position(), turn_ids.size(), opts.max_seq_len);
-            return false;
+        if (static_cast<int32_t>(turn_ids.size()) >= opts.max_seq_len) {
+            if (opts.interactive) {
+                std::fprintf(stderr,
+                             "[Context limit reached (%zu >= %d). Use /reset to start a new conversation.]\n",
+                             turn_ids.size(), opts.max_seq_len);
+                return false;
+            }
+            throw std::runtime_error("Prompt length exceeds --max-seq-len");
         }
-        throw std::runtime_error("Prompt length exceeds --max-seq-len");
+    } else {
+        if (turn_ids.empty()) {
+            if (opts.interactive) {
+                std::fprintf(stderr, "[Empty turn; nothing to prefill]\n");
+                return false;
+            }
+            throw std::runtime_error("Prompt tokenized to 0 tokens");
+        }
+        if (engine.position() + static_cast<int32_t>(turn_ids.size()) >= opts.max_seq_len) {
+            if (opts.interactive) {
+                std::fprintf(stderr,
+                             "[Context limit reached (%d + %zu >= %d). Use /reset to start a new conversation.]\n",
+                             engine.position(), turn_ids.size(), opts.max_seq_len);
+                return false;
+            }
+            throw std::runtime_error("Prompt length exceeds --max-seq-len");
+        }
     }
 
     sampler.record_tokens(encoded);
     const int32_t vocab_size = engine.config().vocab_size;
 
+    std::vector<int32_t> full_prompt_ids;
+    if (state.is_first_turn) {
+        full_prompt_ids = turn_ids;
+    } else {
+        full_prompt_ids = engine.cached_tokens();
+        full_prompt_ids.insert(full_prompt_ids.end(), turn_ids.begin(), turn_ids.end());
+    }
+
     const auto tp0 = std::chrono::steady_clock::now();
-    int32_t next_tok = engine.prefill(turn_ids);
-    if (sampler.config().uses_host_logits()) {
+    const rxinfer::PrefillCacheResult cache_res = engine.prefill_cached(full_prompt_ids);
+    int32_t next_tok = cache_res.next_token;
+    if (sampler.config().uses_host_logits() && cache_res.evaluated_tokens > 0) {
         engine.copy_last_logits_f16(logits_f16_scratch);
         next_tok = sampler.sample_from_f16_bits(logits_f16_scratch.data(), vocab_size);
     }
     const auto tp1 = std::chrono::steady_clock::now();
     const double prefill_ms = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+    if (!opts.save_prompt_cache_after_prefill.empty()) {
+        const auto tsc0 = std::chrono::steady_clock::now();
+        engine.save_prompt_cache(opts.save_prompt_cache_after_prefill);
+        const auto tsc1 = std::chrono::steady_clock::now();
+        if (!opts.quiet) {
+            std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
+                         engine.position(), opts.save_prompt_cache_after_prefill.c_str(),
+                         std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+        }
+    }
 
     state.pending_tokens.clear();
     state.is_first_turn = false;
@@ -422,34 +473,44 @@ bool run_turn(rxinfer::InferenceEngine& engine,
     }
 
     state.turns++;
-    state.last_prompt_tokens = static_cast<int32_t>(turn_ids.size());
+    state.last_prompt_tokens = cache_res.evaluated_tokens;
     state.last_generated_tokens = generated;
     state.last_decode_calls = decode_calls;
     state.last_prefill_ms = prefill_ms;
     state.last_decode_ms = decode_ms;
 
-    state.total_prompt_tokens += turn_ids.size();
+    state.total_prompt_tokens += cache_res.evaluated_tokens;
     state.total_generated_tokens += generated;
     state.total_decode_calls += decode_calls;
     state.total_prefill_ms += prefill_ms;
     state.total_decode_ms += decode_ms;
 
     if (!opts.quiet) {
-        const double p_tps = (turn_ids.size() * 1000.0) / std::max(0.001, prefill_ms);
+        const double p_tps = (cache_res.evaluated_tokens * 1000.0) / std::max(0.001, prefill_ms);
         const double total_ms = prefill_ms + decode_ms;
         const double e2e_tps = (generated > 0) ? (generated * 1000.0 / std::max(0.001, total_ms)) : 0.0;
+        std::string prompt_desc;
+        if (cache_res.matched_prefix_tokens > 0) {
+            char pbuf[160];
+            std::snprintf(pbuf, sizeof(pbuf), "%d new + %d cached%s",
+                          cache_res.evaluated_tokens, cache_res.matched_prefix_tokens,
+                          cache_res.restored_gdn_snapshot ? " (GDN restored)" : "");
+            prompt_desc = pbuf;
+        } else {
+            prompt_desc = std::to_string(cache_res.evaluated_tokens) + " tok";
+        }
         if (decode_calls > 0) {
             const double d_tps = (decode_calls * 1000.0) / std::max(0.001, decode_ms);
             const double ms_per_tok = decode_ms / decode_calls;
             std::fprintf(stderr,
-                         "[Prompt: %zu tok in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Decode: %d steps in %.1f ms (%.2f tok/s, %.2f ms/tok) | Out: %d tok (E2E %.2f tok/s) | Ctx: %d/%d]\n",
-                         turn_ids.size(), prefill_ms, p_tps, prefill_ms,
+                         "[Prompt: %s in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Decode: %d steps in %.1f ms (%.2f tok/s, %.2f ms/tok) | Out: %d tok (E2E %.2f tok/s) | Ctx: %d/%d]\n",
+                         prompt_desc.c_str(), prefill_ms, p_tps, prefill_ms,
                          decode_calls, decode_ms, d_tps, ms_per_tok,
                          generated, e2e_tps, engine.position(), opts.max_seq_len);
         } else {
             std::fprintf(stderr,
-                         "[Prompt: %zu tok in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Out: %d tok (0 decode steps) | Ctx: %d/%d]\n",
-                         turn_ids.size(), prefill_ms, p_tps, prefill_ms,
+                         "[Prompt: %s in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Out: %d tok (0 decode steps) | Ctx: %d/%d]\n",
+                         prompt_desc.c_str(), prefill_ms, p_tps, prefill_ms,
                          generated, engine.position(), opts.max_seq_len);
         }
     }
@@ -468,6 +529,8 @@ int main(int argc, char** argv) {
         std::string prompt_file;
         std::string system_prompt;
         std::string save_rxr4_path;
+        std::string prompt_cache_path;
+        std::string save_prompt_cache_path;
         bool has_prompt = false;
         bool interactive = false;
         bool chat_flag_set = false;
@@ -480,7 +543,9 @@ int main(int argc, char** argv) {
         bool has_max_tokens = false;
         int32_t max_tokens = 256;
         int32_t max_seq_len = 4096;
-        int32_t max_batch_tokens = 256;
+        int32_t max_batch_tokens = 512;
+        int32_t decode_attn_splits = 0;
+        double kv_vram_gb = -1.0;
         int threads = 0;
         rxinfer::DType kv_dtype = rxinfer::DType::F16;
         rxinfer::SamplerConfig sampler_cfg{};
@@ -527,6 +592,14 @@ int main(int argc, char** argv) {
                 max_batch_tokens = std::stoi(need_val("--max-batch-tokens"));
             } else if (arg == "--kv-dtype") {
                 kv_dtype = parse_kv_dtype(need_val("--kv-dtype"));
+            } else if (arg == "--kv-vram-gb") {
+                kv_vram_gb = std::stod(need_val("--kv-vram-gb"));
+            } else if (arg == "--decode-splits") {
+                decode_attn_splits = std::stoi(need_val("--decode-splits"));
+            } else if (arg == "--prompt-cache") {
+                prompt_cache_path = need_val("--prompt-cache");
+            } else if (arg == "--save-prompt-cache") {
+                save_prompt_cache_path = need_val("--save-prompt-cache");
             } else if (arg == "--temp") {
                 sampler_cfg.temperature = std::stof(need_val("--temp"));
             } else if (arg == "--top-k") {
@@ -578,9 +651,10 @@ int main(int argc, char** argv) {
 
         const auto dev = rxinfer::query_device_info(0);
         if (!quiet) {
-            std::fprintf(stderr, "rxinfer | GPU: %s (%s) | VRAM: %.2f GiB | WGPs: %d\n",
+            std::fprintf(stderr, "rxinfer | GPU: %s (%s) | VRAM: %.2f GiB (%.2f GiB free) | WGPs: %d\n",
                          dev.name.c_str(), dev.gcn_arch_name.c_str(),
                          dev.total_vram_bytes / double(1ULL << 30),
+                         dev.free_vram_bytes / double(1ULL << 30),
                          dev.multiprocessor_count);
         }
 
@@ -663,16 +737,21 @@ int main(int argc, char** argv) {
         eopts.max_batch_tokens = max_batch_tokens;
         eopts.kv_dtype = kv_dtype;
         eopts.enable_hip_graph = !no_graph;
+        eopts.kv_vram_gb = kv_vram_gb;
+        eopts.decode_attn_splits = decode_attn_splits;
 
         rxinfer::InferenceEngine engine(std::move(weights), eopts);
         max_seq_len = engine.options().max_seq_len;
 
         if (!quiet) {
-            std::fprintf(stderr, "Total allocated VRAM: %.2f GiB (kv=%s, hipGraph=%s, max_seq=%d)\n",
+            std::fprintf(stderr,
+                         "Total allocated VRAM: %.2f GiB | KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | kv=%s | hipGraph=%s | max_seq=%d | batch=%d\n",
                          engine.total_vram_used_bytes() / double(1ULL << 30),
+                         engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
+                         engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
                          std::string(rxinfer::dtype_name(kv_dtype)).c_str(),
                          eopts.enable_hip_graph ? "on" : "off",
-                         max_seq_len);
+                         max_seq_len, engine.options().max_batch_tokens);
         }
 
         if (run_bench) {
@@ -707,7 +786,55 @@ int main(int argc, char** argv) {
         topts.max_tokens = max_tokens;
         topts.max_seq_len = max_seq_len;
         topts.system_prompt = system_prompt;
+        if (!interactive) {
+            if (!save_prompt_cache_path.empty()) {
+                topts.save_prompt_cache_after_prefill = save_prompt_cache_path;
+            } else if (!prompt_cache_path.empty() && !path_exists(prompt_cache_path)) {
+                topts.save_prompt_cache_after_prefill = prompt_cache_path;
+            }
+        }
         std::vector<uint16_t> logits_f16_scratch;
+
+        if (!prompt_cache_path.empty() && path_exists(prompt_cache_path)) {
+            const auto tlc0 = std::chrono::steady_clock::now();
+            const int32_t loaded_pos = engine.load_prompt_cache(prompt_cache_path);
+            const auto tlc1 = std::chrono::steady_clock::now();
+            if (!quiet) {
+                std::fprintf(stderr, "Loaded prompt cache from %s (%d tok) in %.1f ms\n",
+                             prompt_cache_path.c_str(), loaded_pos,
+                             std::chrono::duration<double, std::milli>(tlc1 - tlc0).count());
+            }
+            if (loaded_pos > 0) {
+                bool continue_loaded_turn = interactive;
+                if (!interactive && has_prompt) {
+                    std::string first_text = chat_mode
+                        ? tokenizer.format_chat_turn(prompt, system_prompt, true, false, think_mode)
+                        : prompt;
+                    std::vector<int32_t> first_ids = tokenizer.encode(first_text, false);
+                    if (tokenizer.should_add_bos() && tokenizer.bos_id() >= 0 &&
+                        (first_ids.empty() || first_ids[0] != tokenizer.bos_id())) {
+                        first_ids.insert(first_ids.begin(), tokenizer.bos_id());
+                    }
+                    const auto& cached = engine.cached_tokens();
+                    const size_t min_len = std::min(first_ids.size(), cached.size());
+                    size_t lcp = 0;
+                    while (lcp < min_len && first_ids[lcp] == cached[lcp]) ++lcp;
+                    if (!(lcp == first_ids.size() || lcp == cached.size() || lcp > 16)) {
+                        continue_loaded_turn = true;
+                    }
+                }
+                if (continue_loaded_turn) {
+                    state.is_first_turn = false;
+                    if (chat_mode && !engine.cached_tokens().empty()) {
+                        const int32_t last_id = engine.cached_tokens().back();
+                        const int32_t im_end = tokenizer.token_to_id("<|im_end|>");
+                        const int32_t eot = tokenizer.token_to_id("<|eot_id|>");
+                        state.close_previous_turn = (last_id != im_end && last_id != eot);
+                    }
+                    sampler.record_tokens(engine.cached_tokens());
+                }
+            }
+        }
 
         if (interactive) {
             install_interactive_sigint();
@@ -783,7 +910,54 @@ int main(int argc, char** argv) {
                         print_interactive_help();
                     } else if (cmd == "/reset" || cmd == "/clear") {
                         state.reset_conversation(engine, sampler);
-                        std::fprintf(stderr, "[Conversation reset. Context 0 / %d]\n", topts.max_seq_len);
+                        std::fprintf(stderr, "[Conversation reset. Context 0 / %d (LCP snapshots=%d)]\n",
+                                     topts.max_seq_len, engine.num_prefix_checkpoints());
+                    } else if (cmd == "/save-cache") {
+                        const std::string target = arg.empty() ? prompt_cache_path : arg;
+                        if (target.empty()) {
+                            std::fprintf(stderr, "Usage: /save-cache <path>\n");
+                        } else {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            engine.save_prompt_cache(target);
+                            const auto t1 = std::chrono::steady_clock::now();
+                            std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
+                                         engine.position(), target.c_str(),
+                                         std::chrono::duration<double, std::milli>(t1 - t0).count());
+                        }
+                    } else if (cmd == "/load-cache") {
+                        const std::string target = arg.empty() ? prompt_cache_path : arg;
+                        if (target.empty()) {
+                            std::fprintf(stderr, "Usage: /load-cache <path>\n");
+                        } else {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            const int32_t loaded_pos = engine.load_prompt_cache(target);
+                            const auto t1 = std::chrono::steady_clock::now();
+                            state.pending_tokens.clear();
+                            state.is_first_turn = (loaded_pos == 0);
+                            state.close_previous_turn = false;
+                            if (topts.chat_mode && loaded_pos > 0 && !engine.cached_tokens().empty()) {
+                                const int32_t last_id = engine.cached_tokens().back();
+                                const int32_t im_end = tokenizer.token_to_id("<|im_end|>");
+                                const int32_t eot = tokenizer.token_to_id("<|eot_id|>");
+                                state.close_previous_turn = (last_id != im_end && last_id != eot);
+                            }
+                            sampler.clear_history();
+                            sampler.record_tokens(engine.cached_tokens());
+                            std::fprintf(stderr, "[Loaded prompt cache (%d tok) from %s in %.1f ms]\n",
+                                         loaded_pos, target.c_str(),
+                                         std::chrono::duration<double, std::milli>(t1 - t0).count());
+                        }
+                    } else if (cmd == "/cache") {
+                        std::fprintf(stderr,
+                                     "[Cache] Live ctx: %d/%d tok | Snapshots: %d | KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | File: %s\n",
+                                     engine.position(), topts.max_seq_len,
+                                     engine.num_prefix_checkpoints(),
+                                     engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
+                                     engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
+                                     prompt_cache_path.empty() ? "(none)" : prompt_cache_path.c_str());
+                    } else if (cmd == "/clear-cache") {
+                        engine.clear_prefix_cache();
+                        std::fprintf(stderr, "[Cleared in-memory GDN prefix checkpoints]\n");
                     } else if (cmd == "/stats") {
                         print_session_stats(state, engine, sampler);
                     } else if (cmd == "/think") {
@@ -888,6 +1062,19 @@ int main(int argc, char** argv) {
             }
 
             run_turn(engine, tokenizer, sampler, state, full_input, topts, logits_f16_scratch);
+        }
+
+        const std::string final_save_cache =
+            !save_prompt_cache_path.empty() ? save_prompt_cache_path : prompt_cache_path;
+        if (interactive && !final_save_cache.empty() && engine.position() > 0) {
+            const auto tsc0 = std::chrono::steady_clock::now();
+            engine.save_prompt_cache(final_save_cache);
+            const auto tsc1 = std::chrono::steady_clock::now();
+            if (!quiet) {
+                std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
+                             engine.position(), final_save_cache.c_str(),
+                             std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+            }
         }
 
         if (!quiet && interactive && state.turns > 0) {
