@@ -711,8 +711,9 @@ int test_gguf_q4k_q6k_tokenizer_e2e() {
     }
 
     auto ids = tk_gguf.encode("hello");
-    if (ids.size() != 1 || tk_gguf.decode(ids) != "hello") {
-        std::printf("[FAIL] GGUF tokenizer encode/decode mismatch!\n");
+    if (ids.size() != 1 || tk_gguf.decode(ids) != "hello" ||
+        !tk_gguf.is_eos(V - 2) || tk_gguf.should_add_bos()) {
+        std::printf("[FAIL] GGUF tokenizer encode/decode/EOS mismatch!\n");
         return 1;
     }
 
@@ -982,8 +983,8 @@ int test_gguf_qwen35_iq_and_rxr4_e2e() {
         }
     }
     const double cos_rx = cosine_sim(logits_g, logits_r);
-    if (cos_rx < 0.999999) {
-        std::printf("[FAIL] qwen35 GGUF vs RXR4 logits mismatch cos=%.8f\n", cos_rx);
+    if (cos_rx < 0.999999 || eng_g.cache_signature() != eng_r.cache_signature()) {
+        std::printf("[FAIL] qwen35 GGUF vs RXR4 logits/signature mismatch cos=%.8f\n", cos_rx);
         return 1;
     }
 

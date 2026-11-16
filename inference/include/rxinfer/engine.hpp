@@ -226,6 +226,7 @@ private:
     std::unordered_map<int, hipGraphExec_t> verify_graph_execs_;
     int32_t cur_pos_ = 0;
     int32_t last_next_token_ = -1;
+    std::string cache_signature_;
     std::vector<int32_t> cached_tokens_;
     std::vector<int32_t> kv_resident_tokens_;
     std::vector<PrefixSnapshot> prefix_snapshots_;

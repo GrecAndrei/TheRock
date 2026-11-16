@@ -64,8 +64,9 @@ In interactive mode (`-i`), `rxinfer` automatically enables:
 ./inference/build/rxinfer --model /path/to/model.rxr4 --chat --prompt "Explain Wave32 WMMA." \
   --kv-dtype fp8 --temp 0.7 --top-k 40 --top-p 0.95 --repeat-penalty 1.05
 
-# Convert a HuggingFace safetensors directory to a fast-loading .rxr4 checkpoint
-./inference/build/rxinfer --model /path/to/model_dir --save-rxr4 /path/to/model.rxr4
+# Convert a HuggingFace safetensors directory or GGUF to a fast-loading .rxr4 checkpoint
+# (Loading foo.rxr4 auto-discovers foo.tokenizer.json, foo.gguf, or tokenizer.json in the same folder)
+./inference/build/rxinfer --model /path/to/model_dir_or_file.gguf --save-rxr4 /path/to/model.rxr4
 ```
 
 ### Interactive Slash Commands & Multi-line Input

@@ -18,7 +18,37 @@
 namespace rxinfer {
 namespace {
 
-std::string build_cache_signature(const ModelConfig& c, DType kv_dt) {
+uint64_t compute_weight_fingerprint(const ModelWeights& w) {
+    uint64_t h = 14695981039346656037ULL;
+    std::vector<uint8_t> buf;
+    auto mix_device = [&](const void* d_ptr, size_t bytes) {
+        if (!d_ptr || bytes == 0) return;
+        buf.resize(bytes);
+        RX_HIP_CHECK(hipMemcpy(buf.data(), d_ptr, bytes, hipMemcpyDeviceToHost));
+        for (uint8_t b : buf) {
+            h ^= b;
+            h *= 1099511628211ULL;
+        }
+    };
+    const size_t h_bytes = static_cast<size_t>(std::max(0, w.config.hidden_size)) * sizeof(__half);
+    mix_device(w.final_norm, h_bytes);
+    if (w.embed_tokens.valid()) {
+        const size_t sc_b = quant::r4_g64_scales_bytes(w.embed_tokens.N, w.embed_tokens.K);
+        mix_device(w.embed_tokens.scales, std::min<size_t>(16384, sc_b));
+    }
+    if (!w.layers.empty()) {
+        mix_device(w.layers.front().input_norm, h_bytes);
+        mix_device(w.layers.back().post_attn_norm, h_bytes);
+        if (w.layers.back().down_proj.valid()) {
+            const size_t sc_b = quant::r4_g64_scales_bytes(w.layers.back().down_proj.N, w.layers.back().down_proj.K);
+            mix_device(w.layers.back().down_proj.scales, std::min<size_t>(4096, sc_b));
+        }
+    }
+    return h;
+}
+
+std::string build_cache_signature(const ModelWeights& w, DType kv_dt) {
+    const ModelConfig& c = w.config;
     std::ostringstream oss;
     oss << "type=" << c.model_type
         << ";V=" << c.vocab_size
@@ -55,6 +85,10 @@ std::string build_cache_signature(const ModelConfig& c, DType kv_dt) {
             (l < static_cast<int32_t>(c.layer_types.size())) ? c.layer_types[l] : LayerKind::FullAttention;
         oss << ((k == LayerKind::FullAttention) ? 'A' : 'G');
     }
+    char wh_buf[24];
+    std::snprintf(wh_buf, sizeof(wh_buf), ";wh=%016llx",
+                  static_cast<unsigned long long>(compute_weight_fingerprint(w)));
+    oss << wh_buf;
     return oss.str();
 }
 
@@ -127,6 +161,7 @@ InferenceEngine::InferenceEngine(ModelWeights weights, EngineOptions opts)
 
     RX_HIP_CHECK(hipStreamCreate(&stream_));
     init_arenas();
+    cache_signature_ = build_cache_signature(weights_, opts_.kv_dtype);
     reset_state();
     if (opts_.enable_hip_graph) {
         capture_decode_graph();
@@ -433,7 +468,7 @@ void InferenceEngine::clear_prefix_cache() {
 }
 
 std::string InferenceEngine::cache_signature() const {
-    return build_cache_signature(weights_.config, opts_.kv_dtype);
+    return cache_signature_;
 }
 
 void InferenceEngine::record_prefix_snapshot(bool pin) {
@@ -936,7 +971,7 @@ void InferenceEngine::save_prompt_cache(const std::string& path) const {
 
     const char magic[4] = {'R', 'X', 'P', 'C'};
     const uint32_t version = 1;
-    const std::string sig = build_cache_signature(weights_.config, opts_.kv_dtype);
+    const std::string& sig = cache_signature_;
     const uint64_t sig_len = sig.size();
     const int32_t pos = cur_pos_;
     const int32_t last_tok = last_next_token_;
@@ -1034,8 +1069,7 @@ int32_t InferenceEngine::load_prompt_cache(const std::string& path) {
 
     std::string sig(sig_len, '\0');
     ifs.read(sig.data(), sig_len);
-    const std::string expected_sig = build_cache_signature(weights_.config, opts_.kv_dtype);
-    if (sig != expected_sig) {
+    if (sig != cache_signature_) {
         throw std::runtime_error("Prompt cache signature mismatch (different model or --kv-dtype): " + path);
     }
 

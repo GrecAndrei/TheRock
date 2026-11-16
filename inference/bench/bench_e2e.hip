@@ -466,6 +466,13 @@ int test_periodic_checkpoints_and_restore() {
         return 1;
     }
 
+    auto w_other = rxinfer::load_synthetic_model(cfg, 999, lo);
+    rxinfer::InferenceEngine eng_other(std::move(w_other), eo);
+    if (eng.cache_signature() == eng_other.cache_signature()) {
+        std::printf("  [FAIL] Distinct-weight models collided on cache_signature()\n");
+        return 1;
+    }
+
     std::printf("  [PASS] Periodic 4096-grid GDN checkpoints + Pinned Sys + restore_prefix + inspect_prompt_cache\n");
     return 0;
 }

@@ -639,6 +639,13 @@ Tokenizer Tokenizer::from_gguf(const std::string& gguf_path) {
         tk.add_bos_token_ = (!tk.byte_level_ && tk.bos_id_ >= 0 && !tk.is_eos(tk.bos_id_));
     }
 
+    // Also register standard end-of-sequence tokens present in vocab (matching HF tokenizer loader),
+    // applied after add_bos_token_ is finalized so byte-level BOS/pad sharing doesn't trigger add_bos.
+    for (const char* eos_cand : {"<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"}) {
+        const int32_t eid = tk.token_to_id(eos_cand);
+        if (eid >= 0) tk.add_eos_id(eid);
+    }
+
     // Ensure well-known chat/reasoning delimiter tokens present in vocab are matched verbatim in encode().
     const char* known_delims[] = {
         "<|im_start|>", "<|im_end|>", "<|endoftext|>",

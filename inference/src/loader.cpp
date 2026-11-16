@@ -10,10 +10,14 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -78,8 +82,10 @@ void pack_r4_parallel(int N, int K, void* dst_qs, __half* dst_scales, int num_th
     num_threads = std::min(num_threads, std::max(1, n_tiles));
 
     auto worker = [&](int tid) {
+        const int nt_begin = (n_tiles * tid) / num_threads;
+        const int nt_end = (n_tiles * (tid + 1)) / num_threads;
         std::vector<float> rows(16ULL * K, 0.0f);
-        for (int nt = tid; nt < n_tiles; nt += num_threads) {
+        for (int nt = nt_begin; nt < nt_end; ++nt) {
             const int n0 = nt * 16;
             const int valid_rows = std::min(16, N - n0);
             for (int nl = 0; nl < valid_rows; ++nl) {
@@ -256,6 +262,9 @@ struct MappedFile {
             if (p == MAP_FAILED) {
                 ::close(fd);
                 throw std::runtime_error("mmap failed: " + path);
+            }
+            if (size >= (1ULL << 20)) {
+                (void)::madvise(p, size, MADV_SEQUENTIAL);
             }
             data = static_cast<const uint8_t*>(p);
         }
@@ -1820,7 +1829,8 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
 }
 
 void save_rxr4_checkpoint(const ModelWeights& weights, const std::string& path) {
-    std::ofstream ofs(path, std::ios::binary);
+    const std::string tmp_path = path + ".rxtmp";
+    std::ofstream ofs(tmp_path, std::ios::binary);
     if (!ofs) throw std::runtime_error("Failed to open RXR4 output: " + path);
 
     const char magic[4] = {'R', 'X', 'R', '4'};
@@ -1844,26 +1854,65 @@ void save_rxr4_checkpoint(const ModelWeights& weights, const std::string& path) 
         RX_HIP_CHECK(hipMemcpy(buf.data(), static_cast<const uint8_t*>(weights.weight_arena.base()) + off,
                                n, hipMemcpyDeviceToHost));
         ofs.write(reinterpret_cast<const char*>(buf.data()), n);
+        if (!ofs) {
+            ofs.close();
+            (void)std::remove(tmp_path.c_str());
+            throw std::runtime_error("Failed writing RXR4 checkpoint: " + path);
+        }
         off += n;
+    }
+    ofs.flush();
+    if (!ofs) {
+        ofs.close();
+        (void)std::remove(tmp_path.c_str());
+        throw std::runtime_error("Failed flushing RXR4 checkpoint: " + path);
+    }
+    ofs.close();
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        (void)std::remove(tmp_path.c_str());
+        throw std::runtime_error("Failed finalizing RXR4 checkpoint: " + path);
     }
 }
 
 ModelWeights load_from_rxr4(const std::string& path) {
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) throw std::runtime_error("Failed to open RXR4 file: " + path);
+    struct FdGuard {
+        int fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) ::close(fd);
+        }
+    };
+    FdGuard fg{::open(path.c_str(), O_RDONLY)};
+    if (fg.fd < 0) throw std::runtime_error("Failed to open RXR4 file: " + path);
+    (void)::posix_fadvise(fg.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+    auto read_exact = [&](void* dst, size_t n, const char* what) {
+        auto* p = static_cast<uint8_t*>(dst);
+        size_t got = 0;
+        while (got < n) {
+            const ssize_t r = ::read(fg.fd, p + got, n - got);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error(std::string("Read error in RXR4 ") + what + ": " + path);
+            }
+            if (r == 0) {
+                throw std::runtime_error(std::string("Truncated RXR4 ") + what + ": " + path);
+            }
+            got += static_cast<size_t>(r);
+        }
+    };
 
     char magic[4]{};
     uint32_t version = 0;
     uint64_t cfg_len = 0, arena_bytes = 0;
-    ifs.read(magic, 4);
-    ifs.read(reinterpret_cast<char*>(&version), 4);
-    ifs.read(reinterpret_cast<char*>(&cfg_len), 8);
-    ifs.read(reinterpret_cast<char*>(&arena_bytes), 8);
-    if (std::memcmp(magic, "RXR4", 4) != 0 || version != 1) {
+    read_exact(magic, 4, "magic");
+    read_exact(&version, 4, "version");
+    read_exact(&cfg_len, 8, "cfg_len");
+    read_exact(&arena_bytes, 8, "arena_bytes");
+    if (std::memcmp(magic, "RXR4", 4) != 0 || version != 1 || cfg_len > (16ULL << 20)) {
         throw std::runtime_error("Invalid RXR4 header: " + path);
     }
     std::string cfg_str(cfg_len, '\0');
-    ifs.read(cfg_str.data(), cfg_len);
+    if (cfg_len > 0) read_exact(cfg_str.data(), cfg_len, "config");
 
     ModelConfig cfg = ModelConfig::from_hf_json_string(cfg_str);
     ModelWeights w;
@@ -1871,17 +1920,92 @@ ModelWeights load_from_rxr4(const std::string& path) {
     if (w.weight_arena.used() != arena_bytes) {
         throw std::runtime_error("RXR4 arena size mismatch");
     }
+    if (arena_bytes == 0) return w;
 
-    constexpr size_t CHUNK = 64ULL << 20;
-    std::vector<uint8_t> buf(std::min(CHUNK, static_cast<size_t>(arena_bytes)));
-    size_t off = 0;
-    while (off < arena_bytes) {
-        const size_t n = std::min(CHUNK, static_cast<size_t>(arena_bytes - off));
-        ifs.read(reinterpret_cast<char*>(buf.data()), n);
-        RX_HIP_CHECK(hipMemcpy(static_cast<uint8_t*>(w.weight_arena.base()) + off, buf.data(),
-                               n, hipMemcpyHostToDevice));
-        off += n;
+    constexpr size_t CHUNK = 16ULL << 20;
+    const size_t buf_bytes = std::min(CHUNK, static_cast<size_t>(arena_bytes));
+    std::vector<uint8_t> bufs[2] = {std::vector<uint8_t>(buf_bytes), std::vector<uint8_t>(buf_bytes)};
+    size_t slot_off[2]{0, 0};
+    size_t slot_len[2]{0, 0};
+    bool slot_full[2]{false, false};
+    bool reader_done = false;
+    bool abort_read = false;
+    std::string read_err;
+    std::mutex mu;
+    std::condition_variable cv;
+
+    std::thread reader([&]() {
+        try {
+            size_t off = 0;
+            int idx = 0;
+            while (off < arena_bytes) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&]() { return !slot_full[idx] || abort_read; });
+                    if (abort_read) return;
+                }
+                const size_t n = std::min(CHUNK, static_cast<size_t>(arena_bytes - off));
+                read_exact(bufs[idx].data(), n, "payload");
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    slot_off[idx] = off;
+                    slot_len[idx] = n;
+                    slot_full[idx] = true;
+                }
+                cv.notify_all();
+                off += n;
+                idx ^= 1;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                reader_done = true;
+            }
+            cv.notify_all();
+        } catch (const std::exception& e) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                read_err = e.what();
+                reader_done = true;
+            }
+            cv.notify_all();
+        }
+    });
+
+    try {
+        int idx = 0;
+        while (true) {
+            size_t off = 0, n = 0;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&]() { return slot_full[idx] || !read_err.empty() || reader_done; });
+                if (!read_err.empty()) {
+                    throw std::runtime_error(read_err);
+                }
+                if (!slot_full[idx] && reader_done) break;
+                off = slot_off[idx];
+                n = slot_len[idx];
+            }
+            RX_HIP_CHECK(hipMemcpyAsync(static_cast<uint8_t*>(w.weight_arena.base()) + off,
+                                        bufs[idx].data(), n, hipMemcpyHostToDevice, nullptr));
+            RX_HIP_CHECK(hipStreamSynchronize(nullptr));
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                slot_full[idx] = false;
+            }
+            cv.notify_all();
+            idx ^= 1;
+        }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            abort_read = true;
+        }
+        cv.notify_all();
+        if (reader.joinable()) reader.join();
+        throw;
     }
+
+    if (reader.joinable()) reader.join();
     return w;
 }
 

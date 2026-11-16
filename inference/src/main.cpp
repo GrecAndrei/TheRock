@@ -1149,8 +1149,13 @@ int main(int argc, char** argv) {
         } else if (ends_with(model_path, ".rxr4")) {
             weights = rxinfer::load_from_rxr4(model_path);
             if (tokenizer_path.empty()) {
-                const std::string cand = parent_dir(model_path) + "/tokenizer.json";
-                if (path_exists(cand)) tokenizer_path = cand;
+                const std::string stem = model_path.substr(0, model_path.size() - 5);
+                const std::string stem_tok = stem + ".tokenizer.json";
+                const std::string stem_gguf = stem + ".gguf";
+                const std::string dir_tok = parent_dir(model_path) + "/tokenizer.json";
+                if (path_exists(stem_tok)) tokenizer_path = stem_tok;
+                else if (path_exists(stem_gguf)) tokenizer_path = stem_gguf;
+                else if (path_exists(dir_tok)) tokenizer_path = dir_tok;
             }
         } else if (ends_with(model_path, ".gguf")) {
             weights = rxinfer::load_from_gguf(model_path, nullptr, lopts);
