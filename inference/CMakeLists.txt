@@ -31,7 +31,10 @@ add_library(rxinfer_core STATIC
     src/loader.cpp
     src/markdown.cpp
     src/sampler.cpp
+    src/server.cpp
     src/tokenizer.cpp
+    src/tools.cpp
+    src/tui.cpp
     src/engine.cpp
     src/kernels/quant_q4_gguf.hip
     src/kernels/quant_r4_gfx12.hip

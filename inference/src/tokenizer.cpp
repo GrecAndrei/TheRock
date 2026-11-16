@@ -190,7 +190,11 @@ void Tokenizer::finalize_added_tokens() {
                   return a.id < b.id;
               });
     added_by_first_byte_.assign(256, {});
+    added_token_ids_.clear();
     for (size_t i = 0; i < added_tokens_.size(); ++i) {
+        if (added_tokens_[i].id >= 0) {
+            added_token_ids_.insert(added_tokens_[i].id);
+        }
         if (!added_tokens_[i].content.empty()) {
             const uint8_t first = static_cast<uint8_t>(added_tokens_[i].content[0]);
             added_by_first_byte_[first].push_back(i);
@@ -389,6 +393,29 @@ Tokenizer Tokenizer::from_hf_json_string(const std::string& json_text) {
         }
     } else if (tk.metaspace_ && tk.bos_id_ >= 0 && !tk.is_eos(tk.bos_id_)) {
         tk.add_bos_token_ = true;
+    }
+
+    const char* known_delims[] = {
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+        "<|python_tag|>",
+        "<think>", "</think>",
+        "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+    };
+    for (const char* tok_str : known_delims) {
+        const auto it = tk.token_to_id_.find(tok_str);
+        if (it == tk.token_to_id_.end()) continue;
+        bool already = false;
+        for (const auto& at : tk.added_tokens_) {
+            if (at.content == tok_str) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) {
+            const bool is_spec = tk.special_ids_.count(it->second) > 0;
+            tk.added_tokens_.push_back(AddedToken{tok_str, it->second, is_spec});
+        }
     }
 
     tk.finalize_added_tokens();
@@ -646,11 +673,13 @@ Tokenizer Tokenizer::from_gguf(const std::string& gguf_path) {
         if (eid >= 0) tk.add_eos_id(eid);
     }
 
-    // Ensure well-known chat/reasoning delimiter tokens present in vocab are matched verbatim in encode().
+    // Ensure well-known chat/reasoning/tool delimiter tokens present in vocab are matched verbatim in encode().
     const char* known_delims[] = {
         "<|im_start|>", "<|im_end|>", "<|endoftext|>",
         "<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+        "<|python_tag|>",
         "<think>", "</think>",
+        "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
     };
     for (const char* tok_str : known_delims) {
         const auto it = tk.token_to_id_.find(tok_str);
@@ -1027,7 +1056,7 @@ std::string Tokenizer::decode_token(int32_t id, bool skip_special_tokens) const 
     if (skip_special_tokens && is_special(id)) return "";
 
     const std::string& tok = id_to_token_[id];
-    if (is_special(id)) return tok;
+    if (is_special(id) || added_token_ids_.count(id) > 0) return tok;
 
     if (byte_level_) {
         std::string out;
@@ -1163,6 +1192,417 @@ std::string Tokenizer::format_chat_turn(const std::string& user_prompt,
         out += "<|im_end|>\n";
     }
     out += "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    if (!enable_thinking && token_to_id("</think>") >= 0) {
+        out += "<think>\n\n</think>\n\n";
+    } else if (enable_thinking && token_to_id("<think>") >= 0 && token_to_id("</think>") >= 0) {
+        out += "<think>\n";
+    }
+    return out;
+}
+
+namespace {
+
+std::string trim_chat_ws(const std::string& s) {
+    size_t a = 0;
+    while (a < s.size() && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
+    size_t b = s.size();
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
+    return s.substr(a, b - a);
+}
+
+std::string serialize_tool_json_line(const ToolFunctionDef& t) {
+    if (!t.raw_json.empty()) {
+        try {
+            return json::dump(json::parse(t.raw_json));
+        } catch (...) {
+        }
+    }
+    json::Object fn_obj;
+    fn_obj.emplace("name", json::Value{t.name});
+    if (!t.description.empty()) {
+        fn_obj.emplace("description", json::Value{t.description});
+    }
+    json::Value params_val;
+    if (!t.parameters_json.empty()) {
+        try {
+            params_val = json::parse(t.parameters_json);
+        } catch (...) {
+            json::Object fallback;
+            fallback.emplace("type", json::Value{std::string("object")});
+            fallback.emplace("properties", json::Value{json::Object{}});
+            params_val = json::Value{std::move(fallback)};
+        }
+    } else {
+        json::Object fallback;
+        fallback.emplace("type", json::Value{std::string("object")});
+        fallback.emplace("properties", json::Value{json::Object{}});
+        params_val = json::Value{std::move(fallback)};
+    }
+    fn_obj.emplace("parameters", std::move(params_val));
+
+    json::Object wrap;
+    wrap.emplace("type", json::Value{std::string("function")});
+    wrap.emplace("function", json::Value{std::move(fn_obj)});
+    return json::dump(json::Value{std::move(wrap)});
+}
+
+std::string format_qwen_tool_call_xml(const ToolCall& tc) {
+    std::string out = "<tool_call>\n<function=" + tc.name + ">\n";
+    if (!tc.arguments.empty()) {
+        try {
+            const json::Value args = json::parse(tc.arguments);
+            if (args.is_object()) {
+                for (const auto& kv : args.as_object()) {
+                    out += "<parameter=" + kv.first + ">\n";
+                    if (kv.second.is_string()) {
+                        out += kv.second.as_str();
+                    } else {
+                        out += json::dump(kv.second);
+                    }
+                    out += "\n</parameter>\n";
+                }
+            }
+        } catch (...) {
+            const std::string t = trim_chat_ws(tc.arguments);
+            if (!t.empty()) {
+                out += "<parameter=raw>\n" + t + "\n</parameter>\n";
+            }
+        }
+    }
+    out += "</function>\n</tool_call>";
+    return out;
+}
+
+std::string format_llama_tool_call_json(const ToolCall& tc) {
+    json::Object obj;
+    obj.emplace("name", json::Value{tc.name});
+    if (!tc.arguments.empty()) {
+        try {
+            obj.emplace("parameters", json::parse(tc.arguments));
+        } catch (...) {
+            obj.emplace("parameters", json::Value{tc.arguments});
+        }
+    } else {
+        obj.emplace("parameters", json::Value{json::Object{}});
+    }
+    return json::dump(json::Value{std::move(obj)});
+}
+
+std::string build_tools_instruction_block(const std::vector<ToolFunctionDef>& tools) {
+    std::string out = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    for (const auto& t : tools) {
+        out += "\n" + serialize_tool_json_line(t);
+    }
+    out += "\n</tools>";
+    out +=
+        "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+        "<tool_call>\n"
+        "<function=example_function_name>\n"
+        "<parameter=example_parameter_1>\n"
+        "value_1\n"
+        "</parameter>\n"
+        "<parameter=example_parameter_2>\n"
+        "This is the value for the second parameter\n"
+        "that can span\n"
+        "multiple lines\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n\n"
+        "<IMPORTANT>\n"
+        "Reminder:\n"
+        "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+        "- Required parameters MUST be specified\n"
+        "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+        "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+        "</IMPORTANT>";
+    return out;
+}
+
+std::string build_llama_tools_block(const std::vector<ToolFunctionDef>& tools) {
+    std::string out = "You have access to the following functions:\n";
+    for (const auto& t : tools) {
+        out += serialize_tool_json_line(t) + "\n";
+    }
+    out += "If you call a function, respond with <|python_tag|> followed by a JSON object "
+           "{\"name\": \"function_name\", \"parameters\": {...}}.";
+    return out;
+}
+
+} // namespace
+
+void Tokenizer::split_thinking(const std::string& text,
+                               std::string& out_reasoning,
+                               std::string& out_visible) {
+    out_reasoning.clear();
+    out_visible.clear();
+
+    const std::string open_tag = "<think>";
+    const std::string close_tag = "</think>";
+    size_t pos = 0;
+    bool found_any = false;
+    while (pos < text.size()) {
+        const size_t op = text.find(open_tag, pos);
+        if (op == std::string::npos) {
+            out_visible.append(text, pos, text.size() - pos);
+            break;
+        }
+        found_any = true;
+        out_visible.append(text, pos, op - pos);
+        const size_t body_start = op + open_tag.size();
+        const size_t cl = text.find(close_tag, body_start);
+        if (cl == std::string::npos) {
+            if (!out_reasoning.empty()) out_reasoning.push_back('\n');
+            out_reasoning.append(text, body_start, text.size() - body_start);
+            pos = text.size();
+            break;
+        }
+        if (!out_reasoning.empty()) out_reasoning.push_back('\n');
+        out_reasoning.append(text, body_start, cl - body_start);
+        pos = cl + close_tag.size();
+    }
+    if (!found_any) {
+        out_visible = text;
+    }
+    out_reasoning = trim_chat_ws(out_reasoning);
+    out_visible = trim_chat_ws(out_visible);
+}
+
+std::string Tokenizer::format_system_prompt(const std::string& system_prompt,
+                                            const std::vector<ToolFunctionDef>& tools,
+                                            const ChatTemplateOptions& opts) const {
+    const ChatFormat fmt = detect_chat_format();
+    const std::string sys_content = trim_chat_ws(system_prompt);
+    std::string out;
+
+    if (fmt == ChatFormat::Llama3) {
+        std::string full_sys;
+        if (!tools.empty()) {
+            full_sys = build_llama_tools_block(tools);
+        }
+        if (!sys_content.empty()) {
+            if (!full_sys.empty()) full_sys += "\n\n";
+            full_sys += sys_content;
+        }
+        if (!full_sys.empty()) {
+            out += "<|start_header_id|>system<|end_header_id|>\n\n" + full_sys + "<|eot_id|>";
+        }
+        return out;
+    }
+
+    std::string reasoning_instructions;
+    if (opts.enable_thinking && !opts.reasoning_effort.empty()) {
+        if (opts.reasoning_effort == "xhigh") {
+            reasoning_instructions =
+                "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+                "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+        } else if (opts.reasoning_effort == "low") {
+            reasoning_instructions =
+                "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+                "conclusion without unnecessary elaboration.";
+        }
+    }
+
+    if (!tools.empty()) {
+        out += "<|im_start|>system\n";
+        if (!reasoning_instructions.empty()) {
+            out += reasoning_instructions + "\n\n";
+        }
+        out += build_tools_instruction_block(tools);
+        if (!sys_content.empty()) {
+            out += "\n\n" + sys_content;
+        }
+        out += "<|im_end|>\n";
+    } else if (!sys_content.empty() || !reasoning_instructions.empty()) {
+        out += "<|im_start|>system\n";
+        if (!reasoning_instructions.empty() && !sys_content.empty()) {
+            out += reasoning_instructions + "\n\n" + sys_content;
+        } else if (!reasoning_instructions.empty()) {
+            out += reasoning_instructions;
+        } else {
+            out += sys_content;
+        }
+        out += "<|im_end|>\n";
+    }
+    return out;
+}
+
+std::string Tokenizer::format_chat_messages(const std::vector<ChatMessage>& messages,
+                                            const std::vector<ToolFunctionDef>& tools,
+                                            const ChatTemplateOptions& opts) const {
+    const ChatFormat fmt = detect_chat_format();
+    const bool has_think_tokens = (token_to_id("<think>") >= 0 && token_to_id("</think>") >= 0);
+
+    std::string sys_content;
+    size_t lead_sys_end = 0;
+    while (lead_sys_end < messages.size() &&
+           (messages[lead_sys_end].role == "system" || messages[lead_sys_end].role == "developer")) {
+        const std::string part = trim_chat_ws(messages[lead_sys_end].content);
+        if (!part.empty()) {
+            if (!sys_content.empty()) sys_content += "\n\n";
+            sys_content += part;
+        }
+        ++lead_sys_end;
+    }
+
+    // Track last non-tool user query so reasoning is ALWAYS preserved inside multi-step tool loops.
+    long long last_query_index = -1;
+    for (long long i = static_cast<long long>(messages.size()) - 1; i >= 0; --i) {
+        if (messages[static_cast<size_t>(i)].role == "user") {
+            const std::string c = trim_chat_ws(messages[static_cast<size_t>(i)].content);
+            const bool is_tool_resp =
+                (c.rfind("<tool_response>", 0) == 0 &&
+                 c.size() >= std::string("</tool_response>").size() &&
+                 c.compare(c.size() - std::string("</tool_response>").size(),
+                           std::string("</tool_response>").size(), "</tool_response>") == 0);
+            if (!is_tool_resp) {
+                last_query_index = i;
+                break;
+            }
+        }
+    }
+
+    std::string out = format_system_prompt(sys_content, tools, opts);
+
+    if (fmt == ChatFormat::Llama3) {
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto& msg = messages[i];
+            if (msg.role == "system" || msg.role == "developer") {
+                if (i < lead_sys_end) continue;
+                out += "<|start_header_id|>system<|end_header_id|>\n\n" + trim_chat_ws(msg.content) + "<|eot_id|>";
+            } else if (msg.role == "user") {
+                out += "<|start_header_id|>user<|end_header_id|>\n\n" + trim_chat_ws(msg.content) + "<|eot_id|>";
+            } else if (msg.role == "assistant") {
+                std::string embedded_r, vis_c;
+                split_thinking(msg.content, embedded_r, vis_c);
+                const std::string reasoning =
+                    !msg.reasoning_content.empty() ? trim_chat_ws(msg.reasoning_content) : embedded_r;
+                const bool include_think =
+                    opts.preserve_thinking || (static_cast<long long>(i) > last_query_index);
+
+                out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+                if (include_think && !msg.raw_assistant_body.empty()) {
+                    out += msg.raw_assistant_body;
+                } else {
+                    if (include_think && !reasoning.empty()) {
+                        out += "<think>\n" + reasoning + "\n</think>\n\n";
+                    }
+                    out += vis_c;
+                    for (size_t tc_i = 0; tc_i < msg.tool_calls.size(); ++tc_i) {
+                        if (tc_i == 0 && !vis_c.empty()) out += "\n\n";
+                        else if (tc_i > 0) out += "; ";
+                        out += "<|python_tag|>" + format_llama_tool_call_json(msg.tool_calls[tc_i]);
+                    }
+                }
+                out += "<|eot_id|>";
+            } else if (msg.role == "tool") {
+                out += "<|start_header_id|>ipython<|end_header_id|>\n\n" + trim_chat_ws(msg.content) + "<|eot_id|>";
+            }
+        }
+
+        if (opts.add_generation_prompt) {
+            out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+            if (opts.enable_thinking && has_think_tokens) {
+                out += "<think>\n";
+            }
+        }
+        return out;
+    }
+
+    // ChatML / Qwen3.5 template
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto& msg = messages[i];
+        if (msg.role == "system" || msg.role == "developer") {
+            if (i < lead_sys_end) continue;
+            const std::string c = trim_chat_ws(msg.content);
+            if (!c.empty()) {
+                out += "<|im_start|>system\n" + c + "<|im_end|>\n";
+            }
+        } else if (msg.role == "user") {
+            out += "<|im_start|>user\n" + trim_chat_ws(msg.content) + "<|im_end|>\n";
+        } else if (msg.role == "assistant") {
+            std::string embedded_r, vis_c;
+            split_thinking(msg.content, embedded_r, vis_c);
+            const std::string reasoning =
+                !msg.reasoning_content.empty() ? trim_chat_ws(msg.reasoning_content) : embedded_r;
+            const bool include_think =
+                opts.preserve_thinking || (static_cast<long long>(i) > last_query_index);
+
+            out += "<|im_start|>assistant\n";
+            if (include_think && !msg.raw_assistant_body.empty()) {
+                out += msg.raw_assistant_body;
+            } else {
+                if (has_think_tokens) {
+                    if (include_think) {
+                        out += "<think>\n" + reasoning + "\n</think>\n\n" + vis_c;
+                    } else {
+                        out += vis_c;
+                    }
+                } else {
+                    if (include_think && !reasoning.empty()) {
+                        out += "<think>\n" + reasoning + "\n</think>\n\n";
+                    }
+                    out += vis_c;
+                }
+
+                for (size_t tc_i = 0; tc_i < msg.tool_calls.size(); ++tc_i) {
+                    if (tc_i == 0) {
+                        if (!vis_c.empty()) out += "\n\n";
+                    } else {
+                        out += "\n";
+                    }
+                    out += format_qwen_tool_call_xml(msg.tool_calls[tc_i]);
+                }
+            }
+            out += "<|im_end|>\n";
+        } else if (msg.role == "tool") {
+            const bool prev_is_tool = (i > 0 && messages[i - 1].role == "tool");
+            const bool next_is_tool = (i + 1 < messages.size() && messages[i + 1].role == "tool");
+            if (!prev_is_tool) {
+                out += "<|im_start|>user";
+            }
+            out += "\n<tool_response>\n" + trim_chat_ws(msg.content) + "\n</tool_response>";
+            if (!next_is_tool) {
+                out += "<|im_end|>\n";
+            }
+        }
+    }
+
+    if (opts.add_generation_prompt) {
+        out += "<|im_start|>assistant\n";
+        if (!opts.enable_thinking && token_to_id("</think>") >= 0) {
+            out += "<think>\n\n</think>\n\n";
+        } else if (opts.enable_thinking && has_think_tokens) {
+            out += "<think>\n";
+        }
+    }
+    return out;
+}
+
+std::string Tokenizer::format_tool_response_turn(const std::vector<ChatMessage>& tool_messages,
+                                                 bool close_previous_turn,
+                                                 bool enable_thinking) const {
+    const ChatFormat fmt = detect_chat_format();
+    std::string out;
+    if (fmt == ChatFormat::Llama3) {
+        if (close_previous_turn) out += "<|eot_id|>";
+        for (const auto& tm : tool_messages) {
+            out += "<|start_header_id|>ipython<|end_header_id|>\n\n" + trim_chat_ws(tm.content) + "<|eot_id|>";
+        }
+        out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        if (enable_thinking && token_to_id("<think>") >= 0 && token_to_id("</think>") >= 0) {
+            out += "<think>\n";
+        }
+        return out;
+    }
+
+    if (close_previous_turn) {
+        out += "<|im_end|>\n";
+    }
+    out += "<|im_start|>user";
+    for (const auto& tm : tool_messages) {
+        out += "\n<tool_response>\n" + trim_chat_ws(tm.content) + "\n</tool_response>";
+    }
+    out += "<|im_end|>\n<|im_start|>assistant\n";
     if (!enable_thinking && token_to_id("</think>") >= 0) {
         out += "<think>\n\n</think>\n\n";
     } else if (enable_thinking && token_to_id("<think>") >= 0 && token_to_id("</think>") >= 0) {

@@ -47,7 +47,7 @@ private:
         bool italic = false;
         bool underline = false;
         bool strike = false;
-        uint8_t fg = 0; // 0 = default, 32/33/35/36 = ANSI foreground code
+        uint16_t fg = 0; // 0 = default, 1..99 = ANSI SGR, 256..511 = 256-color (fg - 256)
 
         bool operator==(const StyleState& o) const {
             return bold == o.bold && dim == o.dim && italic == o.italic &&
@@ -67,6 +67,9 @@ private:
     // Style tracking
     StyleState applied_style_{};
     bool in_think_ = false;
+    bool think_need_rail_ = false;
+    bool eat_post_think_open_nl_ = false;
+    bool post_think_gap_pending_ = false;
     bool in_code_fence_ = false;
     bool in_inline_code_ = false;
     bool in_blockquote_ = false;

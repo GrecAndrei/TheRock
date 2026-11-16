@@ -11,6 +11,36 @@
 
 namespace rxinfer {
 
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments; // JSON object string
+};
+
+struct ToolFunctionDef {
+    std::string name;
+    std::string description;
+    std::string parameters_json; // JSON schema object string
+    std::string raw_json;        // Optional verbatim OpenAI tool JSON entry
+};
+
+struct ChatMessage {
+    std::string role;              // "system", "developer", "user", "assistant", "tool"
+    std::string content;           // Visible text content
+    std::string reasoning_content; // Optional thinking content (served back in <think>...</think>)
+    std::vector<ToolCall> tool_calls;
+    std::string tool_call_id;
+    std::string name;
+    std::string raw_assistant_body; // Optional exact server-captured assistant text for 100% KV-prefix reuse
+};
+
+struct ChatTemplateOptions {
+    bool add_generation_prompt = true;
+    bool enable_thinking = false;
+    bool preserve_thinking = true; // Preserve <think> across turns AND after tool calls
+    std::string reasoning_effort;  // Optional: "xhigh", "medium", "low"
+};
+
 class Tokenizer {
 public:
     Tokenizer() = default;
@@ -46,11 +76,30 @@ public:
     // Format either Turn 0 (is_first_turn=true) or an incremental Turn N>0 delta
     // (closing the previous assistant turn when close_previous_turn=true).
     std::string format_system_prefix(const std::string& system_prompt) const;
+    std::string format_system_prompt(const std::string& system_prompt,
+                                     const std::vector<ToolFunctionDef>& tools = {},
+                                     const ChatTemplateOptions& opts = {}) const;
     std::string format_chat_turn(const std::string& user_prompt,
                                  const std::string& system_prompt = "",
                                  bool is_first_turn = true,
                                  bool close_previous_turn = false,
                                  bool enable_thinking = false) const;
+
+    // Format full multi-turn / agentic conversation with optional tools, tool calls,
+    // tool responses, and preserved reasoning (<think>...</think>).
+    std::string format_chat_messages(const std::vector<ChatMessage>& messages,
+                                     const std::vector<ToolFunctionDef>& tools = {},
+                                     const ChatTemplateOptions& opts = {}) const;
+
+    // Incremental delta for appending tool response(s) onto an open assistant turn in KV cache.
+    std::string format_tool_response_turn(const std::vector<ChatMessage>& tool_messages,
+                                          bool close_previous_turn = true,
+                                          bool enable_thinking = false) const;
+
+    // Extract any <think>...</think> reasoning from `text` into `out_reasoning` and `out_visible`.
+    static void split_thinking(const std::string& text,
+                               std::string& out_reasoning,
+                               std::string& out_visible);
 
     bool loaded() const { return !id_to_token_.empty(); }
     int32_t vocab_size() const { return static_cast<int32_t>(id_to_token_.size()); }
@@ -96,6 +145,7 @@ private:
     std::unordered_map<uint64_t, MergeEntry> merge_ranks_;
     std::vector<float> scores_;
     std::unordered_set<int32_t> special_ids_;
+    std::unordered_set<int32_t> added_token_ids_;
     std::vector<AddedToken> added_tokens_;
     std::vector<std::vector<size_t>> added_by_first_byte_;
 

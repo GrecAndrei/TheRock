@@ -5,6 +5,8 @@
 #include "rxinfer/config.hpp"
 
 #include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -215,6 +217,118 @@ private:
 
 Value parse(const std::string& text) {
     return Parser(text).parse_root();
+}
+
+void append_escaped_string(std::string& out, const std::string& s) {
+    out.push_back('"');
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
+                    out += buf;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+}
+
+std::string escape_string(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    append_escaped_string(out, s);
+    return out;
+}
+
+namespace {
+
+void dump_impl(const Value& v, std::string& out, int indent, int depth) {
+    if (v.is_null()) {
+        out += "null";
+    } else if (v.is_bool()) {
+        out += std::get<bool>(v.data) ? "true" : "false";
+    } else if (v.is_number()) {
+        double d = std::get<double>(v.data);
+        if (!std::isfinite(d)) {
+            out += "null";
+        } else if (d == 0.0) {
+            out.push_back('0');
+        } else if (std::fabs(d) < 9007199254740992.0 && d == std::trunc(d)) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(d));
+            out += buf;
+        } else {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.17g", d);
+            out += buf;
+        }
+    } else if (v.is_string()) {
+        append_escaped_string(out, std::get<std::string>(v.data));
+    } else if (v.is_array()) {
+        const auto& arr = std::get<Array>(v.data);
+        if (arr.empty()) {
+            out += "[]";
+            return;
+        }
+        out.push_back('[');
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (i > 0) out.push_back(',');
+            if (indent >= 0) {
+                out.push_back('\n');
+                out.append(static_cast<size_t>((depth + 1) * indent), ' ');
+            }
+            dump_impl(arr[i], out, indent, depth + 1);
+        }
+        if (indent >= 0) {
+            out.push_back('\n');
+            out.append(static_cast<size_t>(depth * indent), ' ');
+        }
+        out.push_back(']');
+    } else if (v.is_object()) {
+        const auto& obj = std::get<Object>(v.data);
+        if (obj.empty()) {
+            out += "{}";
+            return;
+        }
+        out.push_back('{');
+        bool first = true;
+        for (const auto& kv : obj) {
+            if (!first) out.push_back(',');
+            first = false;
+            if (indent >= 0) {
+                out.push_back('\n');
+                out.append(static_cast<size_t>((depth + 1) * indent), ' ');
+            }
+            append_escaped_string(out, kv.first);
+            out.push_back(':');
+            if (indent >= 0) out.push_back(' ');
+            dump_impl(kv.second, out, indent, depth + 1);
+        }
+        if (indent >= 0) {
+            out.push_back('\n');
+            out.append(static_cast<size_t>(depth * indent), ' ');
+        }
+        out.push_back('}');
+    }
+}
+
+} // namespace
+
+std::string dump(const Value& v, int indent) {
+    std::string out;
+    dump_impl(v, out, indent, 0);
+    return out;
 }
 
 } // namespace rxinfer::json

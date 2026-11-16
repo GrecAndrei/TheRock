@@ -633,6 +633,13 @@ ModelWeights load_from_safetensors_dir(const std::string& model_dir,
 
     ModelWeights w;
     allocate_model_arena(cfg, w);
+    const size_t total_arena_bytes = w.weight_arena.used();
+    size_t packed_arena_bytes = 0;
+    auto report_progress = [&](size_t add_bytes) {
+        packed_arena_bytes = std::min(total_arena_bytes, packed_arena_bytes + add_bytes);
+        if (opts.progress_cb) opts.progress_cb(packed_arena_bytes, total_arena_bytes);
+    };
+    if (opts.progress_cb) opts.progress_cb(0, total_arena_bytes);
 
     const int num_threads = (opts.num_threads > 0)
                                 ? opts.num_threads
@@ -648,6 +655,7 @@ ModelWeights load_from_safetensors_dir(const std::string& model_dir,
             decode_row_to_f32(src, r, row_out, dst.K);
         });
         upload_r4_host_to_device(dst, h_qs.data(), h_sc.data());
+        report_progress(h_qs.size() + h_sc.size() * sizeof(__half));
     };
 
     auto pack_2_r4 = [&](const R4Matrix& dst, const SafetensorEntry& top, int top_rows, const SafetensorEntry& bot) {
@@ -658,6 +666,7 @@ ModelWeights load_from_safetensors_dir(const std::string& model_dir,
             else decode_row_to_f32(bot, r - top_rows, row_out, dst.K);
         });
         upload_r4_host_to_device(dst, h_qs.data(), h_sc.data());
+        report_progress(h_qs.size() + h_sc.size() * sizeof(__half));
     };
 
     pack_1_r4(w.embed_tokens, find_tensor("embed_tokens.weight"));
@@ -737,6 +746,7 @@ ModelWeights load_from_safetensors_dir(const std::string& model_dir,
                                          decode_row_to_f32(*qkvz, src_row, row_out, lw.in_proj_qkvz.K);
                                      });
                     upload_r4_host_to_device(lw.in_proj_qkvz, h_qs.data(), h_sc.data());
+                    report_progress(h_qs.size() + h_sc.size() * sizeof(__half));
                 } else {
                     pack_1_r4(lw.in_proj_qkvz, *qkvz);
                 }
@@ -809,6 +819,7 @@ ModelWeights load_from_safetensors_dir(const std::string& model_dir,
         pack_1_r4(lw.down_proj, find_tensor(pfx + "mlp.down_proj.weight"));
     }
 
+    if (opts.progress_cb) opts.progress_cb(total_arena_bytes, total_arena_bytes);
     return w;
 }
 
@@ -1630,6 +1641,14 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
 
     ModelWeights w;
     allocate_model_arena(cfg, w);
+    const size_t total_arena_bytes = w.weight_arena.used();
+    size_t packed_arena_bytes = 0;
+    auto report_progress = [&](size_t add_bytes) {
+        packed_arena_bytes = std::min(total_arena_bytes, packed_arena_bytes + add_bytes);
+        if (opts.progress_cb) opts.progress_cb(packed_arena_bytes, total_arena_bytes);
+    };
+    if (opts.progress_cb) opts.progress_cb(0, total_arena_bytes);
+
     const int num_threads = (opts.num_threads > 0)
                                 ? opts.num_threads
                                 : std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
@@ -1654,6 +1673,7 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
             gguf_detail::decode_gguf_row(src, r, row_out, dst.K);
         });
         upload_r4_host_to_device(dst, h_qs.data(), h_sc.data());
+        report_progress(h_qs.size() + h_sc.size() * sizeof(__half));
     };
     auto pack_g2 = [&](const R4Matrix& dst, const gguf_detail::GGUFTensor& top, int top_rows,
                        const gguf_detail::GGUFTensor& bot) {
@@ -1664,6 +1684,7 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
             else gguf_detail::decode_gguf_row(bot, r - top_rows, row_out, dst.K);
         });
         upload_r4_host_to_device(dst, h_qs.data(), h_sc.data());
+        report_progress(h_qs.size() + h_sc.size() * sizeof(__half));
     };
     auto load_g_f16 = [&](const __half* dst, const gguf_detail::GGUFTensor& src, int n) {
         std::vector<float> tmp(n);
@@ -1743,6 +1764,7 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
                                          gguf_detail::decode_gguf_row(*qkvz, src_row, row_out, lw.in_proj_qkvz.K);
                                      });
                     upload_r4_host_to_device(lw.in_proj_qkvz, h_qs.data(), h_sc.data());
+                    report_progress(h_qs.size() + h_sc.size() * sizeof(__half));
                 } else {
                     pack_g1(lw.in_proj_qkvz, *qkvz);
                 }
@@ -1825,6 +1847,7 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
                 require(pfx + "ffn_up.weight"));
         pack_g1(lw.down_proj, require(pfx + "ffn_down.weight"));
     }
+    if (opts.progress_cb) opts.progress_cb(total_arena_bytes, total_arena_bytes);
     return w;
 }
 
@@ -1874,7 +1897,7 @@ void save_rxr4_checkpoint(const ModelWeights& weights, const std::string& path) 
     }
 }
 
-ModelWeights load_from_rxr4(const std::string& path) {
+ModelWeights load_from_rxr4(const std::string& path, const LoaderOptions& opts) {
     struct FdGuard {
         int fd = -1;
         ~FdGuard() {
@@ -1972,6 +1995,7 @@ ModelWeights load_from_rxr4(const std::string& path) {
     });
 
     try {
+        if (opts.progress_cb) opts.progress_cb(0, arena_bytes);
         int idx = 0;
         while (true) {
             size_t off = 0, n = 0;
@@ -1988,6 +2012,7 @@ ModelWeights load_from_rxr4(const std::string& path) {
             RX_HIP_CHECK(hipMemcpyAsync(static_cast<uint8_t*>(w.weight_arena.base()) + off,
                                         bufs[idx].data(), n, hipMemcpyHostToDevice, nullptr));
             RX_HIP_CHECK(hipStreamSynchronize(nullptr));
+            if (opts.progress_cb) opts.progress_cb(off + n, arena_bytes);
             {
                 std::lock_guard<std::mutex> lk(mu);
                 slot_full[idx] = false;

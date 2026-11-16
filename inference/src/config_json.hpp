@@ -45,8 +45,18 @@ struct Value {
     std::string as_str(const std::string& def = "") const {
         return is_string() ? std::get<std::string>(data) : def;
     }
+    const Array& as_array() const {
+        static const Array kEmpty;
+        return is_array() ? std::get<Array>(data) : kEmpty;
+    }
+    const Object& as_object() const {
+        static const Object kEmpty;
+        return is_object() ? std::get<Object>(data) : kEmpty;
+    }
 };
 
 Value parse(const std::string& text);
+std::string escape_string(const std::string& s);
+std::string dump(const Value& v, int indent = -1);
 
 } // namespace rxinfer::json

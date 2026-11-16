@@ -6,7 +6,10 @@
 #include "rxinfer/loader.hpp"
 #include "rxinfer/markdown.hpp"
 #include "rxinfer/sampler.hpp"
+#include "rxinfer/server.hpp"
 #include "rxinfer/tokenizer.hpp"
+#include "rxinfer/tools.hpp"
+#include "rxinfer/tui.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -1280,12 +1283,376 @@ int test_markdown_formatter() {
     return 0;
 }
 
+int test_tui_and_think_rails() {
+    // Verify <think> rail structure in MarkdownStreamFormatter
+    const std::string think_doc = "<think>\nFirst thought\n\nSecond thought\n</think>\n\nFinal **answer**.\n";
+    const std::string f_all = render_markdown_chunks(think_doc, true, 0);
+    const std::string f_1 = render_markdown_chunks(think_doc, true, 1);
+    const std::string f_3 = render_markdown_chunks(think_doc, true, 3);
+    if (f_1 != f_all || f_3 != f_all) {
+        std::printf("[FAIL] <think> rail chunk invariance failed\n");
+        return 1;
+    }
+    const std::string plain = strip_ansi_sgr(f_all);
+    if (plain.find("╭─ thinking") == std::string::npos ||
+        plain.find("│ First thought") == std::string::npos ||
+        plain.find("│ Second thought") == std::string::npos ||
+        plain.find("╰───") == std::string::npos ||
+        plain.find("Final answer.") == std::string::npos) {
+        std::printf("[FAIL] <think> rail layout mismatch:\n%s\n", plain.c_str());
+        return 1;
+    }
+
+    // Verify rxinfer::tui utilities
+    if (rxinfer::tui::clean_model_display_name("/tmp/AREX-2-Abliterated-Q8_0.rxr4", "") != "AREX-2-Abliterated-Q8_0" ||
+        rxinfer::tui::clean_model_display_name("/models/Qwen3.5-27B/", "") != "Qwen3.5-27B") {
+        std::printf("[FAIL] clean_model_display_name mismatch\n");
+        return 1;
+    }
+    if (rxinfer::tui::format_tokens_compact(12400) != "12.4k" ||
+        rxinfer::tui::format_tokens_compact(200000) != "200k" ||
+        rxinfer::tui::format_tokens_compact(950) != "950") {
+        std::printf("[FAIL] format_tokens_compact mismatch\n");
+        return 1;
+    }
+    if (rxinfer::tui::format_duration_compact(42.3) != "42 ms" ||
+        rxinfer::tui::format_duration_compact(1500.0) != "1.5 s") {
+        std::printf("[FAIL] format_duration_compact mismatch\n");
+        return 1;
+    }
+
+    rxinfer::tui::InteractiveLineEditor ed({
+        {"/help", "", "help", false},
+        {"/tools", "[builtin|load <p>|clear]", "tools", true},
+        {"/think", "[on|off]", "think", false},
+        {"/history", "", "history", false},
+    });
+    if (ed.suggest_command("/toosl") != "/tools" || ed.suggest_command("/thnk") != "/think") {
+        std::printf("[FAIL] InteractiveLineEditor::suggest_command mismatch\n");
+        return 1;
+    }
+    ed.add_history("hello world");
+    const auto theme_plain = rxinfer::tui::UiTheme::detect(false);
+    const std::string bar = rxinfer::tui::render_progress_bar(0.5, 10, theme_plain);
+    if (theme_plain.color || bar.size() < 10) {
+        std::printf("[FAIL] UiTheme::detect(false) / render_progress_bar mismatch\n");
+        return 1;
+    }
+
+    std::printf("[PASS] <think> rails + rxinfer::tui helpers\n");
+    return 0;
+}
+
+int test_tools_reasoning_and_server() {
+    // Build a ChatML/Qwen3.5-style tokenizer with <think>, </think>, <tool_call>, </tool_call> as added tokens
+    const std::string qwen_tok_json = R"json({
+        "added_tokens": [
+            {"id": 0, "content": "<|endoftext|>", "special": true},
+            {"id": 1, "content": "<|im_start|>", "special": true},
+            {"id": 2, "content": "<|im_end|>", "special": true},
+            {"id": 3, "content": "<think>", "special": false},
+            {"id": 4, "content": "</think>", "special": false},
+            {"id": 5, "content": "<tool_call>", "special": false},
+            {"id": 6, "content": "</tool_call>", "special": false}
+        ],
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+        "decoder": {"type": "ByteLevel"},
+        "model": {
+            "type": "BPE",
+            "vocab": {
+                "<|endoftext|>": 0, "<|im_start|>": 1, "<|im_end|>": 2,
+                "<think>": 3, "</think>": 4, "<tool_call>": 5, "</tool_call>": 6,
+                "a": 7, "b": 8, "c": 9, "d": 10, "e": 11, "f": 12, "g": 13, "h": 14,
+                "i": 15, "j": 16, "k": 17, "l": 18, "m": 19, "n": 20, "o": 21, "p": 22,
+                "q": 23, "r": 24, "s": 25, "t": 26, "u": 27, "v": 28, "w": 29, "x": 30,
+                "y": 31, "z": 32, " ": 33, "\u010a": 34, "<": 35, ">": 36, "/": 37, "=": 38,
+                "_": 39, ".": 40, ",": 41, ":": 42, "{": 43, "}": 44, "\"": 45, "0": 46,
+                "1": 47, "2": 48, "3": 49, "4": 50, "5": 51, "6": 52, "7": 53, "8": 54, "9": 55,
+                "-": 56, "+": 57, "(": 58, ")": 59, "[": 60, "]": 61, "?": 62, "!": 63, "\u0120": 64
+            },
+            "merges": []
+        }
+    })json";
+    auto tk = rxinfer::Tokenizer::from_hf_json_string(qwen_tok_json);
+    tk.add_eos_id(2);
+    if (tk.token_to_id("<tool_call>") != 5 || tk.token_to_id("</tool_call>") != 6) {
+        std::printf("[FAIL] <tool_call> added_tokens lookup failed\n");
+        return 1;
+    }
+    const auto tc_toks = tk.encode("<tool_call>a</tool_call>", false);
+    if (tc_toks.size() != 3 || tc_toks[0] != 5 || tc_toks[2] != 6) {
+        std::printf("[FAIL] <tool_call> did not encode as single special token\n");
+        return 1;
+    }
+
+    // 1. Verify reasoning preservation across BOTH user turns and tool calls!
+    const auto builtin = rxinfer::tools::builtin_workspace_tools();
+    std::vector<rxinfer::ChatMessage> msgs = {
+        {"system", "Be precise.", "", {}, "", "", ""},
+        {"user", "Turn 1 question", "", {}, "", "", ""},
+        {"assistant", "Answer 1", "Prior turn reasoning", {}, "", "", ""},
+        {"user", "Turn 2 question", "", {}, "", "", ""},
+        {"assistant", "", "Reasoning before tool call", {{"call_rx_1", "read_file", R"({"path":"a.txt","limit":5})"}}, "", "", ""},
+        {"tool", "1: hello", "", {}, "call_rx_1", "read_file", ""},
+    };
+
+    rxinfer::ChatTemplateOptions opts_preserve;
+    opts_preserve.enable_thinking = true;
+    opts_preserve.preserve_thinking = true;
+    opts_preserve.reasoning_effort = "xhigh";
+    const std::string prompt_keep = tk.format_chat_messages(msgs, builtin, opts_preserve);
+    if (prompt_keep.find("<tools>") == std::string::npos ||
+        prompt_keep.find("Reasoning effort is set to xhigh.") == std::string::npos ||
+        prompt_keep.find("<think>\nPrior turn reasoning\n</think>") == std::string::npos ||
+        prompt_keep.find("<think>\nReasoning before tool call\n</think>") == std::string::npos ||
+        prompt_keep.find("<function=read_file>") == std::string::npos ||
+        prompt_keep.find("<tool_response>\n1: hello\n</tool_response>") == std::string::npos) {
+        std::printf("[FAIL] format_chat_messages(preserve_thinking=true) missing expected sections:\n%s\n",
+                    prompt_keep.c_str());
+        return 1;
+    }
+    // Prompt must end with <|im_start|>assistant\n<think>\n so model reasons again after tool response
+    if (prompt_keep.rfind("<|im_start|>assistant\n<think>\n") !=
+        prompt_keep.size() - std::string("<|im_start|>assistant\n<think>\n").size()) {
+        std::printf("[FAIL] format_chat_messages generation prompt suffix mismatch\n");
+        return 1;
+    }
+
+    // Even when preserve_thinking=false, Turn 1's <think> is stripped on Turn 2,
+    // BUT Reasoning before tool call (after last_query_index) MUST STILL be served back!
+    rxinfer::ChatTemplateOptions opts_strip = opts_preserve;
+    opts_strip.preserve_thinking = false;
+    opts_strip.reasoning_effort.clear();
+    const std::string prompt_strip = tk.format_chat_messages(msgs, builtin, opts_strip);
+    if (prompt_strip.find("Prior turn reasoning") != std::string::npos ||
+        prompt_strip.find("Reasoning before tool call") == std::string::npos) {
+        std::printf("[FAIL] preserve_thinking=false violated last_query_index rule:\n%s\n",
+                    prompt_strip.c_str());
+        return 1;
+    }
+
+    // Verify raw_assistant_body preserves exact formatting (e.g. single newline before <tool_call>)
+    // when include_think=true, and is still ignored when preserve_thinking=false strips Turn 1.
+    auto msgs_raw = msgs;
+    msgs_raw[2].raw_assistant_body = "<think>\nPrior turn reasoning\n</think>\n\nAnswer 1";
+    msgs_raw[4].raw_assistant_body =
+        "<think>\nReasoning before tool call\n</think>\n<tool_call>\n<function=read_file>\n"
+        "<parameter=path>\na.txt\n</parameter>\n<parameter=limit>\n5\n</parameter>\n</function>\n</tool_call>";
+    const std::string prompt_raw_keep = tk.format_chat_messages(msgs_raw, builtin, opts_preserve);
+    if (prompt_raw_keep.find("</think>\n<tool_call>\n<function=read_file>\n<parameter=path>") == std::string::npos) {
+        std::printf("[FAIL] raw_assistant_body was not preserved verbatim:\n%s\n", prompt_raw_keep.c_str());
+        return 1;
+    }
+    const std::string prompt_raw_strip = tk.format_chat_messages(msgs_raw, builtin, opts_strip);
+    if (prompt_raw_strip.find("Prior turn reasoning") != std::string::npos ||
+        prompt_raw_strip.find("</think>\n<tool_call>") == std::string::npos) {
+        std::printf("[FAIL] raw_assistant_body violated preserve_thinking=false stripping:\n%s\n",
+                    prompt_raw_strip.c_str());
+        return 1;
+    }
+
+    // Also test incremental format_tool_response_turn with multiple grouped tool responses
+    const std::string tr_delta = tk.format_tool_response_turn(
+        {{"tool", "res1", "", {}, "c1", "read_file", ""}, {"tool", "res2", "", {}, "c2", "list_dir", ""}},
+        true, true);
+    if (tr_delta.rfind("<|im_end|>\n<|im_start|>user\n<tool_response>\nres1\n</tool_response>\n<tool_response>\nres2\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n", 0) != 0) {
+        std::printf("[FAIL] format_tool_response_turn mismatch:\n%s\n", tr_delta.c_str());
+        return 1;
+    }
+
+    // 2. Parse assistant outputs (Qwen XML + schema coercion, multi-tool, bare function, JSON, Llama3 python_tag)
+    const std::string raw_qwen_out =
+        "Let me check both files carefully.\n</think>\n\n"
+        "Checking now.\n"
+        "<tool_call>\n<function=read_file>\n<parameter=path>\nfoo.cpp\n</parameter>\n<parameter=limit>\n42\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=list_dir>\n<parameter=path>\nsrc\n</parameter>\n</function>\n</tool_call>";
+
+    const auto parsed_full = rxinfer::tools::parse_assistant_output(raw_qwen_out, true, builtin, 10);
+    if (parsed_full.reasoning_content != "Let me check both files carefully." ||
+        parsed_full.content != "Checking now." ||
+        parsed_full.tool_calls.size() != 2 ||
+        parsed_full.tool_calls[0].id != "call_rx_10" ||
+        parsed_full.tool_calls[0].name != "read_file" ||
+        parsed_full.tool_calls[0].arguments.find("\"limit\":42") == std::string::npos ||
+        parsed_full.tool_calls[1].id != "call_rx_11" ||
+        parsed_full.tool_calls[1].name != "list_dir") {
+        std::printf("[FAIL] Qwen XML tool call parsing mismatch\n");
+        return 1;
+    }
+
+    // Verify StreamingAssistantParser chunk invariance (1-byte, 3-byte, whole-string)
+    for (size_t chunk_sz : {size_t(0), size_t(1), size_t(2), size_t(5)}) {
+        rxinfer::tools::StreamingAssistantParser sp(true, builtin, 10);
+        std::string sr, sc;
+        std::vector<rxinfer::ToolCall> stcs;
+        if (chunk_sz == 0) {
+            auto d = sp.feed(raw_qwen_out);
+            sr += d.reasoning_content;
+            sc += d.content;
+            stcs.insert(stcs.end(), d.tool_calls.begin(), d.tool_calls.end());
+        } else {
+            for (size_t i = 0; i < raw_qwen_out.size(); i += chunk_sz) {
+                auto d = sp.feed(std::string_view(raw_qwen_out).substr(i, std::min(chunk_sz, raw_qwen_out.size() - i)));
+                sr += d.reasoning_content;
+                sc += d.content;
+                stcs.insert(stcs.end(), d.tool_calls.begin(), d.tool_calls.end());
+            }
+        }
+        auto tail = sp.finish();
+        sr += tail.reasoning_content;
+        sc += tail.content;
+        stcs.insert(stcs.end(), tail.tool_calls.begin(), tail.tool_calls.end());
+        if (sp.reasoning_content() != parsed_full.reasoning_content ||
+            sp.content() != parsed_full.content ||
+            stcs.size() != 2 ||
+            stcs[0].name != "read_file" ||
+            stcs[1].name != "list_dir") {
+            std::printf("[FAIL] StreamingAssistantParser chunk_sz=%zu mismatch\n", chunk_sz);
+            return 1;
+        }
+    }
+
+    // Bare <function=...> + Llama3 <|python_tag|>
+    const auto parsed_bare = rxinfer::tools::parse_assistant_output(
+        "<think>\nthink\n</think>\n<function=list_dir>\n<parameter=max_entries>\n10\n</parameter>\n</function>",
+        false, builtin, 1);
+    if (parsed_bare.tool_calls.size() != 1 || parsed_bare.tool_calls[0].name != "list_dir" ||
+        parsed_bare.tool_calls[0].arguments.find("\"max_entries\":10") == std::string::npos) {
+        std::printf("[FAIL] Bare <function=...> fallback failed\n");
+        return 1;
+    }
+    const auto parsed_llama = rxinfer::tools::parse_assistant_output(
+        "<|python_tag|>{\"name\":\"get_weather\",\"parameters\":{\"city\":\"NYC\"}}<|eom_id|>",
+        false, {}, 1);
+    if (parsed_llama.tool_calls.size() != 1 || parsed_llama.tool_calls[0].name != "get_weather" ||
+        parsed_llama.tool_calls[0].arguments.find("NYC") == std::string::npos) {
+        std::printf("[FAIL] Llama3 <|python_tag|> tool call parsing failed\n");
+        return 1;
+    }
+
+    // 3. Built-in tool execution + mutating confirmation guard + external tool command
+    const std::string sandbox_dir = test_tmp_path("tools_sandbox");
+    std::filesystem::create_directories(sandbox_dir);
+    const std::string sample_file = sandbox_dir + "/hello.txt";
+
+    rxinfer::tools::ToolExecOptions ro_opts;
+    ro_opts.allow_mutating = false;
+    ro_opts.confirm_cb = [](const rxinfer::ToolCall&) { return false; };
+    const auto denied = rxinfer::tools::execute_tool_call(
+        {"c1", "write_file", "{\"path\":\"" + sample_file + "\",\"content\":\"line1\\nline2\\n\"}"},
+        ro_opts);
+    if (denied.ok || denied.output.find("denied") == std::string::npos) {
+        std::printf("[FAIL] Mutating tool should be denied when allow_mutating=false\n");
+        return 1;
+    }
+
+    rxinfer::tools::ToolExecOptions rw_opts;
+    rw_opts.allow_mutating = true;
+    const auto wrote = rxinfer::tools::execute_tool_call(
+        {"c2", "write_file", "{\"path\":\"" + sample_file + "\",\"content\":\"alpha\\nbeta needle\\ngamma\\n\"}"},
+        rw_opts);
+    if (!wrote.ok) {
+        std::printf("[FAIL] write_file failed: %s\n", wrote.output.c_str());
+        return 1;
+    }
+    const auto read_res = rxinfer::tools::execute_tool_call(
+        {"c3", "read_file", "{\"path\":\"" + sample_file + "\",\"offset\":2,\"limit\":1}"},
+        ro_opts);
+    if (!read_res.ok || read_res.output.find("2: beta needle") == std::string::npos) {
+        std::printf("[FAIL] read_file mismatch: %s\n", read_res.output.c_str());
+        return 1;
+    }
+    const auto search_res = rxinfer::tools::execute_tool_call(
+        {"c4", "search_text", "{\"pattern\":\"needle\",\"path\":\"" + sandbox_dir + "\"}"},
+        ro_opts);
+    if (!search_res.ok || search_res.output.find("beta needle") == std::string::npos) {
+        std::printf("[FAIL] search_text mismatch: %s\n", search_res.output.c_str());
+        return 1;
+    }
+    const auto list_res = rxinfer::tools::execute_tool_call(
+        {"c5", "list_dir", "{\"path\":\"" + sandbox_dir + "\"}"},
+        ro_opts);
+    if (!list_res.ok || list_res.output.find("hello.txt") == std::string::npos) {
+        std::printf("[FAIL] list_dir mismatch: %s\n", list_res.output.c_str());
+        return 1;
+    }
+    const auto cmd_res = rxinfer::tools::execute_tool_call(
+        {"c6", "run_command", "{\"command\":\"echo tool_cmd_ok\"}"},
+        rw_opts);
+    if (!cmd_res.ok || cmd_res.output.find("tool_cmd_ok") == std::string::npos) {
+        std::printf("[FAIL] run_command mismatch: %s\n", cmd_res.output.c_str());
+        return 1;
+    }
+    rxinfer::tools::ToolExecOptions ext_opts;
+    ext_opts.external_exec_cmd = "cat";
+    const auto ext_res = rxinfer::tools::execute_tool_call(
+        {"c7", "custom_fn", "{\"x\":7}"}, ext_opts);
+    if (!ext_res.ok || ext_res.output.find("\"custom_fn\"") == std::string::npos) {
+        std::printf("[FAIL] external_exec_cmd mismatch: %s\n", ext_res.output.c_str());
+        return 1;
+    }
+
+    // 4. OpenAI HTTP request & response JSON helpers
+    const std::string req_json = R"json({
+        "model": "AREX-2",
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "max_completion_tokens": 256,
+        "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": false, "reasoning_effort": "xhigh"},
+        "tools": [{"type":"function","function":{"name":"read_file","description":"Read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],
+        "tool_choice": {"type":"function","function":{"name":"read_file"}},
+        "messages": [
+            {"role": "user", "content": [{"type":"text","text":"Check foo"}]},
+            {"role": "assistant", "content": null, "reasoning_content": "Need to read foo",
+             "tool_calls": [{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"foo\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    })json";
+    const auto creq = rxinfer::server::parse_chat_completion_request(req_json);
+    if (creq.model != "AREX-2" || !creq.stream || !creq.stream_include_usage ||
+        !creq.has_max_tokens || creq.max_tokens != 256 ||
+        !creq.has_enable_thinking || !creq.enable_thinking ||
+        !creq.has_preserve_thinking || creq.preserve_thinking ||
+        creq.reasoning_effort != "xhigh" ||
+        creq.tools.size() != 1 || creq.tool_choice != "function" || creq.forced_tool_name != "read_file" ||
+        creq.messages.size() != 3 ||
+        creq.messages[1].reasoning_content != "Need to read foo" ||
+        creq.messages[1].tool_calls.size() != 1 ||
+        creq.messages[2].tool_call_id != "call_1") {
+        std::printf("[FAIL] OpenAI parse_chat_completion_request mismatch\n");
+        return 1;
+    }
+
+    const std::string resp_json = rxinfer::server::build_chat_completion_json(
+        "chatcmpl-1", 1234, "AREX-2", parsed_full, "tool_calls", 100, 80, 42);
+    if (resp_json.find("\"reasoning_content\":\"Let me check both files carefully.\"") == std::string::npos ||
+        resp_json.find("\"finish_reason\":\"tool_calls\"") == std::string::npos ||
+        resp_json.find("\"cached_tokens\":80") == std::string::npos ||
+        resp_json.find("\"id\":\"call_rx_10\"") == std::string::npos) {
+        std::printf("[FAIL] build_chat_completion_json mismatch:\n%s\n", resp_json.c_str());
+        return 1;
+    }
+    const std::string chunk_json = rxinfer::server::build_chat_completion_chunk_json(
+        "chatcmpl-1", 1234, "AREX-2", false, "step1", "", {parsed_full.tool_calls[0]}, 0, "");
+    if (chunk_json.find("\"object\":\"chat.completion.chunk\"") == std::string::npos ||
+        chunk_json.find("\"reasoning_content\":\"step1\"") == std::string::npos ||
+        chunk_json.find("\"index\":0") == std::string::npos) {
+        std::printf("[FAIL] build_chat_completion_chunk_json mismatch:\n%s\n", chunk_json.c_str());
+        return 1;
+    }
+
+    std::printf("[PASS] Tool calling + reasoning preservation + workspace exec + OpenAI server schema\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
     if (test_tokenizer() != 0) return 1;
     if (test_sampler_and_multiturn_chat() != 0) return 1;
     if (test_markdown_formatter() != 0) return 1;
+    if (test_tui_and_think_rails() != 0) return 1;
+    if (test_tools_reasoning_and_server() != 0) return 1;
     if (test_safetensors_hf_qwen35_e2e() != 0) return 1;
     if (test_gguf_q4k_q6k_tokenizer_e2e() != 0) return 1;
     if (test_gguf_qwen35_iq_and_rxr4_e2e() != 0) return 1;

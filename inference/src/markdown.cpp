@@ -74,6 +74,9 @@ void MarkdownStreamFormatter::reset() {
     }
     utf8_buf_.clear();
     in_think_ = false;
+    think_need_rail_ = false;
+    eat_post_think_open_nl_ = false;
+    post_think_gap_pending_ = false;
     in_code_fence_ = false;
     in_inline_code_ = false;
     in_blockquote_ = false;
@@ -109,19 +112,19 @@ MarkdownStreamFormatter::StyleState MarkdownStreamFormatter::desired_style() con
     if (!enabled_) return s;
 
     if (in_think_) {
-        s.dim = true;
         s.italic = true;
+        s.fg = 256 + 246;
     }
     if (in_code_fence_) {
         s.dim = false;
         s.italic = false;
-        s.fg = 36;
+        s.fg = 256 + 117;
         return s;
     }
     if (in_inline_code_) {
         s.dim = false;
         s.italic = false;
-        s.fg = 36;
+        s.fg = 256 + 117;
         if (in_heading_ > 0) s.bold = true;
         return s;
     }
@@ -129,18 +132,18 @@ MarkdownStreamFormatter::StyleState MarkdownStreamFormatter::desired_style() con
         s.bold = true;
         if (in_heading_ == 1) {
             s.underline = true;
-            s.fg = 36;
+            s.fg = 256 + 81;
         } else if (in_heading_ == 2) {
-            s.fg = 36;
+            s.fg = 256 + 117;
         } else if (in_heading_ == 3) {
-            s.fg = 33;
+            s.fg = 256 + 183;
         } else {
-            s.fg = 35;
+            s.fg = 256 + 147;
         }
     }
     if (in_blockquote_) {
-        s.dim = true;
         s.italic = true;
+        s.fg = 256 + 249;
     }
     if (in_bold_) s.bold = true;
     if (in_italic_) s.italic = true;
@@ -165,7 +168,10 @@ void MarkdownStreamFormatter::sync_style() {
     if (want.italic) seq += ";3";
     if (want.underline) seq += ";4";
     if (want.strike) seq += ";9";
-    if (want.fg != 0) {
+    if (want.fg >= 256) {
+        seq += ";38;5;";
+        seq += std::to_string(want.fg - 256);
+    } else if (want.fg != 0) {
         seq.push_back(';');
         seq += std::to_string(want.fg);
     }
@@ -303,23 +309,39 @@ void MarkdownStreamFormatter::feed_cp(std::string_view cp, bool allow_tag_match)
                 if (tag_buf_ == kOpen) {
                     tag_buf_.clear();
                     clear_inline_styles();
+                    if (post_think_gap_pending_) {
+                        post_think_gap_pending_ = false;
+                        emit_raw("\n");
+                        at_line_start_ = true;
+                    }
+                    if (!at_line_start_) {
+                        emit_raw("\n");
+                        at_line_start_ = true;
+                    }
                     in_think_ = true;
+                    think_need_rail_ = true;
+                    eat_post_think_open_nl_ = true;
                     force_reset_style();
-                    emit_raw("\x1b[2;3m[thinking]\x1b[0m");
-                    sync_style();
+                    emit_raw("\x1b[38;5;242m╭─ \x1b[3;38;5;245mthinking\x1b[0m\n");
+                    at_line_start_ = true;
+                    consecutive_newlines_ = 0;
                     return;
                 }
                 if (tag_buf_ == kClose) {
                     tag_buf_.clear();
                     clear_inline_styles();
                     in_think_ = false;
+                    think_need_rail_ = false;
+                    eat_post_think_open_nl_ = false;
                     force_reset_style();
                     if (!at_line_start_) {
                         emit_raw("\n");
                         at_line_start_ = true;
                     }
-                    emit_raw("\x1b[2m[/thinking]\x1b[0m");
-                    sync_style();
+                    emit_raw("\x1b[38;5;240m╰────────────────────\x1b[0m\n");
+                    at_line_start_ = true;
+                    consecutive_newlines_ = 0;
+                    post_think_gap_pending_ = true;
                     return;
                 }
                 const bool is_prefix =
@@ -347,11 +369,18 @@ void MarkdownStreamFormatter::feed_cp(std::string_view cp, bool allow_tag_match)
         }
 
         if (cp.size() == 1 && cp[0] == '<') {
+            eat_post_think_open_nl_ = false;
             if (at_line_start_ && !line_prefix_.empty()) {
                 flush_line_prefix_as_inline();
             }
             if (backslash_pending_) {
                 backslash_pending_ = false;
+                if (in_think_ && think_need_rail_) {
+                    think_need_rail_ = false;
+                    force_reset_style();
+                    emit_raw("\x1b[38;5;240m│ \x1b[0m");
+                    sync_style();
+                }
                 emit_literal_text("\\<");
                 return;
             }
@@ -361,6 +390,37 @@ void MarkdownStreamFormatter::feed_cp(std::string_view cp, bool allow_tag_match)
             tag_buf_ = "<";
             return;
         }
+    }
+
+    if (eat_post_think_open_nl_) {
+        eat_post_think_open_nl_ = false;
+        if (cp.size() == 1 && cp[0] == '\n') {
+            return;
+        }
+    }
+    if (post_think_gap_pending_) {
+        if (cp.size() == 1 && cp[0] == '\n') {
+            return;
+        }
+        post_think_gap_pending_ = false;
+        emit_raw("\n");
+        at_line_start_ = true;
+        consecutive_newlines_ = 0;
+    }
+    if (in_think_ && think_need_rail_) {
+        think_need_rail_ = false;
+        if (cp.size() == 1 && cp[0] == '\n') {
+            force_reset_style();
+            emit_raw("\x1b[38;5;240m│\x1b[0m\n");
+            at_line_start_ = true;
+            think_need_rail_ = true;
+            consecutive_newlines_ = 1;
+            prev_char_kind_ = CharKind::Whitespace;
+            return;
+        }
+        force_reset_style();
+        emit_raw("\x1b[38;5;240m│ \x1b[0m");
+        sync_style();
     }
 
     if (at_line_start_) {
@@ -393,7 +453,8 @@ void MarkdownStreamFormatter::feed_line_start_fence_close(std::string_view cp) {
             fence_char_ = 0;
             fence_len_ = 0;
             force_reset_style();
-            emit_raw("\x1b[2m────────────────────────────────\x1b[0m\n");
+            emit_raw("\x1b[38;5;240m╰────────────────────────────────────\x1b[0m\n");
+            if (in_think_) think_need_rail_ = true;
             sync_style();
             at_line_start_ = true;
             return;
@@ -444,11 +505,11 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             in_blockquote_ = false;
             force_reset_style();
             if (lang.empty()) {
-                emit_raw("\x1b[2m────────────────────────────────\x1b[0m\n");
+                emit_raw("\x1b[38;5;240m╭────────────────────────────────────\x1b[0m\n");
             } else {
-                emit_raw("\x1b[2m─── ");
+                emit_raw("\x1b[38;5;240m╭─ \x1b[1;38;5;80m");
                 emit_raw(lang);
-                emit_raw(" ───\x1b[0m\n");
+                emit_raw("\x1b[0;38;5;240m ───────────────────────────\x1b[0m\n");
             }
             sync_style();
             at_line_start_ = true;
@@ -489,7 +550,8 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             is_valid_hr_line(rest, rest[0])) {
             line_prefix_.clear();
             force_reset_style();
-            emit_raw("\x1b[2m────────────────────────────────────────\x1b[0m\n");
+            emit_raw("\x1b[38;5;240m────────────────────────────────────────\x1b[0m\n");
+            if (in_think_) think_need_rail_ = true;
             sync_style();
             at_line_start_ = true;
             consecutive_newlines_ = 1;
@@ -500,7 +562,8 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             line_prefix_.clear();
             sync_style();
             emit_raw(std::string(indent, ' '));
-            emit_raw("\x1b[36m▎\x1b[0m\n");
+            emit_raw("\x1b[38;5;80m▎\x1b[0m\n");
+            if (in_think_) think_need_rail_ = true;
             sync_style();
             at_line_start_ = true;
             consecutive_newlines_ = 1;
@@ -571,7 +634,7 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             prev_char_kind_ = CharKind::Whitespace;
             force_reset_style();
             if (indent > 0) emit_raw(std::string(indent, ' '));
-            emit_raw("\x1b[36m▎\x1b[0m ");
+            emit_raw("\x1b[38;5;80m▎\x1b[0m ");
             sync_style();
             return;
         }
@@ -592,7 +655,7 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             const size_t level = indent / 2;
             const std::string pad(level * 2, ' ');
             emit_raw(pad);
-            emit_raw(level == 0 ? "\x1b[36m•\x1b[0m " : (level == 1 ? "\x1b[36m◦\x1b[0m " : "\x1b[36m▪\x1b[0m "));
+            emit_raw(level == 0 ? "\x1b[38;5;80m•\x1b[0m " : (level == 1 ? "\x1b[38;5;80m◦\x1b[0m " : "\x1b[38;5;80m▪\x1b[0m "));
             sync_style();
             return;
         }
@@ -612,7 +675,7 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             force_reset_style();
             const size_t level = indent / 2;
             emit_raw(std::string(level * 2, ' '));
-            emit_raw(level == 0 ? "\x1b[36m•\x1b[0m " : (level == 1 ? "\x1b[36m◦\x1b[0m " : "\x1b[36m▪\x1b[0m "));
+            emit_raw(level == 0 ? "\x1b[38;5;80m•\x1b[0m " : (level == 1 ? "\x1b[38;5;80m◦\x1b[0m " : "\x1b[38;5;80m▪\x1b[0m "));
             sync_style();
             return;
         }
@@ -647,7 +710,7 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             force_reset_style();
             const size_t level = indent / 2;
             emit_raw(std::string(level * 2, ' '));
-            emit_raw(level == 0 ? "\x1b[36m•\x1b[0m " : (level == 1 ? "\x1b[36m◦\x1b[0m " : "\x1b[36m▪\x1b[0m "));
+            emit_raw(level == 0 ? "\x1b[38;5;80m•\x1b[0m " : (level == 1 ? "\x1b[38;5;80m◦\x1b[0m " : "\x1b[38;5;80m▪\x1b[0m "));
             sync_style();
             return;
         }
@@ -705,7 +768,7 @@ void MarkdownStreamFormatter::feed_line_start(std::string_view cp) {
             prev_char_kind_ = CharKind::Whitespace;
             force_reset_style();
             if (indent > 0) emit_raw(std::string(indent, ' '));
-            emit_raw("\x1b[36m");
+            emit_raw("\x1b[38;5;80m");
             emit_raw(num_label);
             emit_raw("\x1b[0m ");
             sync_style();
@@ -1006,6 +1069,7 @@ void MarkdownStreamFormatter::emit_newline() {
     }
     sync_style();
     emit_raw("\n");
+    if (in_think_) think_need_rail_ = true;
     prev_char_kind_ = CharKind::Whitespace;
 }
 
@@ -1048,7 +1112,7 @@ void MarkdownStreamFormatter::finish() {
                 line_prefix_.clear();
                 in_code_fence_ = false;
                 force_reset_style();
-                emit_raw("\x1b[2m────────────────────────────────\x1b[0m");
+                emit_raw("\x1b[38;5;240m╰────────────────────────────────────\x1b[0m");
             } else {
                 sync_style();
                 emit_raw(line_prefix_);
@@ -1073,7 +1137,7 @@ void MarkdownStreamFormatter::finish() {
                 is_valid_hr_line(rest, rest[0])) {
                 line_prefix_.clear();
                 force_reset_style();
-                emit_raw("\x1b[2m────────────────────────────────────────\x1b[0m");
+                emit_raw("\x1b[38;5;240m────────────────────────────────────────\x1b[0m");
             } else {
                 flush_line_prefix_as_inline();
             }
@@ -1087,11 +1151,22 @@ void MarkdownStreamFormatter::finish() {
     if (!inline_delim_.empty()) {
         resolve_inline_delim("", CharKind::Whitespace);
     }
+    if (in_think_) {
+        if (!at_line_start_) {
+            emit_raw("\n");
+            at_line_start_ = true;
+        }
+        force_reset_style();
+        emit_raw("\x1b[38;5;240m╰────────────────────\x1b[0m");
+    }
 
     clear_inline_styles();
     in_heading_ = 0;
     in_blockquote_ = false;
     in_think_ = false;
+    think_need_rail_ = false;
+    eat_post_think_open_nl_ = false;
+    post_think_gap_pending_ = false;
     in_code_fence_ = false;
     at_line_start_ = true;
     eat_leading_ws_ = false;

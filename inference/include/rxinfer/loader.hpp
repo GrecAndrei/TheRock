@@ -6,13 +6,17 @@
 #include "rxinfer/model.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace rxinfer {
 
+using LoadProgressFn = std::function<void(size_t done_bytes, size_t total_bytes)>;
+
 struct LoaderOptions {
     int num_threads = 0; // 0 -> auto hardware concurrency
     bool fast_synthetic = false; // If true in synthetic mode, fill R4 device buffers directly without FP32 packing
+    LoadProgressFn progress_cb = nullptr;
 };
 
 // Compute exact device arena byte budget needed for all weights of cfg.
@@ -33,6 +37,6 @@ ModelWeights load_from_gguf(const std::string& gguf_path,
 
 // Native pre-packed RXR4 binary checkpoint for near-instant reload.
 void save_rxr4_checkpoint(const ModelWeights& weights, const std::string& path);
-ModelWeights load_from_rxr4(const std::string& path);
+ModelWeights load_from_rxr4(const std::string& path, const LoaderOptions& opts = {});
 
 } // namespace rxinfer

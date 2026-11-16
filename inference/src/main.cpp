@@ -8,7 +8,10 @@
 #include "rxinfer/loader.hpp"
 #include "rxinfer/markdown.hpp"
 #include "rxinfer/sampler.hpp"
+#include "rxinfer/server.hpp"
 #include "rxinfer/tokenizer.hpp"
+#include "rxinfer/tools.hpp"
+#include "rxinfer/tui.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -37,11 +40,13 @@ void handle_sigint(int) {
 }
 
 void install_interactive_sigint() {
+    std::signal(SIGPIPE, SIG_IGN);
     struct sigaction sa{};
     sa.sa_handler = handle_sigint;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 }
 
 class BracketedPasteGuard {
@@ -378,10 +383,23 @@ void print_usage(const char* argv0) {
                  "  --system <text>           Optional system prompt (cached across /reset)\n"
                  "  --chat                    Wrap prompt in chat template (default ON in -i)\n"
                  "  --no-chat                 Disable chat template (raw continuation mode)\n"
-                 "  --think                   Enable <think> mode in chat template\n"
+                 "  --think                   Enable <think> reasoning mode in chat template\n"
+                 "  --no-think                Disable <think> reasoning mode (even in --serve / tool mode)\n"
+                 "  --reasoning-effort <lvl>  Reasoning effort hint (xhigh|medium|low|none)\n"
+                 "  --preserve-thinking       Serve prior <think> reasoning back across turns & tool calls (default: on)\n"
+                 "  --no-preserve-thinking    Strip prior-turn <think> on new user turns (still kept across tool calls)\n"
+                 "  --tools <path.json>       Load OpenAI-format tool definitions JSON file\n"
+                 "  --builtin-tools           Enable built-in workspace tools (read_file, list_dir, search_text, write_file, run_command)\n"
+                 "  --auto-approve            Auto-approve mutating built-in tools (write_file, run_command)\n"
+                 "  --tool-exec <cmd>         External command receiving {id,name,arguments} JSON on stdin for custom tools\n"
+                 "  --max-tool-rounds <N>     Max tool-calling rounds per turn (default: 16)\n"
+                 "  --serve                   Start OpenAI-compatible HTTP server (/v1/chat/completions, /v1/models, /health)\n"
+                 "  --host <addr>             Server bind address (default: 127.0.0.1)\n"
+                 "  --port <N>                Server TCP port (default: 8080)\n"
+                 "  --api-key <key>           Optional Bearer API key required by --serve\n"
                  "  --format                  Force ANSI Markdown terminal formatting (default: auto on TTY)\n"
                  "  --no-format, --raw        Disable ANSI Markdown formatting (plain UTF-8 output)\n"
-                 "  --max-tokens <N>          Max new tokens per turn (default: 256, or 1024 in -i)\n"
+                 "  --max-tokens <N>          Max new tokens per turn (0 = unlimited, default: 0)\n"
                  "  --max-seq-len <N>         Max context length (default: auto up to 200k in -i, or prompt-fit)\n"
                  "  --max-batch-tokens <N>    Prefill chunk size (default: 512)\n"
                  "  --kv-dtype <f16|fp8|fp4>  KV cache dtype (default: auto based on VRAM/context)\n"
@@ -408,33 +426,77 @@ void print_usage(const char* argv0) {
                  argv0);
 }
 
-void print_interactive_help() {
-    std::fprintf(stderr,
-                 "\nInteractive commands:\n"
-                 "  /help, /?               Show this help\n"
-                 "  /file <path> [prompt]   Attach a text/code file into context (send immediately if prompt given)\n"
-                 "  /paste                  Start multi-line block input (end with '/end' or '\"\"\"')\n"
-                 "  /undo [N]               Rewind conversation by N turns (default 1, uses cached snapshots)\n"
-                 "  /retry                  Rewind last turn and regenerate response\n"
-                 "  /reset, /clear          Clear active state and start a new conversation (keeps LCP snapshots)\n"
-                 "  /save-cache [path]      Save live KV + GDN prompt state to .rxprompt (or auto-cache)\n"
-                 "  /load-cache <path>      Restore KV + GDN prompt state from .rxprompt file\n"
-                 "  /cache                  Show prompt cache, LCP snapshots, and VRAM/GTT KV tier status\n"
-                 "  /clear-cache            Free in-memory GDN prefix checkpoints\n"
-                 "  /stats                  Show context usage, VRAM/GTT, and true TPS stats\n"
-                 "  /format [on|off]        Toggle or set terminal Markdown formatting (*bold*, headings, code)\n"
-                 "  /think [on|off]         Toggle or set <think> mode\n"
-                 "  /system <text>          Set system prompt (resets conversation; auto-cached across /reset)\n"
-                 "  /temp <F>               Set sampling temperature (0 = greedy GPU argmax)\n"
-                 "  /top-k <N>              Set top-k (0 = off)\n"
-                 "  /top-p <F>              Set top-p (1.0 = off)\n"
-                 "  /min-p <F>              Set min-p (0.0 = off)\n"
-                 "  /repeat-penalty <F>     Set repetition penalty (1.0 = off)\n"
-                 "  /max-tokens <N>         Set max tokens generated per turn\n"
-                 "  /seed <N>               Set sampling seed (0 = random)\n"
-                 "  /bench                  Run prefill/decode/verify benchmark (resets state)\n"
-                 "  /quit, /exit, /q        Exit (or Ctrl-D; Ctrl-C interrupts generation)\n"
-                 "Tips: Paste multi-line blocks directly, wrap blocks in '\"\"\"', or end lines with '\\'.\n\n");
+std::vector<rxinfer::tui::InteractiveLineEditor::CommandSpec> build_interactive_commands() {
+    return {
+        {"/help", "", "Show interactive commands", false},
+        {"/?", "", "Alias for /help", false},
+        {"/file", "<path> [prompt]", "Attach file into context (send if prompt given)", true},
+        {"/attach", "<path> [prompt]", "Alias for /file", true},
+        {"/paste", "", "Start multi-line block input (/end or \"\"\")", false},
+        {"/undo", "[N]", "Rewind conversation by N turns (default 1)", false},
+        {"/retry", "", "Rewind last turn and regenerate response", false},
+        {"/reset", "", "Reset conversation (keeps LCP snapshots)", false},
+        {"/clear", "", "Alias for /reset", false},
+        {"/stats", "", "Show context, VRAM/GTT, sampler, and speed stats", false},
+        {"/cache", "", "Show prompt cache, LCP snapshots, and KV tiers", false},
+        {"/save-cache", "[path]", "Save live KV + GDN state to .rxprompt", true},
+        {"/load-cache", "<path>", "Restore KV + GDN state from .rxprompt", true},
+        {"/clear-cache", "", "Free in-memory GDN prefix checkpoints", false},
+        {"/format", "[on|off]", "Toggle terminal Markdown formatting", false},
+        {"/think", "[on|off]", "Toggle <think> reasoning mode", false},
+        {"/tools", "[builtin|load <p>|clear]", "Inspect or manage function-calling tools", true},
+        {"/approve", "[on|off]", "Toggle auto-approval for mutating tools", false},
+        {"/history", "", "Show structured turn, reasoning & tool history", false},
+        {"/system", "<text>", "Set system prompt (resets conversation)", false},
+        {"/temp", "<F>", "Set sampling temperature (0 = greedy GPU argmax)", false},
+        {"/top-k", "<N>", "Set top-k cutoff (0 = off)", false},
+        {"/top-p", "<F>", "Set top-p cutoff (1.0 = off)", false},
+        {"/min-p", "<F>", "Set min-p cutoff (0.0 = off)", false},
+        {"/repeat-penalty", "<F>", "Set repetition penalty (1.0 = off)", false},
+        {"/max-tokens", "[N|0]", "Set max tokens generated per turn (0 = unlimited)", false},
+        {"/seed", "<N>", "Set sampling seed (0 = random)", false},
+        {"/bench", "", "Run prefill/decode/verify benchmark", false},
+        {"/quit", "", "Exit interactive session", false},
+        {"/exit", "", "Alias for /quit", false},
+        {"/q", "", "Alias for /quit", false},
+    };
+}
+
+void print_interactive_help(const rxinfer::tui::UiTheme& theme) {
+    const auto cmds = build_interactive_commands();
+    std::vector<std::pair<std::string, std::string>> rows;
+    auto add_cmd_row = [&](const char* group, std::initializer_list<const char*> names) {
+        std::string list;
+        for (const char* n : names) {
+            for (const auto& c : cmds) {
+                if (c.name == n) {
+                    std::string left = c.name;
+                    if (!c.args_hint.empty()) left += " " + c.args_hint;
+                    while (left.size() < 24) left.push_back(' ');
+                    std::string line = std::string(theme.accent()) + left + theme.reset() +
+                                       theme.muted() + c.desc + theme.reset();
+                    rows.emplace_back(list.empty() ? group : "", std::move(line));
+                    list = "1";
+                    break;
+                }
+            }
+        }
+    };
+    add_cmd_row("Session", {"/undo", "/retry", "/reset", "/quit"});
+    add_cmd_row("Input", {"/file", "/paste", "/system", "/think", "/format"});
+    add_cmd_row("Cache", {"/cache", "/save-cache", "/load-cache", "/clear-cache"});
+    add_cmd_row("Sampler", {"/temp", "/top-k", "/top-p", "/min-p", "/repeat-penalty", "/max-tokens", "/seed"});
+    add_cmd_row("Tools", {"/tools", "/approve", "/history", "/stats", "/bench", "/help"});
+    rows.emplace_back("Tips",
+                      std::string(theme.muted()) +
+                          "Tab completes commands & paths · ↑↓ history · Alt+Enter / \\ newline · Ctrl-C interrupts" +
+                          theme.reset());
+
+    std::fprintf(stderr, "\n");
+    const std::string title = std::string(theme.accent()) + "◆" + theme.reset() + " " +
+                              theme.bold() + "Interactive Commands" + theme.reset();
+    rxinfer::tui::print_box_card(stderr, theme, title, rows, 92);
+    std::fprintf(stderr, "\n");
 }
 
 rxinfer::ModelConfig default_qwen38_27b_config() {
@@ -481,6 +543,8 @@ struct TurnRecord {
     std::vector<int32_t> pending_before;
     bool was_first_turn = true;
     bool was_close_previous = false;
+    size_t messages_count_before = 0;
+    int next_tool_call_id_before = 1;
     std::string user_input;
 };
 
@@ -494,6 +558,8 @@ struct ChatSessionState {
     bool close_previous_turn = false;
     std::vector<int32_t> pending_tokens;
     std::vector<PendingAttachment> pending_attachments;
+    std::vector<rxinfer::ChatMessage> messages;
+    int next_tool_call_id = 1;
     std::vector<TurnRecord> history;
 
     int32_t turns = 0;
@@ -516,6 +582,8 @@ struct ChatSessionState {
         close_previous_turn = false;
         pending_tokens.clear();
         pending_attachments.clear();
+        messages.clear();
+        next_tool_call_id = 1;
         history.clear();
     }
 };
@@ -523,22 +591,30 @@ struct ChatSessionState {
 struct TurnOptions {
     bool chat_mode = false;
     bool think_mode = false;
+    bool preserve_thinking = true;
     bool format_markdown = true;
     bool ignore_eos = false;
     bool quiet = false;
     bool interactive = false;
     bool auto_prompt_cache = false;
-    int32_t max_tokens = 256;
+    int32_t max_tokens = 0;
     int32_t max_seq_len = 4096;
+    int32_t max_tool_rounds = 16;
     std::string system_prompt;
+    std::string reasoning_effort;
     std::string save_prompt_cache_after_prefill;
     std::string auto_cache_dir;
     std::string shared_doc_prefix; // Optional non-interactive --prompt-file content when paired with --prompt
+    std::string model_display_name = "Assistant";
+    std::vector<rxinfer::ToolFunctionDef> tools;
+    rxinfer::tools::ToolExecOptions tool_exec{};
+    rxinfer::tui::UiTheme theme{};
 };
 
 void print_session_stats(const ChatSessionState& st,
                            const rxinfer::InferenceEngine& engine,
-                           const rxinfer::Sampler& sampler) {
+                           const rxinfer::Sampler& sampler,
+                           const rxinfer::tui::UiTheme& theme) {
     const auto& sc = sampler.config();
     const double sess_prefill_tps =
         (st.total_prefill_ms > 0.0) ? (st.total_prompt_tokens * 1000.0 / st.total_prefill_ms) : 0.0;
@@ -546,37 +622,61 @@ void print_session_stats(const ChatSessionState& st,
         (st.total_decode_ms > 0.0) ? (st.total_decode_calls * 1000.0 / st.total_decode_ms) : 0.0;
     const double sess_ms_tok =
         (st.total_decode_calls > 0) ? (st.total_decode_ms / st.total_decode_calls) : 0.0;
+    const double ctx_frac =
+        static_cast<double>(engine.position()) / static_cast<double>(std::max(1, engine.options().max_seq_len));
 
-    std::fprintf(stderr,
-                 "\n[Stats] Context: %d / %d tokens (%.1f%%) | VRAM: %.2f GiB (W=%.2f S=%.2f X=%.2f)\n"
-                 "        KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | Prefix snaps: %d\n"
-                 "        Sampler: temp=%.2f top_k=%d top_p=%.2f min_p=%.2f rep=%.2f path=%s\n"
-                 "        Session: %d turns | prompt=%lld tok (%.1f tok/s) | gen=%lld tok | decode=%lld steps (%.2f tok/s, %.2f ms/tok)\n",
-                 engine.position(), engine.options().max_seq_len,
-                 100.0 * engine.position() / std::max(1, engine.options().max_seq_len),
-                 engine.total_vram_used_bytes() / double(1ULL << 30),
-                 engine.weights().weight_arena.used() / double(1ULL << 30),
-                 engine.state_vram_bytes() / double(1ULL << 30),
-                 engine.scratch_vram_bytes() / double(1ULL << 30),
-                 engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
-                 engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
-                 engine.num_prefix_checkpoints(),
-                 sc.temperature, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty,
-                 sc.uses_host_logits() ? "host-sample" : "gpu-argmax",
-                 st.turns,
-                 static_cast<long long>(st.total_prompt_tokens), sess_prefill_tps,
-                 static_cast<long long>(st.total_generated_tokens),
-                 static_cast<long long>(st.total_decode_calls), sess_decode_tps, sess_ms_tok);
+    char buf_ctx[512], buf_vram[512], buf_kv[512], buf_samp[512], buf_sess[512];
+    std::snprintf(buf_ctx, sizeof(buf_ctx), "%s  %s%d / %d tok%s %s(%.1f%%)%s",
+                  rxinfer::tui::render_progress_bar(ctx_frac, 18, theme).c_str(),
+                  theme.bold(), engine.position(), engine.options().max_seq_len, theme.reset(),
+                  theme.muted(), ctx_frac * 100.0, theme.reset());
+    std::snprintf(buf_vram, sizeof(buf_vram), "%.2f GiB %s(weights %.2f · state %.2f · scratch %.2f GiB)%s",
+                  engine.total_vram_used_bytes() / double(1ULL << 30),
+                  theme.muted(),
+                  engine.weights().weight_arena.used() / double(1ULL << 30),
+                  engine.state_vram_bytes() / double(1ULL << 30),
+                  engine.scratch_vram_bytes() / double(1ULL << 30),
+                  theme.reset());
+    std::snprintf(buf_kv, sizeof(buf_kv), "VRAM %.2f GiB (%s tok) + GTT %.2f GiB (%s tok) · %d snap%s",
+                  engine.kv_vram_bytes() / double(1ULL << 30),
+                  rxinfer::tui::format_tokens_compact(engine.vram_kv_tokens()).c_str(),
+                  engine.kv_gtt_bytes() / double(1ULL << 30),
+                  rxinfer::tui::format_tokens_compact(engine.gtt_kv_tokens()).c_str(),
+                  engine.num_prefix_checkpoints(),
+                  engine.num_prefix_checkpoints() == 1 ? "" : "s");
+    std::snprintf(buf_samp, sizeof(buf_samp), "temp %.2f · top_k %d · top_p %.2f · min_p %.2f · rep %.2f · %s",
+                  sc.temperature, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty,
+                  sc.uses_host_logits() ? "host-sample" : "gpu-argmax");
+    std::snprintf(buf_sess, sizeof(buf_sess),
+                  "%d turn%s · prompt %lld tok (%.1f/s) · gen %lld tok · decode %s%.2f tok/s%s (%.2f ms/tok)",
+                  st.turns, st.turns == 1 ? "" : "s",
+                  static_cast<long long>(st.total_prompt_tokens), sess_prefill_tps,
+                  static_cast<long long>(st.total_generated_tokens),
+                  theme.ok(), sess_decode_tps, theme.reset(), sess_ms_tok);
+
+    std::vector<std::pair<std::string, std::string>> rows = {
+        {"Context", buf_ctx},
+        {"VRAM", buf_vram},
+        {"KV Pool", buf_kv},
+        {"Sampler", buf_samp},
+        {"Session", buf_sess},
+    };
     if (st.last_prompt_tokens > 0 || st.last_generated_tokens > 0) {
         const double l_p_tps = (st.last_prefill_ms > 0.0) ? (st.last_prompt_tokens * 1000.0 / st.last_prefill_ms) : 0.0;
         const double l_d_tps = (st.last_decode_ms > 0.0) ? (st.last_decode_calls * 1000.0 / st.last_decode_ms) : 0.0;
-        std::fprintf(stderr,
-                     "        Last turn: prompt=%d tok (%.1f ms, %.1f tok/s) | gen=%d tok | decode=%d steps (%.1f ms, %.2f tok/s)\n\n",
-                     st.last_prompt_tokens, st.last_prefill_ms, l_p_tps,
-                     st.last_generated_tokens, st.last_decode_calls, st.last_decode_ms, l_d_tps);
-    } else {
-        std::fprintf(stderr, "\n");
+        char buf_last[192];
+        std::snprintf(buf_last, sizeof(buf_last),
+                      "prompt %d tok (%.0f ms · %.1f/s) · gen %d tok · decode %.2f tok/s",
+                      st.last_prompt_tokens, st.last_prefill_ms, l_p_tps,
+                      st.last_generated_tokens, l_d_tps);
+        rows.emplace_back("Last turn", buf_last);
     }
+
+    std::fprintf(stderr, "\n");
+    const std::string title = std::string(theme.accent()) + "◆" + theme.reset() + " " +
+                              theme.bold() + "Session Stats" + theme.reset();
+    rxinfer::tui::print_box_card(stderr, theme, title, rows, 90);
+    std::fprintf(stderr, "\n");
 }
 
 std::vector<int32_t> encode_with_optional_bos(const rxinfer::Tokenizer& tokenizer,
@@ -588,6 +688,50 @@ std::vector<int32_t> encode_with_optional_bos(const rxinfer::Tokenizer& tokenize
         ids.insert(ids.begin(), tokenizer.bos_id());
     }
     return ids;
+}
+
+std::string format_first_turn_prompt(const rxinfer::Tokenizer& tokenizer,
+                                     const std::string& user_prompt,
+                                     const TurnOptions& opts) {
+    if (opts.tools.empty() && opts.reasoning_effort.empty()) {
+        return tokenizer.format_chat_turn(user_prompt, opts.system_prompt, true, false, opts.think_mode);
+    }
+    rxinfer::ChatTemplateOptions tpl_opts;
+    tpl_opts.add_generation_prompt = true;
+    tpl_opts.enable_thinking = opts.think_mode;
+    tpl_opts.preserve_thinking = opts.preserve_thinking;
+    tpl_opts.reasoning_effort = opts.reasoning_effort;
+
+    std::string out = tokenizer.format_system_prompt(opts.system_prompt, opts.tools, tpl_opts);
+    const auto fmt = tokenizer.detect_chat_format();
+    const bool has_think = (tokenizer.token_to_id("<think>") >= 0 && tokenizer.token_to_id("</think>") >= 0);
+    if (fmt == rxinfer::Tokenizer::ChatFormat::Llama3) {
+        out += "<|start_header_id|>user<|end_header_id|>\n\n" + user_prompt + "<|eot_id|>";
+        out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        if (opts.think_mode && has_think) out += "<think>\n";
+    } else {
+        out += "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        if (!opts.think_mode && tokenizer.token_to_id("</think>") >= 0) {
+            out += "<think>\n\n</think>\n\n";
+        } else if (opts.think_mode && has_think) {
+            out += "<think>\n";
+        }
+    }
+    return out;
+}
+
+std::string truncate_inline_preview(const std::string& s, size_t max_chars = 96) {
+    std::string clean;
+    clean.reserve(std::min(s.size(), max_chars + 4));
+    for (char c : s) {
+        if (c == '\n' || c == '\r' || c == '\t') clean.push_back(' ');
+        else clean.push_back(c);
+        if (clean.size() >= max_chars) {
+            clean += "...";
+            break;
+        }
+    }
+    return clean;
 }
 
 bool run_turn(rxinfer::InferenceEngine& engine,
@@ -610,21 +754,58 @@ bool run_turn(rxinfer::InferenceEngine& engine,
         input_text = raw_input_text;
     }
 
+    rxinfer::ChatTemplateOptions tpl_opts;
+    tpl_opts.add_generation_prompt = true;
+    tpl_opts.enable_thinking = opts.think_mode;
+    tpl_opts.preserve_thinking = opts.preserve_thinking;
+    tpl_opts.reasoning_effort = opts.reasoning_effort;
+
+    const bool rebuild_without_prior_thinking =
+        (!state.is_first_turn && opts.chat_mode && !opts.preserve_thinking && !state.messages.empty());
+
     std::string delta_text;
-    if (opts.chat_mode) {
-        delta_text = tokenizer.format_chat_turn(
-            input_text, opts.system_prompt, state.is_first_turn, state.close_previous_turn, opts.think_mode);
+    std::vector<int32_t> encoded;
+    std::vector<int32_t> turn_ids;
+    std::vector<int32_t> full_prompt_ids;
+
+    if (rebuild_without_prior_thinking) {
+        std::vector<rxinfer::ChatMessage> rebuilt = state.messages;
+        if (!opts.system_prompt.empty() &&
+            (rebuilt.empty() || (rebuilt[0].role != "system" && rebuilt[0].role != "developer"))) {
+            rxinfer::ChatMessage sys_msg;
+            sys_msg.role = "system";
+            sys_msg.content = opts.system_prompt;
+            rebuilt.insert(rebuilt.begin(), std::move(sys_msg));
+        }
+        rxinfer::ChatMessage umsg;
+        umsg.role = "user";
+        umsg.content = input_text;
+        rebuilt.push_back(std::move(umsg));
+
+        const std::string full_text = tokenizer.format_chat_messages(rebuilt, opts.tools, tpl_opts);
+        full_prompt_ids = encode_with_optional_bos(tokenizer, full_text, tokenizer.should_add_bos());
+        turn_ids = full_prompt_ids;
+        encoded = full_prompt_ids;
     } else {
-        delta_text = (state.is_first_turn || input_text.empty()) ? input_text : ("\n" + input_text);
+        if (opts.chat_mode) {
+            if (state.is_first_turn) {
+                delta_text = format_first_turn_prompt(tokenizer, input_text, opts);
+            } else {
+                delta_text = tokenizer.format_chat_turn(
+                    input_text, opts.system_prompt, false, state.close_previous_turn, opts.think_mode);
+            }
+        } else {
+            delta_text = (state.is_first_turn || input_text.empty()) ? input_text : ("\n" + input_text);
+        }
+
+        const bool add_bos = state.is_first_turn && state.pending_tokens.empty() && tokenizer.should_add_bos();
+        encoded = encode_with_optional_bos(tokenizer, delta_text, add_bos);
+
+        turn_ids = state.pending_tokens;
+        turn_ids.insert(turn_ids.end(), encoded.begin(), encoded.end());
     }
 
-    const bool add_bos = state.is_first_turn && state.pending_tokens.empty() && tokenizer.should_add_bos();
-    std::vector<int32_t> encoded = encode_with_optional_bos(tokenizer, delta_text, add_bos);
-
-    std::vector<int32_t> turn_ids = state.pending_tokens;
-    turn_ids.insert(turn_ids.end(), encoded.begin(), encoded.end());
-
-    if (state.is_first_turn) {
+    if (state.is_first_turn || rebuild_without_prior_thinking) {
         if (turn_ids.empty()) {
             if (opts.interactive) {
                 std::fprintf(stderr, "[Empty turn; nothing to prefill]\n");
@@ -634,9 +815,16 @@ bool run_turn(rxinfer::InferenceEngine& engine,
         }
         if (static_cast<int32_t>(turn_ids.size()) >= opts.max_seq_len) {
             if (opts.interactive) {
-                std::fprintf(stderr,
-                             "[Context limit reached (%zu >= %d). Use /reset to start a new conversation.]\n",
-                             turn_ids.size(), opts.max_seq_len);
+                if (opts.theme.color) {
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg), "Context limit reached (%zu >= %d) — use /reset to start fresh",
+                                  turn_ids.size(), opts.max_seq_len);
+                    rxinfer::tui::print_status_badge(stderr, opts.theme, "warn", msg);
+                } else {
+                    std::fprintf(stderr,
+                                 "[Context limit reached (%zu >= %d). Use /reset to start a new conversation.]\n",
+                                 turn_ids.size(), opts.max_seq_len);
+                }
                 return false;
             }
             throw std::runtime_error("Prompt length exceeds --max-seq-len");
@@ -651,9 +839,17 @@ bool run_turn(rxinfer::InferenceEngine& engine,
         }
         if (engine.position() + static_cast<int32_t>(turn_ids.size()) >= opts.max_seq_len) {
             if (opts.interactive) {
-                std::fprintf(stderr,
-                             "[Context limit reached (%d + %zu >= %d). Use /reset to start a new conversation.]\n",
-                             engine.position(), turn_ids.size(), opts.max_seq_len);
+                if (opts.theme.color) {
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg),
+                                  "Context limit reached (%d + %zu >= %d) — use /reset to start fresh",
+                                  engine.position(), turn_ids.size(), opts.max_seq_len);
+                    rxinfer::tui::print_status_badge(stderr, opts.theme, "warn", msg);
+                } else {
+                    std::fprintf(stderr,
+                                 "[Context limit reached (%d + %zu >= %d). Use /reset to start a new conversation.]\n",
+                                 engine.position(), turn_ids.size(), opts.max_seq_len);
+                }
                 return false;
             }
             throw std::runtime_error("Prompt length exceeds --max-seq-len");
@@ -665,14 +861,17 @@ bool run_turn(rxinfer::InferenceEngine& engine,
     turn_rec.pending_before = state.pending_tokens;
     turn_rec.was_first_turn = state.is_first_turn;
     turn_rec.was_close_previous = state.close_previous_turn;
+    turn_rec.messages_count_before = state.messages.size();
+    turn_rec.next_tool_call_id_before = state.next_tool_call_id;
     turn_rec.user_input = input_text;
 
-    std::vector<int32_t> full_prompt_ids;
-    if (state.is_first_turn) {
-        full_prompt_ids = turn_ids;
-    } else {
-        full_prompt_ids = engine.cached_tokens();
-        full_prompt_ids.insert(full_prompt_ids.end(), turn_ids.begin(), turn_ids.end());
+    if (!rebuild_without_prior_thinking) {
+        if (state.is_first_turn) {
+            full_prompt_ids = turn_ids;
+        } else {
+            full_prompt_ids = engine.cached_tokens();
+            full_prompt_ids.insert(full_prompt_ids.end(), turn_ids.begin(), turn_ids.end());
+        }
     }
 
     // If auto-cache is enabled and engine is empty on Turn 1, look for longest matching prefix on disk.
@@ -692,23 +891,49 @@ bool run_turn(rxinfer::InferenceEngine& engine,
             const auto tlc1 = std::chrono::steady_clock::now();
             loaded_disk_auto_cache = (loaded_pos > 0);
             if (!opts.quiet) {
-                std::fprintf(stderr, "[Auto-cache hit: loaded %d tok from %s in %.1f ms]\n",
-                             loaded_pos, best_file.c_str(),
-                             std::chrono::duration<double, std::milli>(tlc1 - tlc0).count());
+                if (opts.theme.color) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg), "Auto-cache hit · %s tok loaded in %s",
+                                  rxinfer::tui::format_tokens_compact(loaded_pos).c_str(),
+                                  rxinfer::tui::format_duration_compact(
+                                      std::chrono::duration<double, std::milli>(tlc1 - tlc0).count())
+                                      .c_str());
+                    rxinfer::tui::print_status_badge(stderr, opts.theme, "info", msg);
+                } else {
+                    std::fprintf(stderr, "[Auto-cache hit: loaded %d tok from %s in %.1f ms]\n",
+                                 loaded_pos, best_file.c_str(),
+                                 std::chrono::duration<double, std::milli>(tlc1 - tlc0).count());
+                }
             }
         }
     }
 
-    sampler.record_tokens(encoded);
+    if (rebuild_without_prior_thinking) {
+        sampler.clear_history();
+        sampler.record_tokens(full_prompt_ids);
+    } else {
+        sampler.record_tokens(encoded);
+    }
     const int32_t vocab_size = engine.config().vocab_size;
 
     const auto tp0 = std::chrono::steady_clock::now();
     bool evaluated_cold_prefix = false;
     int32_t prior_cached_tokens = loaded_disk_auto_cache ? engine.position() : 0;
 
-    // Automatically cache and pin system prompt prefix on Turn 1 so /reset keeps it hot.
-    if (opts.chat_mode && !opts.system_prompt.empty() && state.is_first_turn && !loaded_disk_auto_cache) {
-        const std::string sys_text = tokenizer.format_system_prefix(opts.system_prompt);
+    std::string spin_label = "Thinking";
+    const size_t approx_new =
+        (full_prompt_ids.size() > static_cast<size_t>(prior_cached_tokens))
+            ? (full_prompt_ids.size() - static_cast<size_t>(prior_cached_tokens))
+            : full_prompt_ids.size();
+    if (approx_new >= 256) {
+        spin_label = "Reading " + rxinfer::tui::format_tokens_compact(static_cast<int64_t>(approx_new)) + " tokens";
+    }
+    rxinfer::tui::PrefillSpinner prefill_spinner(opts.theme, !opts.quiet && opts.theme.tty_stderr, spin_label);
+
+    // Automatically cache and pin system/tools prompt prefix on Turn 1 so /reset keeps it hot.
+    if (opts.chat_mode && (!opts.system_prompt.empty() || !opts.tools.empty() || !opts.reasoning_effort.empty()) &&
+        state.is_first_turn && !loaded_disk_auto_cache) {
+        const std::string sys_text = tokenizer.format_system_prompt(opts.system_prompt, opts.tools, tpl_opts);
         const std::vector<int32_t> sys_ids = encode_with_optional_bos(tokenizer, sys_text, tokenizer.should_add_bos());
         if (!sys_ids.empty() && sys_ids.size() < full_prompt_ids.size() &&
             std::equal(sys_ids.begin(), sys_ids.end(), full_prompt_ids.begin())) {
@@ -727,10 +952,10 @@ bool run_turn(rxinfer::InferenceEngine& engine,
         !opts.auto_cache_dir.empty() && !loaded_disk_auto_cache) {
         std::string doc_prefix_text;
         if (opts.chat_mode) {
-            doc_prefix_text = tokenizer.format_system_prefix(opts.system_prompt) + "<|im_start|>user\n";
+            const std::string sys_part = tokenizer.format_system_prompt(opts.system_prompt, opts.tools, tpl_opts);
+            doc_prefix_text = sys_part + "<|im_start|>user\n";
             if (tokenizer.detect_chat_format() == rxinfer::Tokenizer::ChatFormat::Llama3) {
-                doc_prefix_text = tokenizer.format_system_prefix(opts.system_prompt) +
-                                  "<|start_header_id|>user<|end_header_id|>\n\n";
+                doc_prefix_text = sys_part + "<|start_header_id|>user<|end_header_id|>\n\n";
             }
         }
         doc_prefix_text += opts.shared_doc_prefix;
@@ -751,9 +976,19 @@ bool run_turn(rxinfer::InferenceEngine& engine,
             const std::string saved = save_to_auto_cache(opts.auto_cache_dir, engine, opts.quiet);
             const auto tsc1 = std::chrono::steady_clock::now();
             if (!saved.empty() && !opts.quiet) {
-                std::fprintf(stderr, "[Auto-cached shared prefix (%zu tok) to %s in %.1f ms]\n",
-                             shared, saved.c_str(),
-                             std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+                if (opts.theme.color) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg), "Auto-cached shared prefix (%s tok) in %s",
+                                  rxinfer::tui::format_tokens_compact(static_cast<int64_t>(shared)).c_str(),
+                                  rxinfer::tui::format_duration_compact(
+                                      std::chrono::duration<double, std::milli>(tsc1 - tsc0).count())
+                                      .c_str());
+                    rxinfer::tui::print_status_badge(stderr, opts.theme, "info", msg);
+                } else {
+                    std::fprintf(stderr, "[Auto-cached shared prefix (%zu tok) to %s in %.1f ms]\n",
+                                 shared, saved.c_str(),
+                                 std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+                }
             }
         }
     }
@@ -771,15 +1006,26 @@ bool run_turn(rxinfer::InferenceEngine& engine,
     }
     const auto tp1 = std::chrono::steady_clock::now();
     const double prefill_ms = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+    prefill_spinner.stop();
 
     if (!opts.save_prompt_cache_after_prefill.empty()) {
         const auto tsc0 = std::chrono::steady_clock::now();
         engine.save_prompt_cache(opts.save_prompt_cache_after_prefill);
         const auto tsc1 = std::chrono::steady_clock::now();
         if (!opts.quiet) {
-            std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
-                         engine.position(), opts.save_prompt_cache_after_prefill.c_str(),
-                         std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+            if (opts.theme.color) {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg), "Saved prompt cache (%d tok) in %s",
+                              engine.position(),
+                              rxinfer::tui::format_duration_compact(
+                                  std::chrono::duration<double, std::milli>(tsc1 - tsc0).count())
+                                  .c_str());
+                rxinfer::tui::print_status_badge(stderr, opts.theme, "ok", msg);
+            } else {
+                std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
+                             engine.position(), opts.save_prompt_cache_after_prefill.c_str(),
+                             std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+            }
         }
     } else if (!opts.interactive && opts.auto_prompt_cache && !opts.auto_cache_dir.empty() &&
                opts.shared_doc_prefix.empty() && cache_res.evaluated_tokens >= 1024) {
@@ -787,9 +1033,19 @@ bool run_turn(rxinfer::InferenceEngine& engine,
         const std::string saved = save_to_auto_cache(opts.auto_cache_dir, engine, opts.quiet);
         const auto tsc1 = std::chrono::steady_clock::now();
         if (!saved.empty() && !opts.quiet) {
-            std::fprintf(stderr, "[Auto-cached prompt (%d tok) to %s in %.1f ms]\n",
-                         engine.position(), saved.c_str(),
-                         std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+            if (opts.theme.color) {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg), "Auto-cached prompt (%d tok) in %s",
+                              engine.position(),
+                              rxinfer::tui::format_duration_compact(
+                                  std::chrono::duration<double, std::milli>(tsc1 - tsc0).count())
+                                  .c_str());
+                rxinfer::tui::print_status_badge(stderr, opts.theme, "info", msg);
+            } else {
+                std::fprintf(stderr, "[Auto-cached prompt (%d tok) to %s in %.1f ms]\n",
+                             engine.position(), saved.c_str(),
+                             std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+            }
         }
     }
 
@@ -798,65 +1054,255 @@ bool run_turn(rxinfer::InferenceEngine& engine,
     state.is_first_turn = false;
     state.close_previous_turn = opts.chat_mode;
 
-    rxinfer::MarkdownStreamFormatter printer(opts.format_markdown);
-    if (opts.chat_mode && opts.think_mode &&
-        tokenizer.token_to_id("<think>") >= 0 && tokenizer.token_to_id("</think>") >= 0) {
-        printer.push("<think>\n");
+    if (opts.chat_mode) {
+        rxinfer::ChatMessage umsg;
+        umsg.role = "user";
+        umsg.content = input_text;
+        state.messages.push_back(std::move(umsg));
     }
+
+    if (opts.interactive && opts.chat_mode && !opts.quiet && opts.format_markdown && opts.theme.tty_stdout) {
+        std::printf("\n%s%s◆%s %s%s%s\n",
+                    opts.theme.bold(), opts.theme.accent(), opts.theme.reset(),
+                    opts.theme.bold(), opts.model_display_name.c_str(), opts.theme.reset());
+        std::fflush(stdout);
+    }
+
+    const bool has_think_tokens =
+        (tokenizer.token_to_id("<think>") >= 0 && tokenizer.token_to_id("</think>") >= 0);
+
+    int32_t total_turn_prompt_tokens = cache_res.evaluated_tokens;
     int32_t generated = 0;
     int32_t decode_calls = 0;
+    double total_turn_prefill_ms = prefill_ms;
     double decode_ms = 0.0;
     bool hit_ctx_limit = false;
+    bool hit_tok_limit = false;
+    bool hit_tool_round_limit = false;
     bool interrupted = false;
 
-    for (int32_t step = 0; step < opts.max_tokens; ++step) {
-        if (g_interrupted) {
-            interrupted = true;
+    for (int32_t tool_round = 0;; ++tool_round) {
+        const bool started_inside_think = opts.chat_mode && opts.think_mode && has_think_tokens;
+        const bool use_structured_tool_display = (!opts.tools.empty() && opts.format_markdown);
+
+        rxinfer::MarkdownStreamFormatter printer(opts.format_markdown);
+        rxinfer::tools::StreamingAssistantParser tool_parser(
+            started_inside_think, opts.tools, state.next_tool_call_id);
+        bool printer_in_think = false;
+        bool printed_to_stdout = false;
+        if (started_inside_think && !use_structured_tool_display) {
+            printer.push("<think>\n");
+            printer_in_think = true;
+            printed_to_stdout = true;
+        }
+
+        std::string raw_generated;
+        for (int32_t step = 0; opts.max_tokens <= 0 || step < opts.max_tokens; ++step) {
+            if (g_interrupted) {
+                interrupted = true;
+                break;
+            }
+            if (!opts.ignore_eos && is_stop_token(next_tok, tokenizer, engine.config())) {
+                break;
+            }
+
+            const std::string& raw_tok = tokenizer.id_to_token(next_tok);
+            const std::string piece =
+                (raw_tok == "<think>" || raw_tok == "</think>" || raw_tok == "<tool_call>" ||
+                 raw_tok == "</tool_call>" || raw_tok == "<|python_tag|>" || raw_tok == "<|eom_id|>")
+                    ? raw_tok
+                    : tokenizer.decode_token(next_tok, true);
+            raw_generated += piece;
+
+            if (use_structured_tool_display) {
+                auto d = tool_parser.feed(piece);
+                if (!d.reasoning_content.empty()) {
+                    if (!printer_in_think) {
+                        printer.push("<think>\n");
+                        printer_in_think = true;
+                    }
+                    printer.push(d.reasoning_content);
+                    printed_to_stdout = true;
+                }
+                if (!d.content.empty() || !d.tool_calls.empty()) {
+                    if (printer_in_think) {
+                        printer.push("</think>\n\n");
+                        printer_in_think = false;
+                    }
+                    if (!d.content.empty()) {
+                        printer.push(d.content);
+                        printed_to_stdout = true;
+                    }
+                }
+            } else {
+                printer.push(piece);
+                printed_to_stdout = true;
+            }
+
+            sampler.record_token(next_tok);
+            ++generated;
+
+            if (engine.position() >= opts.max_seq_len) {
+                hit_ctx_limit = true;
+                state.pending_tokens.push_back(next_tok);
+                break;
+            }
+            if (opts.max_tokens > 0 && step + 1 >= opts.max_tokens) {
+                hit_tok_limit = true;
+                state.pending_tokens.push_back(next_tok);
+                break;
+            }
+            if (g_interrupted) {
+                interrupted = true;
+                state.pending_tokens.push_back(next_tok);
+                break;
+            }
+
+            const auto td0 = std::chrono::steady_clock::now();
+            int32_t cand_tok = engine.decode_step(next_tok);
+            if (sampler.config().uses_host_logits()) {
+                engine.copy_last_logits_f16(logits_f16_scratch);
+                cand_tok = sampler.sample_from_f16_bits(logits_f16_scratch.data(), vocab_size);
+            }
+            const auto td1 = std::chrono::steady_clock::now();
+            decode_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
+            ++decode_calls;
+            next_tok = cand_tok;
+        }
+
+        if (use_structured_tool_display) {
+            auto tail = tool_parser.finish();
+            if (!tail.reasoning_content.empty()) {
+                if (!printer_in_think) {
+                    printer.push("<think>\n");
+                    printer_in_think = true;
+                }
+                printer.push(tail.reasoning_content);
+                printed_to_stdout = true;
+            }
+            if (printer_in_think && (!tail.content.empty() || !tool_parser.tool_calls().empty())) {
+                printer.push("</think>\n\n");
+                printer_in_think = false;
+            }
+            if (!tail.content.empty()) {
+                printer.push(tail.content);
+                printed_to_stdout = true;
+            }
+        }
+
+        printer.finish();
+        if (printed_to_stdout || !use_structured_tool_display) {
+            std::printf("\n");
+        }
+        std::fflush(stdout);
+
+        rxinfer::tools::ParsedAssistantOutput parsed = rxinfer::tools::parse_assistant_output(
+            raw_generated, started_inside_think, opts.tools, state.next_tool_call_id);
+        state.next_tool_call_id += static_cast<int>(parsed.tool_calls.size());
+
+        if (opts.chat_mode) {
+            rxinfer::ChatMessage amsg;
+            amsg.role = "assistant";
+            amsg.content = parsed.content;
+            amsg.reasoning_content = parsed.reasoning_content;
+            amsg.tool_calls = parsed.tool_calls;
+            state.messages.push_back(std::move(amsg));
+        }
+
+        if (opts.tools.empty() || parsed.tool_calls.empty() || interrupted || hit_ctx_limit || hit_tok_limit) {
             break;
         }
-        if (!opts.ignore_eos && is_stop_token(next_tok, tokenizer, engine.config())) {
+        if (tool_round >= opts.max_tool_rounds) {
+            hit_tool_round_limit = true;
             break;
         }
 
-        const std::string& raw_tok = tokenizer.id_to_token(next_tok);
-        if (opts.think_mode && (raw_tok == "<think>" || raw_tok == "</think>")) {
-            printer.push(raw_tok);
-        } else {
-            printer.push(tokenizer.decode_token(next_tok, true));
+        // Execute requested tool calls and feed <tool_response> back WITH prior reasoning preserved in KV + GDN cache.
+        rxinfer::tools::ToolExecOptions exec_opts = opts.tool_exec;
+        if (!exec_opts.allow_mutating && opts.interactive && ::isatty(STDIN_FILENO) != 0) {
+            exec_opts.confirm_cb = [&](const rxinfer::ToolCall& tc) -> bool {
+                std::fprintf(stderr, "\n%s[Approve mutating tool %s(%s)? y/N]: %s",
+                             opts.theme.warn(), tc.name.c_str(),
+                             truncate_inline_preview(tc.arguments, 80).c_str(),
+                             opts.theme.reset());
+                std::fflush(stderr);
+                std::string ans;
+                if (!std::getline(std::cin, ans)) return false;
+                const std::string t = trim_ws(ans);
+                return (t == "y" || t == "Y" || t == "yes" || t == "YES");
+            };
         }
-        sampler.record_token(next_tok);
-        ++generated;
 
-        if (engine.position() >= opts.max_seq_len) {
+        std::vector<rxinfer::ChatMessage> tool_msgs;
+        tool_msgs.reserve(parsed.tool_calls.size());
+        for (const auto& tc : parsed.tool_calls) {
+            if (!opts.quiet) {
+                const std::string arg_preview = truncate_inline_preview(tc.arguments, 92);
+                if (opts.theme.color) {
+                    std::fprintf(stderr, "  %s⚙ %s%s(%s)%s\n",
+                                 opts.theme.accent(), tc.name.c_str(),
+                                 opts.theme.muted(), arg_preview.c_str(), opts.theme.reset());
+                } else {
+                    std::fprintf(stderr, "[Tool call: %s(%s)]\n", tc.name.c_str(), arg_preview.c_str());
+                }
+            }
+            const auto tx0 = std::chrono::steady_clock::now();
+            const rxinfer::tools::ToolExecResult res = rxinfer::tools::execute_tool_call(tc, exec_opts);
+            const auto tx1 = std::chrono::steady_clock::now();
+            const double tx_ms = std::chrono::duration<double, std::milli>(tx1 - tx0).count();
+            if (!opts.quiet) {
+                if (opts.theme.color) {
+                    std::fprintf(stderr, "  %s%s %s%s · %s in %s%s\n",
+                                 res.ok ? opts.theme.ok() : opts.theme.err(),
+                                 res.ok ? "✓" : "✗",
+                                 tc.name.c_str(),
+                                 opts.theme.muted(),
+                                 format_byte_size(res.output.size()).c_str(),
+                                 rxinfer::tui::format_duration_compact(tx_ms).c_str(),
+                                 opts.theme.reset());
+                } else {
+                    std::fprintf(stderr, "[Tool result: %s -> %s (%zu bytes, %.1f ms)]\n",
+                                 tc.name.c_str(), res.ok ? "ok" : "error", res.output.size(), tx_ms);
+                }
+            }
+
+            rxinfer::ChatMessage tm;
+            tm.role = "tool";
+            tm.tool_call_id = tc.id;
+            tm.name = tc.name;
+            tm.content = res.output;
+            tool_msgs.push_back(tm);
+            if (opts.chat_mode) {
+                state.messages.push_back(std::move(tm));
+            }
+        }
+
+        const std::string tool_delta =
+            tokenizer.format_tool_response_turn(tool_msgs, /*close_previous_turn=*/true, opts.think_mode);
+        const std::vector<int32_t> tool_delta_ids = encode_with_optional_bos(tokenizer, tool_delta, false);
+        if (engine.position() + static_cast<int32_t>(tool_delta_ids.size()) >= opts.max_seq_len) {
             hit_ctx_limit = true;
-            state.pending_tokens.push_back(next_tok);
-            break;
-        }
-        if (step + 1 >= opts.max_tokens) {
-            state.pending_tokens.push_back(next_tok);
-            break;
-        }
-        if (g_interrupted) {
-            interrupted = true;
-            state.pending_tokens.push_back(next_tok);
             break;
         }
 
-        const auto td0 = std::chrono::steady_clock::now();
-        int32_t cand_tok = engine.decode_step(next_tok);
-        if (sampler.config().uses_host_logits()) {
+        std::vector<int32_t> next_prompt_ids = engine.cached_tokens();
+        next_prompt_ids.insert(next_prompt_ids.end(), tool_delta_ids.begin(), tool_delta_ids.end());
+        sampler.record_tokens(tool_delta_ids);
+
+        rxinfer::tui::PrefillSpinner tool_spinner(opts.theme, !opts.quiet && opts.theme.tty_stderr, "Thinking");
+        const auto ttp0 = std::chrono::steady_clock::now();
+        const rxinfer::PrefillCacheResult tool_cache_res = engine.prefill_cached(next_prompt_ids, true);
+        next_tok = tool_cache_res.next_token;
+        if (sampler.config().uses_host_logits() && tool_cache_res.evaluated_tokens > 0) {
             engine.copy_last_logits_f16(logits_f16_scratch);
-            cand_tok = sampler.sample_from_f16_bits(logits_f16_scratch.data(), vocab_size);
+            next_tok = sampler.sample_from_f16_bits(logits_f16_scratch.data(), vocab_size);
         }
-        const auto td1 = std::chrono::steady_clock::now();
-        decode_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
-        ++decode_calls;
-        next_tok = cand_tok;
-    }
+        const auto ttp1 = std::chrono::steady_clock::now();
+        tool_spinner.stop();
 
-    printer.finish();
-    std::printf("\n");
-    std::fflush(stdout);
+        total_turn_prefill_ms += std::chrono::duration<double, std::milli>(ttp1 - ttp0).count();
+        total_turn_prompt_tokens += tool_cache_res.evaluated_tokens;
+    }
 
     // Save post-turn prefix checkpoint so /undo, /retry, and branching stay instant.
     if (opts.interactive && engine.position() >= 8) {
@@ -866,51 +1312,111 @@ bool run_turn(rxinfer::InferenceEngine& engine,
 
     if (interrupted) {
         g_interrupted = 0;
-        if (!opts.quiet) std::fprintf(stderr, "[interrupted]\n");
+        if (!opts.quiet) {
+            if (opts.theme.color) {
+                rxinfer::tui::print_status_badge(stderr, opts.theme, "warn", "interrupted");
+            } else {
+                std::fprintf(stderr, "[interrupted]\n");
+            }
+        }
+    } else if (hit_tool_round_limit && !opts.quiet) {
+        if (opts.theme.color) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "Reached max tool rounds (%d) — pass --max-tool-rounds to raise",
+                          opts.max_tool_rounds);
+            rxinfer::tui::print_status_badge(stderr, opts.theme, "warn", msg);
+        } else {
+            std::fprintf(stderr, "[reached max tool rounds (%d)]\n", opts.max_tool_rounds);
+        }
     } else if (hit_ctx_limit && !opts.quiet) {
-        std::fprintf(stderr, "[context limit %d reached; use /reset for a new conversation]\n", opts.max_seq_len);
+        if (opts.theme.color) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "Context limit %d reached — use /reset for a new conversation",
+                          opts.max_seq_len);
+            rxinfer::tui::print_status_badge(stderr, opts.theme, "warn", msg);
+        } else {
+            std::fprintf(stderr, "[context limit %d reached; use /reset for a new conversation]\n", opts.max_seq_len);
+        }
+    } else if (hit_tok_limit && !opts.quiet) {
+        if (opts.theme.color) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "Token limit %d reached — use /max-tokens 0 for unlimited",
+                          opts.max_tokens);
+            rxinfer::tui::print_status_badge(stderr, opts.theme, "warn", msg);
+        } else {
+            std::fprintf(stderr, "[max_tokens limit %d reached; use /max-tokens 0 for unlimited]\n", opts.max_tokens);
+        }
     }
 
     state.turns++;
-    state.last_prompt_tokens = cache_res.evaluated_tokens;
+    state.last_prompt_tokens = total_turn_prompt_tokens;
     state.last_generated_tokens = generated;
     state.last_decode_calls = decode_calls;
-    state.last_prefill_ms = prefill_ms;
+    state.last_prefill_ms = total_turn_prefill_ms;
     state.last_decode_ms = decode_ms;
 
-    state.total_prompt_tokens += cache_res.evaluated_tokens;
+    state.total_prompt_tokens += total_turn_prompt_tokens;
     state.total_generated_tokens += generated;
     state.total_decode_calls += decode_calls;
-    state.total_prefill_ms += prefill_ms;
+    state.total_prefill_ms += total_turn_prefill_ms;
     state.total_decode_ms += decode_ms;
 
     if (!opts.quiet) {
-        const double p_tps = (cache_res.evaluated_tokens * 1000.0) / std::max(0.001, prefill_ms);
-        const double total_ms = prefill_ms + decode_ms;
+        const double p_tps = (total_turn_prompt_tokens * 1000.0) / std::max(0.001, total_turn_prefill_ms);
+        const double total_ms = total_turn_prefill_ms + decode_ms;
         const double e2e_tps = (generated > 0) ? (generated * 1000.0 / std::max(0.001, total_ms)) : 0.0;
-        std::string prompt_desc;
-        if (cache_res.matched_prefix_tokens > 0) {
-            char pbuf[160];
-            std::snprintf(pbuf, sizeof(pbuf), "%d new + %d cached%s",
-                          cache_res.evaluated_tokens, cache_res.matched_prefix_tokens,
-                          cache_res.restored_gdn_snapshot ? " (GDN restored)" : "");
-            prompt_desc = pbuf;
+        if (opts.theme.color) {
+            std::string speed_part;
+            if (decode_calls > 0) {
+                const double d_tps = (decode_calls * 1000.0) / std::max(0.001, decode_ms);
+                char sb[96];
+                std::snprintf(sb, sizeof(sb), "%s⚡ %.1f tok/s%s · ", opts.theme.ok(), d_tps, opts.theme.reset());
+                speed_part = sb;
+            }
+            std::string cache_part;
+            if (cache_res.matched_prefix_tokens > 0) {
+                char cb[128];
+                std::snprintf(cb, sizeof(cb), " · %scached %s +%d%s",
+                              opts.theme.accent(),
+                              rxinfer::tui::format_tokens_compact(cache_res.matched_prefix_tokens).c_str(),
+                              total_turn_prompt_tokens,
+                              opts.theme.reset());
+                cache_part = cb;
+            }
+            std::fprintf(stderr, "  %s%s%d tok · TTFT %s%s · ctx %s/%s%s\n",
+                         speed_part.c_str(),
+                         opts.theme.muted(),
+                         generated,
+                         rxinfer::tui::format_duration_compact(total_turn_prefill_ms).c_str(),
+                         cache_part.c_str(),
+                         rxinfer::tui::format_tokens_compact(engine.position()).c_str(),
+                         rxinfer::tui::format_tokens_compact(opts.max_seq_len).c_str(),
+                         opts.theme.reset());
         } else {
-            prompt_desc = std::to_string(cache_res.evaluated_tokens) + " tok";
-        }
-        if (decode_calls > 0) {
-            const double d_tps = (decode_calls * 1000.0) / std::max(0.001, decode_ms);
-            const double ms_per_tok = decode_ms / decode_calls;
-            std::fprintf(stderr,
-                         "[Prompt: %s in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Decode: %d steps in %.1f ms (%.2f tok/s, %.2f ms/tok) | Out: %d tok (E2E %.2f tok/s) | Ctx: %d/%d]\n",
-                         prompt_desc.c_str(), prefill_ms, p_tps, prefill_ms,
-                         decode_calls, decode_ms, d_tps, ms_per_tok,
-                         generated, e2e_tps, engine.position(), opts.max_seq_len);
-        } else {
-            std::fprintf(stderr,
-                         "[Prompt: %s in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Out: %d tok (0 decode steps) | Ctx: %d/%d]\n",
-                         prompt_desc.c_str(), prefill_ms, p_tps, prefill_ms,
-                         generated, engine.position(), opts.max_seq_len);
+            std::string prompt_desc;
+            if (cache_res.matched_prefix_tokens > 0) {
+                char pbuf[160];
+                std::snprintf(pbuf, sizeof(pbuf), "%d new + %d cached%s",
+                              total_turn_prompt_tokens, cache_res.matched_prefix_tokens,
+                              cache_res.restored_gdn_snapshot ? " (GDN restored)" : "");
+                prompt_desc = pbuf;
+            } else {
+                prompt_desc = std::to_string(total_turn_prompt_tokens) + " tok";
+            }
+            if (decode_calls > 0) {
+                const double d_tps = (decode_calls * 1000.0) / std::max(0.001, decode_ms);
+                const double ms_per_tok = decode_ms / decode_calls;
+                std::fprintf(stderr,
+                             "[Prompt: %s in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Decode: %d steps in %.1f ms (%.2f tok/s, %.2f ms/tok) | Out: %d tok (E2E %.2f tok/s) | Ctx: %d/%d]\n",
+                             prompt_desc.c_str(), total_turn_prefill_ms, p_tps, total_turn_prefill_ms,
+                             decode_calls, decode_ms, d_tps, ms_per_tok,
+                             generated, e2e_tps, engine.position(), opts.max_seq_len);
+            } else {
+                std::fprintf(stderr,
+                             "[Prompt: %s in %.1f ms (%.1f tok/s, TTFT %.1f ms) | Out: %d tok (0 decode steps) | Ctx: %d/%d]\n",
+                             prompt_desc.c_str(), total_turn_prefill_ms, p_tps, total_turn_prefill_ms,
+                             generated, engine.position(), opts.max_seq_len);
+            }
         }
     }
 
@@ -963,22 +1469,33 @@ int main(int argc, char** argv) {
         std::string save_rxr4_path;
         std::string prompt_cache_path;
         std::string save_prompt_cache_path;
+        std::vector<std::string> tools_files;
+        std::string tool_exec_cmd;
+        std::string reasoning_effort;
+        std::string server_host = "127.0.0.1";
+        std::string server_api_key;
+        int server_port = 8080;
         bool has_cli_prompt = false;
         bool has_prompt_file = false;
         bool interactive = false;
+        bool serve_mode = false;
         bool chat_flag_set = false;
         bool chat_flag_val = false;
         bool format_flag_set = false;
         bool format_flag_val = true;
+        bool think_flag_set = false;
         bool think_mode = false;
+        bool preserve_thinking = true;
+        bool enable_builtin_tools = false;
+        bool auto_approve = false;
+        int32_t max_tool_rounds = 16;
         bool run_bench = false;
         bool no_graph = false;
         bool ignore_eos = false;
         bool quiet = false;
-        bool has_max_tokens = false;
         bool has_max_seq_len = false;
         bool has_kv_dtype = false;
-        int32_t max_tokens = 256;
+        int32_t max_tokens = 0;
         int32_t max_seq_len = 4096;
         int32_t max_batch_tokens = 512;
         int32_t decode_attn_splits = 0;
@@ -1026,9 +1543,47 @@ int main(int argc, char** argv) {
                 format_flag_val = false;
             } else if (arg == "--think") {
                 think_mode = true;
+                think_flag_set = true;
+            } else if (arg == "--no-think") {
+                think_mode = false;
+                think_flag_set = true;
+            } else if (arg == "--reasoning-effort") {
+                reasoning_effort = need_val("--reasoning-effort");
+                if (reasoning_effort == "none") {
+                    think_mode = false;
+                    think_flag_set = true;
+                }
+            } else if (arg == "--preserve-thinking") {
+                preserve_thinking = true;
+            } else if (arg == "--no-preserve-thinking") {
+                preserve_thinking = false;
+            } else if (arg == "--tools") {
+                tools_files.push_back(expand_user_path(need_val("--tools")));
+            } else if (arg == "--builtin-tools") {
+                enable_builtin_tools = true;
+            } else if (arg == "--auto-approve") {
+                auto_approve = true;
+            } else if (arg == "--tool-exec") {
+                tool_exec_cmd = need_val("--tool-exec");
+            } else if (arg == "--max-tool-rounds") {
+                max_tool_rounds = std::max(1, std::stoi(need_val("--max-tool-rounds")));
+            } else if (arg == "--serve") {
+                serve_mode = true;
+            } else if (arg == "--host") {
+                server_host = need_val("--host");
+            } else if (arg == "--port") {
+                server_port = std::stoi(need_val("--port"));
+                if (server_port <= 0 || server_port > 65535) {
+                    throw std::runtime_error("--port must be in [1, 65535]");
+                }
+            } else if (arg == "--api-key") {
+                server_api_key = need_val("--api-key");
             } else if (arg == "--max-tokens") {
-                max_tokens = std::stoi(need_val("--max-tokens"));
-                has_max_tokens = true;
+                const int32_t v = std::stoi(need_val("--max-tokens"));
+                if (v < -1) {
+                    throw std::runtime_error("--max-tokens must be >= 0 (or -1 for unlimited)");
+                }
+                max_tokens = (v <= 0) ? 0 : v;
             } else if (arg == "--max-seq-len") {
                 max_seq_len = std::stoi(need_val("--max-seq-len"));
                 has_max_seq_len = true;
@@ -1084,6 +1639,35 @@ int main(int argc, char** argv) {
             print_usage(argv[0]);
             return 1;
         }
+        if (serve_mode && interactive) {
+            throw std::runtime_error("Cannot combine --serve and -i/--interactive");
+        }
+
+        std::vector<rxinfer::ToolFunctionDef> configured_tools;
+        auto add_unique_tools = [&](const std::vector<rxinfer::ToolFunctionDef>& defs) {
+            for (const auto& def : defs) {
+                auto it = std::find_if(configured_tools.begin(), configured_tools.end(),
+                                       [&](const rxinfer::ToolFunctionDef& e) { return e.name == def.name; });
+                if (it != configured_tools.end()) {
+                    *it = def;
+                } else {
+                    configured_tools.push_back(def);
+                }
+            }
+        };
+        if (enable_builtin_tools) {
+            add_unique_tools(rxinfer::tools::builtin_workspace_tools());
+        }
+        for (const auto& tf : tools_files) {
+            add_unique_tools(rxinfer::tools::load_tools_file(tf));
+        }
+
+        const bool tools_enabled = !configured_tools.empty();
+        if (!think_flag_set) {
+            if (serve_mode || tools_enabled) {
+                think_mode = true;
+            }
+        }
 
         std::string prompt_file_text;
         if (has_prompt_file) {
@@ -1101,17 +1685,13 @@ int main(int argc, char** argv) {
             prompt = cli_prompt;
         }
 
-        if (interactive && !has_max_tokens) {
-            max_tokens = 1024;
-        }
-        if (max_tokens < 1) {
-            throw std::runtime_error("--max-tokens must be >= 1");
-        }
-
-        const bool chat_mode = chat_flag_set ? chat_flag_val : interactive;
+        const bool chat_mode = chat_flag_set ? chat_flag_val : (interactive || serve_mode || tools_enabled);
         const bool stdout_is_tty = (::isatty(STDOUT_FILENO) != 0);
         const bool no_color_env = (std::getenv("NO_COLOR") != nullptr && std::getenv("NO_COLOR")[0] != '\0');
         const bool format_markdown = format_flag_set ? format_flag_val : (stdout_is_tty && !no_color_env);
+        const bool raw_flag_off = (format_flag_set && !format_flag_val);
+        const rxinfer::tui::UiTheme theme = rxinfer::tui::UiTheme::detect(!raw_flag_off);
+        const std::string model_display_name = rxinfer::tui::clean_model_display_name(model_path, "");
 
         const bool auto_prompt_cache = (prompt_cache_path == "auto");
         const std::string auto_cache_dir = auto_prompt_cache ? default_auto_cache_dir() : "";
@@ -1120,7 +1700,7 @@ int main(int argc, char** argv) {
         }
 
         const auto dev = rxinfer::query_device_info(0);
-        if (!quiet) {
+        if (!quiet && !theme.color) {
             std::fprintf(stderr, "rxinfer | GPU: %s (%s) | VRAM: %.2f GiB (%.2f GiB free) | WGPs: %d\n",
                          dev.name.c_str(), dev.gcn_arch_name.c_str(),
                          dev.total_vram_bytes / double(1ULL << 30),
@@ -1129,8 +1709,12 @@ int main(int argc, char** argv) {
         }
 
         const auto t_load0 = std::chrono::steady_clock::now();
+        rxinfer::tui::LoadProgressReporter load_prog(theme, !quiet && theme.tty_stderr, model_display_name);
         rxinfer::LoaderOptions lopts{};
         lopts.num_threads = threads;
+        if (!quiet && theme.tty_stderr) {
+            lopts.progress_cb = [&](size_t done, size_t total) { load_prog.update(done, total); };
+        }
 
         rxinfer::ModelWeights weights;
         rxinfer::Tokenizer tokenizer;
@@ -1147,7 +1731,7 @@ int main(int argc, char** argv) {
                 tokenizer_path = model_path + "/tokenizer.json";
             }
         } else if (ends_with(model_path, ".rxr4")) {
-            weights = rxinfer::load_from_rxr4(model_path);
+            weights = rxinfer::load_from_rxr4(model_path, lopts);
             if (tokenizer_path.empty()) {
                 const std::string stem = model_path.substr(0, model_path.size() - 5);
                 const std::string stem_tok = stem + ".tokenizer.json";
@@ -1182,11 +1766,12 @@ int main(int argc, char** argv) {
                 tokenizer.add_eos_id(eid);
             }
         }
+        load_prog.finish();
 
         const auto t_load1 = std::chrono::steady_clock::now();
         const double load_ms = std::chrono::duration<double, std::milli>(t_load1 - t_load0).count();
 
-        if (!quiet) {
+        if (!quiet && !theme.color) {
             std::fprintf(stderr,
                          "Loaded %s (%d layers, H=%d, V=%d, weights=%.2f GiB) in %.1f ms\n",
                          weights.config.model_type.empty() ? "model" : weights.config.model_type.c_str(),
@@ -1200,11 +1785,21 @@ int main(int argc, char** argv) {
             rxinfer::save_rxr4_checkpoint(weights, save_rxr4_path);
             const auto ts1 = std::chrono::steady_clock::now();
             if (!quiet) {
-                std::fprintf(stderr, "Saved RXR4 checkpoint to %s in %.1f ms\n",
-                             save_rxr4_path.c_str(),
-                             std::chrono::duration<double, std::milli>(ts1 - ts0).count());
+                if (theme.color) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg), "Saved RXR4 checkpoint to %s in %s",
+                                  save_rxr4_path.c_str(),
+                                  rxinfer::tui::format_duration_compact(
+                                      std::chrono::duration<double, std::milli>(ts1 - ts0).count())
+                                      .c_str());
+                    rxinfer::tui::print_status_badge(stderr, theme, "ok", msg);
+                } else {
+                    std::fprintf(stderr, "Saved RXR4 checkpoint to %s in %.1f ms\n",
+                                 save_rxr4_path.c_str(),
+                                 std::chrono::duration<double, std::milli>(ts1 - ts0).count());
+                }
             }
-            if (!has_prompt && !run_bench && !interactive) return 0;
+            if (!has_prompt && !run_bench && !interactive && !serve_mode) return 0;
         }
 
         // Auto-configure context length & KV dtype when omitted, matching explicit prompt caches too.
@@ -1230,13 +1825,16 @@ int main(int argc, char** argv) {
         const size_t safe_host_gtt =
             (host_total_b > 0) ? std::min(host_total_b * 45 / 100, host_avail_b * 60 / 100) : (8ULL << 30);
 
+        const int64_t gen_reserve =
+            (max_tokens > 0) ? static_cast<int64_t>(max_tokens) : (tools_enabled ? 16384 : 8192);
         if (!has_max_seq_len) {
-            if (interactive) {
+            if (interactive || serve_mode) {
                 max_seq_len = std::min<int32_t>(200000, model_max_pos);
-                if (has_explicit_cache_file && explicit_cache_info.position + max_tokens + 256 > max_seq_len) {
-                    max_seq_len = std::min<int32_t>(model_max_pos, explicit_cache_info.position + max_tokens + 256);
+                if (has_explicit_cache_file && explicit_cache_info.position + gen_reserve + 256 > max_seq_len) {
+                    max_seq_len = std::min<int32_t>(model_max_pos,
+                                                    static_cast<int32_t>(explicit_cache_info.position + gen_reserve + 256));
                 }
-                // Guard against tiny host RAM when auto-sizing interactive large context
+                // Guard against tiny host RAM when auto-sizing interactive/server large context
                 const rxinfer::DType probe_dt =
                     has_kv_dtype ? kv_dtype
                                  : ((weights.config.head_dim % 16 == 0) ? rxinfer::DType::FP4_E2M1_G16
@@ -1253,13 +1851,25 @@ int main(int argc, char** argv) {
                     max_seq_len = std::min(max_seq_len, safe_tok);
                 }
             } else if (has_prompt && tokenizer.loaded()) {
-                const std::string first_txt =
-                    chat_mode ? tokenizer.format_chat_turn(prompt, system_prompt, true, false, think_mode) : prompt;
+                std::string first_txt = prompt;
+                if (chat_mode) {
+                    rxinfer::ChatTemplateOptions sz_opts;
+                    sz_opts.add_generation_prompt = true;
+                    sz_opts.enable_thinking = think_mode;
+                    sz_opts.preserve_thinking = preserve_thinking;
+                    sz_opts.reasoning_effort = reasoning_effort;
+                    std::vector<rxinfer::ChatMessage> sz_msgs;
+                    if (!system_prompt.empty()) {
+                        sz_msgs.push_back(rxinfer::ChatMessage{"system", system_prompt, "", {}, "", ""});
+                    }
+                    sz_msgs.push_back(rxinfer::ChatMessage{"user", prompt, "", {}, "", ""});
+                    first_txt = tokenizer.format_chat_messages(sz_msgs, configured_tools, sz_opts);
+                }
                 const size_t p_toks =
                     encode_with_optional_bos(tokenizer, first_txt, tokenizer.should_add_bos()).size();
-                int64_t needed = static_cast<int64_t>(p_toks) + max_tokens + 512;
+                int64_t needed = static_cast<int64_t>(p_toks) + gen_reserve + 512;
                 if (has_explicit_cache_file) {
-                    needed = std::max<int64_t>(needed, static_cast<int64_t>(explicit_cache_info.position) + max_tokens + 256);
+                    needed = std::max<int64_t>(needed, static_cast<int64_t>(explicit_cache_info.position) + gen_reserve + 256);
                 }
                 const int64_t aligned = static_cast<int64_t>(rxinfer::align_up(std::max<int64_t>(8192, needed), 4096));
                 max_seq_len = static_cast<int32_t>(std::min<int64_t>(model_max_pos, aligned));
@@ -1297,17 +1907,31 @@ int main(int argc, char** argv) {
         max_seq_len = engine.options().max_seq_len;
 
         if (!quiet) {
-            std::fprintf(stderr,
-                         "Total allocated VRAM: %.2f GiB | KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | kv=%s%s | hipGraph=%s | max_seq=%d%s | batch=%d\n",
-                         engine.total_vram_used_bytes() / double(1ULL << 30),
-                         engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
-                         engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
-                         std::string(rxinfer::dtype_name(kv_dtype)).c_str(),
-                         (has_kv_dtype || has_explicit_cache_file) ? "" : " (auto)",
-                         eopts.enable_hip_graph ? "on" : "off",
-                         max_seq_len,
-                         has_max_seq_len ? "" : " (auto)",
-                         engine.options().max_batch_tokens);
+            if (!theme.color) {
+                std::fprintf(stderr,
+                             "Total allocated VRAM: %.2f GiB | KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | kv=%s%s | hipGraph=%s | max_seq=%d%s | batch=%d\n",
+                             engine.total_vram_used_bytes() / double(1ULL << 30),
+                             engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
+                             engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
+                             std::string(rxinfer::dtype_name(kv_dtype)).c_str(),
+                             (has_kv_dtype || has_explicit_cache_file) ? "" : " (auto)",
+                             eopts.enable_hip_graph ? "on" : "off",
+                             max_seq_len,
+                             has_max_seq_len ? "" : " (auto)",
+                             engine.options().max_batch_tokens);
+            } else if (!interactive) {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg),
+                              "%s · %s · VRAM %.2f GiB · ctx %s%s · KV %s · loaded in %s",
+                              model_display_name.c_str(),
+                              dev.gcn_arch_name.c_str(),
+                              engine.total_vram_used_bytes() / double(1ULL << 30),
+                              rxinfer::tui::format_tokens_compact(max_seq_len).c_str(),
+                              has_max_seq_len ? "" : " auto",
+                              std::string(rxinfer::dtype_name(kv_dtype)).c_str(),
+                              rxinfer::tui::format_duration_compact(load_ms).c_str());
+                rxinfer::tui::print_status_badge(stderr, theme, "ok", msg);
+            }
         }
 
         if (run_bench) {
@@ -1319,12 +1943,12 @@ int main(int argc, char** argv) {
                          "Benchmark | prefill(%d)=%.1f tok/s (%.1f ms) | decode(M=1)=%.2f tok/s (%.2f ms/tok) | verify(M=4)=%.2f tok/s\n",
                          pre_len, pre.tok_per_sec, pre.elapsed_ms,
                          dec.tok_per_sec, dec.ms_per_tok, ver4.tok_per_sec);
-            if (!has_prompt && !interactive) return 0;
+            if (!has_prompt && !interactive && !serve_mode) return 0;
             engine.reset_state();
         }
 
-        if (!has_prompt && !interactive) {
-            std::fprintf(stderr, "Nothing to run: pass -i/--interactive, --prompt, --bench, or --save-rxr4.\n");
+        if (!has_prompt && !interactive && !serve_mode) {
+            std::fprintf(stderr, "Nothing to run: pass -i/--interactive, --serve, --prompt, --bench, or --save-rxr4.\n");
             return 1;
         }
         if (!tokenizer.loaded()) {
@@ -1336,6 +1960,7 @@ int main(int argc, char** argv) {
         TurnOptions topts;
         topts.chat_mode = chat_mode;
         topts.think_mode = think_mode;
+        topts.preserve_thinking = preserve_thinking;
         topts.format_markdown = format_markdown;
         topts.ignore_eos = ignore_eos;
         topts.quiet = quiet;
@@ -1343,8 +1968,15 @@ int main(int argc, char** argv) {
         topts.auto_prompt_cache = auto_prompt_cache;
         topts.max_tokens = max_tokens;
         topts.max_seq_len = max_seq_len;
+        topts.max_tool_rounds = max_tool_rounds;
         topts.system_prompt = system_prompt;
+        topts.reasoning_effort = reasoning_effort;
         topts.auto_cache_dir = auto_cache_dir;
+        topts.model_display_name = model_display_name;
+        topts.tools = std::move(configured_tools);
+        topts.tool_exec.allow_mutating = auto_approve;
+        topts.tool_exec.external_exec_cmd = tool_exec_cmd;
+        topts.theme = theme;
         if (!interactive && has_prompt_file && has_cli_prompt) {
             topts.shared_doc_prefix = prompt_file_text;
         }
@@ -1362,15 +1994,28 @@ int main(int argc, char** argv) {
             const int32_t loaded_pos = engine.load_prompt_cache(prompt_cache_path);
             const auto tlc1 = std::chrono::steady_clock::now();
             if (!quiet) {
-                std::fprintf(stderr, "Loaded prompt cache from %s (%d tok) in %.1f ms\n",
-                             prompt_cache_path.c_str(), loaded_pos,
-                             std::chrono::duration<double, std::milli>(tlc1 - tlc0).count());
+                if (theme.color) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg), "Loaded prompt cache · %s tok in %s",
+                                  rxinfer::tui::format_tokens_compact(loaded_pos).c_str(),
+                                  rxinfer::tui::format_duration_compact(
+                                      std::chrono::duration<double, std::milli>(tlc1 - tlc0).count())
+                                      .c_str());
+                    rxinfer::tui::print_status_badge(stderr, theme, "info", msg);
+                } else {
+                    std::fprintf(stderr, "Loaded prompt cache from %s (%d tok) in %.1f ms\n",
+                                 prompt_cache_path.c_str(), loaded_pos,
+                                 std::chrono::duration<double, std::milli>(tlc1 - tlc0).count());
+                }
             }
             if (loaded_pos > 0) {
+                if (serve_mode && engine.position() >= 8) {
+                    engine.save_prefix_checkpoint(false);
+                }
                 bool continue_loaded_turn = interactive;
                 if (!interactive && has_prompt) {
                     const std::string first_text =
-                        chat_mode ? tokenizer.format_chat_turn(prompt, system_prompt, true, false, think_mode) : prompt;
+                        chat_mode ? format_first_turn_prompt(tokenizer, prompt, topts) : prompt;
                     const std::vector<int32_t> first_ids =
                         encode_with_optional_bos(tokenizer, first_text, tokenizer.should_add_bos());
                     const auto& cached = engine.cached_tokens();
@@ -1394,6 +2039,26 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (serve_mode) {
+            install_interactive_sigint();
+            rxinfer::server::ServerOptions srv_opts;
+            srv_opts.host = server_host;
+            srv_opts.port = server_port;
+            srv_opts.api_key = server_api_key;
+            srv_opts.model_id = model_display_name;
+            srv_opts.default_tools = topts.tools;
+            srv_opts.default_system_prompt = system_prompt;
+            srv_opts.default_enable_thinking = think_mode;
+            srv_opts.default_preserve_thinking = preserve_thinking;
+            srv_opts.default_reasoning_effort = reasoning_effort;
+            srv_opts.default_max_tokens = max_tokens;
+            srv_opts.ignore_eos = ignore_eos;
+            srv_opts.quiet = quiet;
+            srv_opts.stop_flag = &g_interrupted;
+            srv_opts.theme = theme;
+            return rxinfer::server::run_openai_server(engine, tokenizer, sampler_cfg, srv_opts);
+        }
+
         const bool stdin_is_tty = (::isatty(STDIN_FILENO) != 0);
         const bool stderr_is_tty = (::isatty(STDERR_FILENO) != 0);
 
@@ -1402,16 +2067,74 @@ int main(int argc, char** argv) {
             if (!quiet) {
                 const char* tpl_name =
                     chat_mode ? rxinfer::Tokenizer::chat_format_name(tokenizer.detect_chat_format()) : "raw";
-                std::fprintf(stderr,
-                             "Interactive chat ready | template=%s | format=%s | think=%s | temp=%.2f top_k=%d top_p=%.2f rep=%.2f | max_tokens=%d | cache=%s\n"
-                             "Type your message, /file <path> to attach large files, /help for commands, /quit or Ctrl-D to exit.\n",
-                             tpl_name,
-                             topts.format_markdown ? "markdown" : "raw",
-                             topts.think_mode ? "on" : "off",
-                             sampler.config().temperature, sampler.config().top_k,
-                             sampler.config().top_p, sampler.config().repeat_penalty,
-                             topts.max_tokens,
-                             auto_prompt_cache ? "auto" : (prompt_cache_path.empty() ? "in-mem LCP" : prompt_cache_path.c_str()));
+                const std::string max_tok_str =
+                    (topts.max_tokens > 0) ? std::to_string(topts.max_tokens) : "unlimited";
+                const char* cache_desc =
+                    auto_prompt_cache ? "auto" : (prompt_cache_path.empty() ? "in-mem LCP" : prompt_cache_path.c_str());
+                const std::string tools_desc =
+                    topts.tools.empty()
+                        ? "off"
+                        : (std::to_string(topts.tools.size()) + " (" +
+                           std::string(topts.tool_exec.allow_mutating ? "auto-approve" : "confirm-mutating") + ")");
+
+                if (theme.color) {
+                    const auto& c = engine.config();
+                    char r_model[256], r_dev[256], r_ctx[256], r_chat[320];
+                    std::snprintf(r_model, sizeof(r_model), "%s · %dL H=%d · %.2f GiB · loaded in %s",
+                                  c.model_type.empty() ? "model" : c.model_type.c_str(),
+                                  c.num_hidden_layers, c.hidden_size,
+                                  engine.weights().weight_arena.used() / double(1ULL << 30),
+                                  rxinfer::tui::format_duration_compact(load_ms).c_str());
+                    std::snprintf(r_dev, sizeof(r_dev), "%s (%s) · %d WGPs · %.2f / %.2f GiB VRAM",
+                                  dev.name.c_str(), dev.gcn_arch_name.c_str(),
+                                  dev.multiprocessor_count,
+                                  engine.total_vram_used_bytes() / double(1ULL << 30),
+                                  dev.total_vram_bytes / double(1ULL << 30));
+                    std::snprintf(r_ctx, sizeof(r_ctx),
+                                  "%s tok%s · KV %s (%.2f GiB VRAM + %.2f GiB GTT) · hipGraph %s",
+                                  rxinfer::tui::format_tokens_compact(max_seq_len).c_str(),
+                                  has_max_seq_len ? "" : " auto",
+                                  std::string(rxinfer::dtype_name(kv_dtype)).c_str(),
+                                  engine.kv_vram_bytes() / double(1ULL << 30),
+                                  engine.kv_gtt_bytes() / double(1ULL << 30),
+                                  eopts.enable_hip_graph ? "on" : "off");
+                    std::snprintf(r_chat, sizeof(r_chat),
+                                  "%s · %s · think %s · tools %s · temp %.2f · max %s · cache %s",
+                                  tpl_name,
+                                  topts.format_markdown ? "markdown" : "raw",
+                                  topts.think_mode ? "on" : "off",
+                                  tools_desc.c_str(),
+                                  sampler.config().temperature,
+                                  max_tok_str.c_str(),
+                                  cache_desc);
+
+                    std::vector<std::pair<std::string, std::string>> rows = {
+                        {"Model", r_model},
+                        {"Device", r_dev},
+                        {"Context", r_ctx},
+                        {"Chat", r_chat},
+                        {"Controls",
+                         std::string(theme.muted()) +
+                             "Tab complete · ↑↓ history · Alt+Enter newline · /tools · /file · /help" +
+                             theme.reset()},
+                    };
+                    const std::string title = std::string(theme.accent()) + "◆" + theme.reset() + " " +
+                                              theme.bold() + "rxinfer" + theme.reset() + " " +
+                                              theme.muted() + model_display_name + theme.reset();
+                    rxinfer::tui::print_box_card(stderr, theme, title, rows, 92);
+                } else {
+                    std::fprintf(stderr,
+                                 "Interactive chat ready | template=%s | format=%s | think=%s | tools=%s | temp=%.2f top_k=%d top_p=%.2f rep=%.2f | max_tokens=%s | cache=%s\n"
+                                 "Type your message, /file <path> to attach large files, /help for commands, /quit or Ctrl-D to exit.\n",
+                                 tpl_name,
+                                 topts.format_markdown ? "markdown" : "raw",
+                                 topts.think_mode ? "on" : "off",
+                                 tools_desc.c_str(),
+                                 sampler.config().temperature, sampler.config().top_k,
+                                 sampler.config().top_p, sampler.config().repeat_penalty,
+                                 max_tok_str.c_str(),
+                                 cache_desc);
+                }
             }
         }
 
@@ -1421,6 +2144,15 @@ int main(int argc, char** argv) {
         }
 
         BracketedPasteGuard paste_guard(interactive && stdin_is_tty && stderr_is_tty);
+        rxinfer::tui::InteractiveLineEditor editor(build_interactive_commands());
+
+        auto badge = [&](const char* kind, const std::string& styled_msg, const std::string& plain_msg) {
+            if (theme.color) {
+                rxinfer::tui::print_status_badge(stderr, theme, kind, styled_msg);
+            } else {
+                std::fprintf(stderr, "%s\n", plain_msg.c_str());
+            }
+        };
 
         std::string pending_multiline;
         std::string line;
@@ -1429,71 +2161,91 @@ int main(int argc, char** argv) {
         std::string block_end_marker;
 
         while (true) {
-            if (!quiet && !in_bracketed_paste) {
-                if (pending_multiline.empty() && !in_block_paste) {
-                    if (!state.pending_attachments.empty()) {
-                        std::fprintf(stderr, "\n[%zu attachment(s) ready]> ", state.pending_attachments.size());
-                    } else {
-                        std::fprintf(stderr, "\n> ");
-                    }
-                } else {
-                    std::fprintf(stderr, ".. ");
+            if (stdin_is_tty && stderr_is_tty && !in_block_paste && pending_multiline.empty()) {
+                if (!quiet) {
+                    std::fputc('\n', stderr);
+                    std::fflush(stderr);
                 }
-                std::fflush(stderr);
-            }
-
-            g_interrupted = 0;
-            if (!std::getline(std::cin, line)) {
-                if (g_interrupted) {
+                g_interrupted = 0;
+                const auto st = editor.read_line(theme, static_cast<int>(state.pending_attachments.size()), line);
+                if (st == rxinfer::tui::InteractiveLineEditor::Status::Interrupted) {
                     g_interrupted = 0;
                     pending_multiline.clear();
                     in_bracketed_paste = false;
                     in_block_paste = false;
-                    std::cin.clear();
-                    std::fprintf(stderr, "\n");
                     continue;
                 }
-                if (!pending_multiline.empty()) {
-                    const std::string final_msg = pending_multiline;
-                    pending_multiline.clear();
-                    run_turn(engine, tokenizer, sampler, state, final_msg, topts, logits_f16_scratch);
+                if (st == rxinfer::tui::InteractiveLineEditor::Status::Eof) {
+                    break;
                 }
-                break;
-            }
-
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-
-            // Detect bracketed paste escape sequences from terminal emulators (\x1b[200~ ... \x1b[201~)
-            if (stdin_is_tty) {
-                const bool saw_start = (line.find("\x1b[200~") != std::string::npos);
-                const bool saw_end = (line.find("\x1b[201~") != std::string::npos);
-                if (saw_start || in_bracketed_paste) {
-                    strip_all_substr(line, "\x1b[200~");
-                    strip_all_substr(line, "\x1b[201~");
-                    if (saw_start && !saw_end) {
-                        in_bracketed_paste = true;
-                        pending_multiline += line;
-                        pending_multiline.push_back('\n');
-                        continue;
-                    }
-                    if (in_bracketed_paste && !saw_end) {
-                        pending_multiline += line;
-                        pending_multiline.push_back('\n');
-                        continue;
-                    }
-                    in_bracketed_paste = false;
-                    if (!pending_multiline.empty()) {
-                        pending_multiline += line;
-                        std::string pasted = std::move(pending_multiline);
-                        pending_multiline.clear();
-                        if (!pasted.empty()) {
-                            run_turn(engine, tokenizer, sampler, state, pasted, topts, logits_f16_scratch);
+            } else {
+                if (!quiet && !in_bracketed_paste) {
+                    if (pending_multiline.empty() && !in_block_paste) {
+                        if (!state.pending_attachments.empty()) {
+                            std::fprintf(stderr, "\n[%zu attachment(s) ready]> ", state.pending_attachments.size());
+                        } else {
+                            std::fprintf(stderr, "\n> ");
                         }
+                    } else {
+                        std::fprintf(stderr, ".. ");
+                    }
+                    std::fflush(stderr);
+                }
+
+                g_interrupted = 0;
+                if (!std::getline(std::cin, line)) {
+                    if (g_interrupted) {
+                        g_interrupted = 0;
+                        pending_multiline.clear();
+                        in_bracketed_paste = false;
+                        in_block_paste = false;
+                        std::cin.clear();
+                        std::fprintf(stderr, "\n");
                         continue;
                     }
-                    // Single-line paste falls through cleanly
+                    if (!pending_multiline.empty()) {
+                        const std::string final_msg = pending_multiline;
+                        pending_multiline.clear();
+                        run_turn(engine, tokenizer, sampler, state, final_msg, topts, logits_f16_scratch);
+                    }
+                    break;
+                }
+
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+
+                // Detect bracketed paste escape sequences from terminal emulators (\x1b[200~ ... \x1b[201~)
+                if (stdin_is_tty) {
+                    const bool saw_start = (line.find("\x1b[200~") != std::string::npos);
+                    const bool saw_end = (line.find("\x1b[201~") != std::string::npos);
+                    if (saw_start || in_bracketed_paste) {
+                        strip_all_substr(line, "\x1b[200~");
+                        strip_all_substr(line, "\x1b[201~");
+                        if (saw_start && !saw_end) {
+                            in_bracketed_paste = true;
+                            pending_multiline += line;
+                            pending_multiline.push_back('\n');
+                            continue;
+                        }
+                        if (in_bracketed_paste && !saw_end) {
+                            pending_multiline += line;
+                            pending_multiline.push_back('\n');
+                            continue;
+                        }
+                        in_bracketed_paste = false;
+                        if (!pending_multiline.empty()) {
+                            pending_multiline += line;
+                            std::string pasted = std::move(pending_multiline);
+                            pending_multiline.clear();
+                            if (!pasted.empty()) {
+                                editor.add_history(pasted);
+                                run_turn(engine, tokenizer, sampler, state, pasted, topts, logits_f16_scratch);
+                            }
+                            continue;
+                        }
+                        // Single-line paste falls through cleanly
+                    }
                 }
             }
 
@@ -1505,6 +2257,7 @@ int main(int argc, char** argv) {
                     pending_multiline.clear();
                     if (!full_block.empty() && full_block.back() == '\n') full_block.pop_back();
                     if (!full_block.empty()) {
+                        editor.add_history(full_block);
                         run_turn(engine, tokenizer, sampler, state, full_block, topts, logits_f16_scratch);
                     }
                 } else {
@@ -1521,8 +2274,9 @@ int main(int argc, char** argv) {
                     block_end_marker = (trimmed_line == "\"\"\"") ? "\"\"\"" : "/end";
                     pending_multiline.clear();
                     if (!quiet) {
-                        std::fprintf(stderr, "[Multi-line mode: paste or type lines, end with '%s']\n",
-                                     block_end_marker.c_str());
+                        badge("info",
+                              "Multi-line mode — paste or type lines, end with '" + block_end_marker + "'",
+                              "[Multi-line mode: paste or type lines, end with '" + block_end_marker + "']");
                     }
                     continue;
                 }
@@ -1551,6 +2305,7 @@ int main(int argc, char** argv) {
             pending_multiline.clear();
 
             if (full_input.empty() && state.pending_attachments.empty()) continue;
+            if (!full_input.empty()) editor.add_history(full_input);
 
             // Escape leading slash with "\/..." to send literal slash text.
             if (full_input.size() >= 2 && full_input[0] == '\\' && full_input[1] == '/') {
@@ -1565,18 +2320,23 @@ int main(int argc, char** argv) {
                     if (cmd == "/quit" || cmd == "/exit" || cmd == "/q") {
                         break;
                     } else if (cmd == "/help" || cmd == "/?") {
-                        print_interactive_help();
+                        print_interactive_help(theme);
                     } else if (cmd == "/file" || cmd == "/attach") {
                         std::string fpath, fquestion;
                         if (!parse_file_command_args(arg, fpath, fquestion)) {
-                            std::fprintf(stderr, "Usage: /file <path> [optional prompt]\n");
+                            badge("info", "Usage: /file <path> [optional prompt]", "Usage: /file <path> [optional prompt]");
                         } else {
                             std::string content = read_text_file(fpath);
                             const size_t nlines = std::count(content.begin(), content.end(), '\n') + (content.empty() ? 0 : 1);
                             state.pending_attachments.push_back({fpath, std::move(content)});
-                            std::fprintf(stderr, "[Attached %s (%zu lines) from %s]\n",
-                                         format_byte_size(state.pending_attachments.back().content.size()).c_str(),
-                                         nlines, fpath.c_str());
+                            char mbuf[512], pbuf[512];
+                            std::snprintf(mbuf, sizeof(mbuf), "Attached %s (%zu lines) from %s",
+                                          format_byte_size(state.pending_attachments.back().content.size()).c_str(),
+                                          nlines, fpath.c_str());
+                            std::snprintf(pbuf, sizeof(pbuf), "[Attached %s (%zu lines) from %s]",
+                                          format_byte_size(state.pending_attachments.back().content.size()).c_str(),
+                                          nlines, fpath.c_str());
+                            badge("ok", mbuf, pbuf);
                             if (!fquestion.empty()) {
                                 run_turn(engine, tokenizer, sampler, state, fquestion, topts, logits_f16_scratch);
                             }
@@ -1584,7 +2344,7 @@ int main(int argc, char** argv) {
                     } else if (cmd == "/undo") {
                         const int32_t steps = arg.empty() ? 1 : std::max(1, std::stoi(arg));
                         if (state.history.empty()) {
-                            std::fprintf(stderr, "[Nothing to undo]\n");
+                            badge("info", "Nothing to undo", "[Nothing to undo]");
                         } else {
                             const int32_t actual = std::min<int32_t>(steps, static_cast<int32_t>(state.history.size()));
                             TurnRecord target = state.history[state.history.size() - actual];
@@ -1592,20 +2352,30 @@ int main(int argc, char** argv) {
                             const auto t0 = std::chrono::steady_clock::now();
                             const bool fast = engine.restore_prefix(target.tokens_before);
                             const auto t1 = std::chrono::steady_clock::now();
+                            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                             state.pending_tokens = std::move(target.pending_before);
                             state.is_first_turn = target.was_first_turn;
                             state.close_previous_turn = target.was_close_previous;
+                            if (target.messages_count_before <= state.messages.size()) {
+                                state.messages.resize(target.messages_count_before);
+                            }
+                            state.next_tool_call_id = target.next_tool_call_id_before;
                             state.pending_attachments.clear();
                             sampler.clear_history();
                             sampler.record_tokens(engine.cached_tokens());
-                            std::fprintf(stderr, "[Rewound %d turn(s) to ctx=%d/%d in %.1f ms%s]\n",
-                                         actual, engine.position(), topts.max_seq_len,
-                                         std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                                         fast ? " (cached snapshot)" : " (replayed prefix)");
+                            char mbuf[256], pbuf[256];
+                            std::snprintf(mbuf, sizeof(mbuf), "Rewound %d turn(s) · ctx %d/%d · %s (%s)",
+                                          actual, engine.position(), topts.max_seq_len,
+                                          rxinfer::tui::format_duration_compact(ms).c_str(),
+                                          fast ? "cached snapshot" : "replayed prefix");
+                            std::snprintf(pbuf, sizeof(pbuf), "[Rewound %d turn(s) to ctx=%d/%d in %.1f ms%s]",
+                                          actual, engine.position(), topts.max_seq_len, ms,
+                                          fast ? " (cached snapshot)" : " (replayed prefix)");
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/retry") {
                         if (state.history.empty()) {
-                            std::fprintf(stderr, "[Nothing to retry]\n");
+                            badge("info", "Nothing to retry", "[Nothing to retry]");
                         } else {
                             TurnRecord last = std::move(state.history.back());
                             state.history.pop_back();
@@ -1613,6 +2383,10 @@ int main(int argc, char** argv) {
                             state.pending_tokens = std::move(last.pending_before);
                             state.is_first_turn = last.was_first_turn;
                             state.close_previous_turn = last.was_close_previous;
+                            if (last.messages_count_before <= state.messages.size()) {
+                                state.messages.resize(last.messages_count_before);
+                            }
+                            state.next_tool_call_id = last.next_tool_call_id_before;
                             state.pending_attachments.clear();
                             sampler.clear_history();
                             sampler.record_tokens(engine.cached_tokens());
@@ -1620,42 +2394,61 @@ int main(int argc, char** argv) {
                         }
                     } else if (cmd == "/reset" || cmd == "/clear") {
                         state.reset_conversation(engine, sampler);
-                        std::fprintf(stderr, "[Conversation reset. Context 0 / %d (LCP snapshots=%d)]\n",
-                                     topts.max_seq_len, engine.num_prefix_checkpoints());
+                        char mbuf[192], pbuf[192];
+                        std::snprintf(mbuf, sizeof(mbuf), "Conversation reset · ctx 0/%s (%d LCP snapshot%s)",
+                                      rxinfer::tui::format_tokens_compact(topts.max_seq_len).c_str(),
+                                      engine.num_prefix_checkpoints(),
+                                      engine.num_prefix_checkpoints() == 1 ? "" : "s");
+                        std::snprintf(pbuf, sizeof(pbuf), "[Conversation reset. Context 0 / %d (LCP snapshots=%d)]",
+                                      topts.max_seq_len, engine.num_prefix_checkpoints());
+                        badge("ok", mbuf, pbuf);
                     } else if (cmd == "/save-cache") {
                         const std::string target = arg.empty() ? (auto_prompt_cache ? "" : prompt_cache_path) : expand_user_path(arg);
                         if (target.empty()) {
                             if (engine.position() <= 0) {
-                                std::fprintf(stderr, "[Nothing to save; context is empty]\n");
+                                badge("info", "Nothing to save — context is empty", "[Nothing to save; context is empty]");
                             } else {
                                 const std::string dir = auto_cache_dir.empty() ? default_auto_cache_dir() : auto_cache_dir;
                                 const auto t0 = std::chrono::steady_clock::now();
                                 const std::string saved = save_to_auto_cache(dir, engine, false);
                                 const auto t1 = std::chrono::steady_clock::now();
+                                const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                                 if (!saved.empty()) {
-                                    std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
-                                                 engine.position(), saved.c_str(),
-                                                 std::chrono::duration<double, std::milli>(t1 - t0).count());
+                                    char mbuf[512], pbuf[512];
+                                    std::snprintf(mbuf, sizeof(mbuf), "Saved prompt cache (%d tok) to %s in %s",
+                                                  engine.position(), saved.c_str(),
+                                                  rxinfer::tui::format_duration_compact(ms).c_str());
+                                    std::snprintf(pbuf, sizeof(pbuf), "[Saved prompt cache (%d tok) to %s in %.1f ms]",
+                                                  engine.position(), saved.c_str(), ms);
+                                    badge("ok", mbuf, pbuf);
                                 }
                             }
                         } else {
                             const auto t0 = std::chrono::steady_clock::now();
                             engine.save_prompt_cache(target);
                             const auto t1 = std::chrono::steady_clock::now();
-                            std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
-                                         engine.position(), target.c_str(),
-                                         std::chrono::duration<double, std::milli>(t1 - t0).count());
+                            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                            char mbuf[512], pbuf[512];
+                            std::snprintf(mbuf, sizeof(mbuf), "Saved prompt cache (%d tok) to %s in %s",
+                                          engine.position(), target.c_str(),
+                                          rxinfer::tui::format_duration_compact(ms).c_str());
+                            std::snprintf(pbuf, sizeof(pbuf), "[Saved prompt cache (%d tok) to %s in %.1f ms]",
+                                          engine.position(), target.c_str(), ms);
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/load-cache") {
                         const std::string target = arg.empty() ? (auto_prompt_cache ? "" : prompt_cache_path) : expand_user_path(arg);
                         if (target.empty()) {
-                            std::fprintf(stderr, "Usage: /load-cache <path>\n");
+                            badge("info", "Usage: /load-cache <path>", "Usage: /load-cache <path>");
                         } else {
                             const auto t0 = std::chrono::steady_clock::now();
                             const int32_t loaded_pos = engine.load_prompt_cache(target);
                             const auto t1 = std::chrono::steady_clock::now();
+                            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                             state.pending_tokens.clear();
                             state.pending_attachments.clear();
+                            state.messages.clear();
+                            state.next_tool_call_id = 1;
                             state.history.clear();
                             state.is_first_turn = (loaded_pos == 0);
                             state.close_previous_turn = false;
@@ -1667,133 +2460,390 @@ int main(int argc, char** argv) {
                             }
                             sampler.clear_history();
                             sampler.record_tokens(engine.cached_tokens());
-                            std::fprintf(stderr, "[Loaded prompt cache (%d tok) from %s in %.1f ms]\n",
-                                         loaded_pos, target.c_str(),
-                                         std::chrono::duration<double, std::milli>(t1 - t0).count());
+                            char mbuf[512], pbuf[512];
+                            std::snprintf(mbuf, sizeof(mbuf), "Loaded prompt cache (%d tok) from %s in %s",
+                                          loaded_pos, target.c_str(),
+                                          rxinfer::tui::format_duration_compact(ms).c_str());
+                            std::snprintf(pbuf, sizeof(pbuf), "[Loaded prompt cache (%d tok) from %s in %.1f ms]",
+                                          loaded_pos, target.c_str(), ms);
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/cache") {
-                        std::fprintf(stderr,
-                                     "[Cache] Live ctx: %d/%d tok | Snapshots: %d | KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | Mode: %s\n",
-                                     engine.position(), topts.max_seq_len,
-                                     engine.num_prefix_checkpoints(),
-                                     engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
-                                     engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
-                                     auto_prompt_cache
-                                         ? ("auto (" + auto_cache_dir + ")").c_str()
-                                         : (prompt_cache_path.empty() ? "in-mem LCP" : prompt_cache_path.c_str()));
+                        const std::string mode_str =
+                            auto_prompt_cache ? ("auto (" + auto_cache_dir + ")")
+                                              : (prompt_cache_path.empty() ? "in-mem LCP" : prompt_cache_path);
+                        if (theme.color) {
+                            const double ctx_frac =
+                                static_cast<double>(engine.position()) / static_cast<double>(std::max(1, topts.max_seq_len));
+                            char r_ctx[256], r_kv[256], r_snap[128];
+                            std::snprintf(r_ctx, sizeof(r_ctx), "%s  %s%d / %d tok%s (%.1f%%)",
+                                          rxinfer::tui::render_progress_bar(ctx_frac, 18, theme).c_str(),
+                                          theme.bold(), engine.position(), topts.max_seq_len, theme.reset(),
+                                          ctx_frac * 100.0);
+                            std::snprintf(r_kv, sizeof(r_kv), "VRAM %.2f GiB (%s tok) + GTT %.2f GiB (%s tok)",
+                                          engine.kv_vram_bytes() / double(1ULL << 30),
+                                          rxinfer::tui::format_tokens_compact(engine.vram_kv_tokens()).c_str(),
+                                          engine.kv_gtt_bytes() / double(1ULL << 30),
+                                          rxinfer::tui::format_tokens_compact(engine.gtt_kv_tokens()).c_str());
+                            std::snprintf(r_snap, sizeof(r_snap), "%d in-memory checkpoint%s",
+                                          engine.num_prefix_checkpoints(),
+                                          engine.num_prefix_checkpoints() == 1 ? "" : "s");
+                            std::vector<std::pair<std::string, std::string>> rows = {
+                                {"Live ctx", r_ctx},
+                                {"Snapshots", r_snap},
+                                {"KV Pool", r_kv},
+                                {"Mode", mode_str},
+                            };
+                            std::fprintf(stderr, "\n");
+                            const std::string title = std::string(theme.accent()) + "◆" + theme.reset() + " " +
+                                                      theme.bold() + "Prompt Cache" + theme.reset();
+                            rxinfer::tui::print_box_card(stderr, theme, title, rows, 90);
+                            std::fprintf(stderr, "\n");
+                        } else {
+                            std::fprintf(stderr,
+                                         "[Cache] Live ctx: %d/%d tok | Snapshots: %d | KV Pool: VRAM=%.2f GiB (%d tok) + GTT=%.2f GiB (%d tok) | Mode: %s\n",
+                                         engine.position(), topts.max_seq_len,
+                                         engine.num_prefix_checkpoints(),
+                                         engine.kv_vram_bytes() / double(1ULL << 30), engine.vram_kv_tokens(),
+                                         engine.kv_gtt_bytes() / double(1ULL << 30), engine.gtt_kv_tokens(),
+                                         mode_str.c_str());
+                        }
                     } else if (cmd == "/clear-cache") {
                         engine.clear_prefix_cache();
-                        std::fprintf(stderr, "[Cleared in-memory GDN prefix checkpoints]\n");
+                        badge("ok", "Cleared in-memory GDN prefix checkpoints", "[Cleared in-memory GDN prefix checkpoints]");
                     } else if (cmd == "/stats") {
-                        print_session_stats(state, engine, sampler);
+                        print_session_stats(state, engine, sampler, theme);
                     } else if (cmd == "/format") {
                         if (arg == "on" || arg == "1" || arg == "true" || arg == "markdown") topts.format_markdown = true;
                         else if (arg == "off" || arg == "0" || arg == "false" || arg == "raw") topts.format_markdown = false;
                         else if (arg.empty()) topts.format_markdown = !topts.format_markdown;
                         else {
-                            std::fprintf(stderr, "Usage: /format [on|off]\n");
+                            badge("info", "Usage: /format [on|off]", "Usage: /format [on|off]");
                             continue;
                         }
-                        std::fprintf(stderr, "[Output formatting: %s]\n",
-                                     topts.format_markdown ? "markdown" : "raw");
+                        badge("ok",
+                              std::string("Output formatting: ") + (topts.format_markdown ? "markdown" : "raw"),
+                              std::string("[Output formatting: ") + (topts.format_markdown ? "markdown]" : "raw]"));
                     } else if (cmd == "/think") {
                         if (arg == "on" || arg == "1" || arg == "true") topts.think_mode = true;
                         else if (arg == "off" || arg == "0" || arg == "false") topts.think_mode = false;
                         else if (arg.empty()) topts.think_mode = !topts.think_mode;
                         else {
-                            std::fprintf(stderr, "Usage: /think [on|off]\n");
+                            badge("info", "Usage: /think [on|off]", "Usage: /think [on|off]");
                             continue;
                         }
-                        std::fprintf(stderr, "[Thinking mode: %s]\n", topts.think_mode ? "on" : "off");
+                        badge("ok",
+                              std::string("Thinking mode: ") + (topts.think_mode ? "on" : "off"),
+                              std::string("[Thinking mode: ") + (topts.think_mode ? "on]" : "off]"));
+                    } else if (cmd == "/tools") {
+                        const size_t sp2 = arg.find_first_of(" \t");
+                        const std::string sub = (sp2 == std::string::npos) ? arg : arg.substr(0, sp2);
+                        const std::string subarg = (sp2 == std::string::npos) ? "" : trim_ws(arg.substr(sp2 + 1));
+                        auto merge_tools = [&](const std::vector<rxinfer::ToolFunctionDef>& defs) {
+                            for (const auto& d : defs) {
+                                auto it = std::find_if(topts.tools.begin(), topts.tools.end(),
+                                                       [&](const rxinfer::ToolFunctionDef& e) { return e.name == d.name; });
+                                if (it != topts.tools.end()) *it = d;
+                                else topts.tools.push_back(d);
+                            }
+                        };
+                        if (sub.empty()) {
+                            if (topts.tools.empty()) {
+                                badge("info",
+                                      "No tools enabled — use '/tools builtin' or '/tools load <file.json>'",
+                                      "[No tools enabled. Use '/tools builtin' or '/tools load <file.json>']");
+                            } else if (theme.color) {
+                                std::vector<std::pair<std::string, std::string>> rows;
+                                rows.push_back({"Approval",
+                                                topts.tool_exec.allow_mutating ? "auto-approve mutating" : "confirm mutating"});
+                                rows.push_back({"Max rounds", std::to_string(topts.max_tool_rounds)});
+                                for (const auto& t : topts.tools) {
+                                    rows.push_back({t.name, truncate_inline_preview(t.description, 72)});
+                                }
+                                std::fprintf(stderr, "\n");
+                                const std::string title = std::string(theme.accent()) + "◆" + theme.reset() + " " +
+                                                          theme.bold() + "Active Tools" + theme.reset();
+                                rxinfer::tui::print_box_card(stderr, theme, title, rows, 92);
+                                std::fprintf(stderr, "\n");
+                            } else {
+                                std::fprintf(stderr, "[Tools (%zu, mutating=%s, max_rounds=%d)]\n",
+                                             topts.tools.size(),
+                                             topts.tool_exec.allow_mutating ? "auto-approve" : "confirm",
+                                             topts.max_tool_rounds);
+                                for (const auto& t : topts.tools) {
+                                    std::fprintf(stderr, "  - %s: %s\n", t.name.c_str(),
+                                                 truncate_inline_preview(t.description, 72).c_str());
+                                }
+                            }
+                        } else if (sub == "builtin") {
+                            merge_tools(rxinfer::tools::builtin_workspace_tools());
+                            topts.chat_mode = true;
+                            if (!state.is_first_turn || engine.position() > 0) {
+                                engine.unpin_prefix_checkpoints();
+                                state.reset_conversation(engine, sampler);
+                                badge("ok",
+                                      "Enabled built-in workspace tools (" + std::to_string(topts.tools.size()) +
+                                          ") · conversation reset to apply system prompt",
+                                      "[Enabled built-in workspace tools (" + std::to_string(topts.tools.size()) +
+                                          "); conversation reset]");
+                            } else {
+                                badge("ok",
+                                      "Enabled built-in workspace tools (" + std::to_string(topts.tools.size()) + ")",
+                                      "[Enabled built-in workspace tools (" + std::to_string(topts.tools.size()) + ")]");
+                            }
+                        } else if (sub == "load") {
+                            if (subarg.empty()) {
+                                badge("info", "Usage: /tools load <path.json>", "Usage: /tools load <path.json>");
+                            } else {
+                                auto defs = rxinfer::tools::load_tools_file(expand_user_path(subarg));
+                                merge_tools(defs);
+                                topts.chat_mode = true;
+                                if (!state.is_first_turn || engine.position() > 0) {
+                                    engine.unpin_prefix_checkpoints();
+                                    state.reset_conversation(engine, sampler);
+                                    badge("ok",
+                                          "Loaded " + std::to_string(defs.size()) + " tool(s) (" +
+                                              std::to_string(topts.tools.size()) + " total) · conversation reset",
+                                          "[Loaded " + std::to_string(defs.size()) + " tool(s); conversation reset]");
+                                } else {
+                                    badge("ok",
+                                          "Loaded " + std::to_string(defs.size()) + " tool(s) (" +
+                                              std::to_string(topts.tools.size()) + " total)",
+                                          "[Loaded " + std::to_string(defs.size()) + " tool(s)]");
+                                }
+                            }
+                        } else if (sub == "clear") {
+                            topts.tools.clear();
+                            if (!state.is_first_turn || engine.position() > 0) {
+                                engine.unpin_prefix_checkpoints();
+                                state.reset_conversation(engine, sampler);
+                                badge("ok", "Cleared tools · conversation reset", "[Cleared tools; conversation reset]");
+                            } else {
+                                badge("ok", "Cleared tools", "[Cleared tools]");
+                            }
+                        } else {
+                            badge("info", "Usage: /tools [builtin|load <path.json>|clear]",
+                                  "Usage: /tools [builtin|load <path.json>|clear]");
+                        }
+                    } else if (cmd == "/approve") {
+                        if (arg == "on" || arg == "1" || arg == "true") topts.tool_exec.allow_mutating = true;
+                        else if (arg == "off" || arg == "0" || arg == "false") topts.tool_exec.allow_mutating = false;
+                        else if (arg.empty()) topts.tool_exec.allow_mutating = !topts.tool_exec.allow_mutating;
+                        else {
+                            badge("info", "Usage: /approve [on|off]", "Usage: /approve [on|off]");
+                            continue;
+                        }
+                        badge("ok",
+                              std::string("Auto-approve mutating tools: ") +
+                                  (topts.tool_exec.allow_mutating ? "on" : "off"),
+                              std::string("[Auto-approve mutating tools: ") +
+                                  (topts.tool_exec.allow_mutating ? "on]" : "off]"));
+                    } else if (cmd == "/history") {
+                        if (state.messages.empty()) {
+                            badge("info", "No messages in structured history yet", "[No messages in structured history yet]");
+                        } else {
+                            std::fprintf(stderr, "\n");
+                            for (size_t mi = 0; mi < state.messages.size(); ++mi) {
+                                const auto& m = state.messages[mi];
+                                if (m.role == "assistant") {
+                                    std::fprintf(stderr, "  [%zu] assistant", mi);
+                                    if (!m.reasoning_content.empty()) {
+                                        std::fprintf(stderr, " | think(%zuB): \"%s\"", m.reasoning_content.size(),
+                                                     truncate_inline_preview(m.reasoning_content, 60).c_str());
+                                    }
+                                    if (!m.tool_calls.empty()) {
+                                        std::fprintf(stderr, " | tool_calls=%zu [", m.tool_calls.size());
+                                        for (size_t ti = 0; ti < m.tool_calls.size(); ++ti) {
+                                            if (ti > 0) std::fprintf(stderr, ", ");
+                                            std::fprintf(stderr, "%s", m.tool_calls[ti].name.c_str());
+                                        }
+                                        std::fprintf(stderr, "]");
+                                    }
+                                    if (!m.content.empty()) {
+                                        std::fprintf(stderr, " | text: \"%s\"",
+                                                     truncate_inline_preview(m.content, 60).c_str());
+                                    }
+                                    std::fprintf(stderr, "\n");
+                                } else if (m.role == "tool") {
+                                    std::fprintf(stderr, "  [%zu] tool(%s): \"%s\"\n", mi, m.name.c_str(),
+                                                 truncate_inline_preview(m.content, 72).c_str());
+                                } else {
+                                    std::fprintf(stderr, "  [%zu] %s: \"%s\"\n", mi, m.role.c_str(),
+                                                 truncate_inline_preview(m.content, 72).c_str());
+                                }
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
                     } else if (cmd == "/system") {
                         topts.system_prompt = arg;
                         engine.unpin_prefix_checkpoints();
                         state.reset_conversation(engine, sampler);
-                        std::fprintf(stderr, "[System prompt updated (%zu chars); conversation reset]\n",
-                                     topts.system_prompt.size());
+                        char mbuf[192], pbuf[192];
+                        std::snprintf(mbuf, sizeof(mbuf), "System prompt updated (%zu chars) · conversation reset",
+                                      topts.system_prompt.size());
+                        std::snprintf(pbuf, sizeof(pbuf), "[System prompt updated (%zu chars); conversation reset]",
+                                      topts.system_prompt.size());
+                        badge("ok", mbuf, pbuf);
                     } else if (cmd == "/temp") {
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[temp=%.3f]\n", sampler.config().temperature);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "temp = %.3f", sampler.config().temperature);
+                            std::snprintf(pbuf, sizeof(pbuf), "[temp=%.3f]", sampler.config().temperature);
+                            badge("info", mbuf, pbuf);
                         } else {
                             auto sc = sampler.config();
                             sc.temperature = std::stof(arg);
                             sampler.set_config(sc);
-                            std::fprintf(stderr, "[temp=%.3f (%s)]\n", sc.temperature,
-                                         sc.uses_host_logits() ? "host-sample" : "gpu-argmax");
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "temp = %.3f (%s)", sc.temperature,
+                                          sc.uses_host_logits() ? "host-sample" : "gpu-argmax");
+                            std::snprintf(pbuf, sizeof(pbuf), "[temp=%.3f (%s)]", sc.temperature,
+                                          sc.uses_host_logits() ? "host-sample" : "gpu-argmax");
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/top-k") {
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[top_k=%d]\n", sampler.config().top_k);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "top_k = %d", sampler.config().top_k);
+                            std::snprintf(pbuf, sizeof(pbuf), "[top_k=%d]", sampler.config().top_k);
+                            badge("info", mbuf, pbuf);
                         } else {
                             auto sc = sampler.config();
                             sc.top_k = std::stoi(arg);
                             sampler.set_config(sc);
-                            std::fprintf(stderr, "[top_k=%d]\n", sc.top_k);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "top_k = %d", sc.top_k);
+                            std::snprintf(pbuf, sizeof(pbuf), "[top_k=%d]", sc.top_k);
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/top-p") {
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[top_p=%.3f]\n", sampler.config().top_p);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "top_p = %.3f", sampler.config().top_p);
+                            std::snprintf(pbuf, sizeof(pbuf), "[top_p=%.3f]", sampler.config().top_p);
+                            badge("info", mbuf, pbuf);
                         } else {
                             auto sc = sampler.config();
                             sc.top_p = std::stof(arg);
                             sampler.set_config(sc);
-                            std::fprintf(stderr, "[top_p=%.3f]\n", sc.top_p);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "top_p = %.3f", sc.top_p);
+                            std::snprintf(pbuf, sizeof(pbuf), "[top_p=%.3f]", sc.top_p);
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/min-p") {
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[min_p=%.3f]\n", sampler.config().min_p);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "min_p = %.3f", sampler.config().min_p);
+                            std::snprintf(pbuf, sizeof(pbuf), "[min_p=%.3f]", sampler.config().min_p);
+                            badge("info", mbuf, pbuf);
                         } else {
                             auto sc = sampler.config();
                             sc.min_p = std::stof(arg);
                             sampler.set_config(sc);
-                            std::fprintf(stderr, "[min_p=%.3f]\n", sc.min_p);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "min_p = %.3f", sc.min_p);
+                            std::snprintf(pbuf, sizeof(pbuf), "[min_p=%.3f]", sc.min_p);
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/repeat-penalty") {
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[repeat_penalty=%.3f]\n", sampler.config().repeat_penalty);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "repeat_penalty = %.3f", sampler.config().repeat_penalty);
+                            std::snprintf(pbuf, sizeof(pbuf), "[repeat_penalty=%.3f]", sampler.config().repeat_penalty);
+                            badge("info", mbuf, pbuf);
                         } else {
                             auto sc = sampler.config();
                             sc.repeat_penalty = std::stof(arg);
                             sampler.set_config(sc);
-                            std::fprintf(stderr, "[repeat_penalty=%.3f]\n", sc.repeat_penalty);
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "repeat_penalty = %.3f", sc.repeat_penalty);
+                            std::snprintf(pbuf, sizeof(pbuf), "[repeat_penalty=%.3f]", sc.repeat_penalty);
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/max-tokens") {
+                        auto fmt_lim = [](int32_t v) -> std::string {
+                            return (v > 0) ? std::to_string(v) : "unlimited";
+                        };
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[max_tokens=%d]\n", topts.max_tokens);
+                            const std::string ls = fmt_lim(topts.max_tokens);
+                            badge("info", "max_tokens = " + ls, "[max_tokens=" + ls + "]");
+                        } else if (arg == "unlimited" || arg == "off" || arg == "none" || arg == "inf" ||
+                                   arg == "0" || arg == "-1") {
+                            topts.max_tokens = 0;
+                            badge("ok", "max_tokens = unlimited", "[max_tokens=unlimited]");
                         } else {
                             const int32_t v = std::stoi(arg);
-                            if (v < 1) {
-                                std::fprintf(stderr, "[max_tokens must be >= 1]\n");
+                            if (v < -1) {
+                                badge("warn", "max_tokens must be >= 0 (or 'unlimited')", "[max_tokens must be >= 0]");
                             } else {
                                 topts.max_tokens = v;
-                                std::fprintf(stderr, "[max_tokens=%d]\n", topts.max_tokens);
+                                const std::string ls = fmt_lim(topts.max_tokens);
+                                badge("ok", "max_tokens = " + ls, "[max_tokens=" + ls + "]");
                             }
                         }
                     } else if (cmd == "/seed") {
                         if (arg.empty()) {
-                            std::fprintf(stderr, "[seed=%llu]\n",
-                                         static_cast<unsigned long long>(sampler.config().seed));
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "seed = %llu",
+                                          static_cast<unsigned long long>(sampler.config().seed));
+                            std::snprintf(pbuf, sizeof(pbuf), "[seed=%llu]",
+                                          static_cast<unsigned long long>(sampler.config().seed));
+                            badge("info", mbuf, pbuf);
                         } else {
                             sampler.reseed(std::stoull(arg));
-                            std::fprintf(stderr, "[seed=%llu]\n",
-                                         static_cast<unsigned long long>(sampler.config().seed));
+                            char mbuf[96], pbuf[96];
+                            std::snprintf(mbuf, sizeof(mbuf), "seed = %llu",
+                                          static_cast<unsigned long long>(sampler.config().seed));
+                            std::snprintf(pbuf, sizeof(pbuf), "[seed=%llu]",
+                                          static_cast<unsigned long long>(sampler.config().seed));
+                            badge("ok", mbuf, pbuf);
                         }
                     } else if (cmd == "/bench") {
                         const int pre_len = std::min(512, std::max(32, max_seq_len / 2));
                         auto pre = engine.benchmark_prefill(pre_len, 1);
                         auto dec = engine.benchmark_decode(60, 8);
                         auto ver4 = engine.benchmark_verify(4, 30, 5);
-                        std::fprintf(stderr,
-                                     "[Benchmark | prefill(%d)=%.1f tok/s (%.1f ms) | decode(M=1)=%.2f tok/s (%.2f ms/tok) | verify(M=4)=%.2f tok/s]\n",
-                                     pre_len, pre.tok_per_sec, pre.elapsed_ms,
-                                     dec.tok_per_sec, dec.ms_per_tok, ver4.tok_per_sec);
-                        state.reset_conversation(engine, sampler);
-                        std::fprintf(stderr, "[Benchmark complete; conversation reset]\n");
+                        if (theme.color) {
+                            char r_pre[128], r_dec[128], r_ver[128];
+                            std::snprintf(r_pre, sizeof(r_pre), "%.1f tok/s (%.1f ms for %d tok)",
+                                          pre.tok_per_sec, pre.elapsed_ms, pre_len);
+                            std::snprintf(r_dec, sizeof(r_dec), "%s%.2f tok/s%s (%.2f ms/tok)",
+                                          theme.ok(), dec.tok_per_sec, theme.reset(), dec.ms_per_tok);
+                            std::snprintf(r_ver, sizeof(r_ver), "%.2f tok/s (M=4)", ver4.tok_per_sec);
+                            std::vector<std::pair<std::string, std::string>> rows = {
+                                {"Prefill", r_pre},
+                                {"Decode", r_dec},
+                                {"Verify", r_ver},
+                            };
+                            std::fprintf(stderr, "\n");
+                            const std::string title = std::string(theme.accent()) + "◆" + theme.reset() + " " +
+                                                      theme.bold() + "Benchmark" + theme.reset();
+                            rxinfer::tui::print_box_card(stderr, theme, title, rows, 76);
+                            state.reset_conversation(engine, sampler);
+                            rxinfer::tui::print_status_badge(stderr, theme, "info", "Conversation reset after benchmark");
+                        } else {
+                            std::fprintf(stderr,
+                                         "[Benchmark | prefill(%d)=%.1f tok/s (%.1f ms) | decode(M=1)=%.2f tok/s (%.2f ms/tok) | verify(M=4)=%.2f tok/s]\n",
+                                         pre_len, pre.tok_per_sec, pre.elapsed_ms,
+                                         dec.tok_per_sec, dec.ms_per_tok, ver4.tok_per_sec);
+                            state.reset_conversation(engine, sampler);
+                            std::fprintf(stderr, "[Benchmark complete; conversation reset]\n");
+                        }
                     } else {
-                        std::fprintf(stderr, "[Unknown command '%s'. Type /help for commands.]\n", cmd.c_str());
+                        const std::string sug = editor.suggest_command(cmd);
+                        if (!sug.empty()) {
+                            badge("warn",
+                                  "Unknown command '" + cmd + "' — did you mean " + sug + "? (type /help)",
+                                  "[Unknown command '" + cmd + "'. Did you mean '" + sug + "'? Type /help for commands.]");
+                        } else {
+                            badge("warn",
+                                  "Unknown command '" + cmd + "' — type /help for commands",
+                                  "[Unknown command '" + cmd + "'. Type /help for commands.]");
+                        }
                     }
                 } catch (const std::exception& ex) {
-                    std::fprintf(stderr, "[Command error: %s]\n", ex.what());
+                    badge("err", std::string("Command error: ") + ex.what(), std::string("[Command error: ") + ex.what() + "]");
                 }
                 continue;
             }
@@ -1808,27 +2858,40 @@ int main(int argc, char** argv) {
                 engine.save_prompt_cache(target);
                 const auto tsc1 = std::chrono::steady_clock::now();
                 if (!quiet) {
-                    std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
-                                 engine.position(), target.c_str(),
-                                 std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+                    const double ms = std::chrono::duration<double, std::milli>(tsc1 - tsc0).count();
+                    char mbuf[512], pbuf[512];
+                    std::snprintf(mbuf, sizeof(mbuf), "Saved prompt cache (%d tok) to %s in %s",
+                                  engine.position(), target.c_str(), rxinfer::tui::format_duration_compact(ms).c_str());
+                    std::snprintf(pbuf, sizeof(pbuf), "[Saved prompt cache (%d tok) to %s in %.1f ms]",
+                                  engine.position(), target.c_str(), ms);
+                    badge("ok", mbuf, pbuf);
                 }
             } else if (auto_prompt_cache && !auto_cache_dir.empty()) {
                 const auto tsc0 = std::chrono::steady_clock::now();
                 const std::string saved = save_to_auto_cache(auto_cache_dir, engine, quiet);
                 const auto tsc1 = std::chrono::steady_clock::now();
                 if (!saved.empty() && !quiet) {
-                    std::fprintf(stderr, "[Auto-cached session (%d tok) to %s in %.1f ms]\n",
-                                 engine.position(), saved.c_str(),
-                                 std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+                    const double ms = std::chrono::duration<double, std::milli>(tsc1 - tsc0).count();
+                    char mbuf[512], pbuf[512];
+                    std::snprintf(mbuf, sizeof(mbuf), "Auto-cached session (%d tok) in %s",
+                                  engine.position(), rxinfer::tui::format_duration_compact(ms).c_str());
+                    std::snprintf(pbuf, sizeof(pbuf), "[Auto-cached session (%d tok) to %s in %.1f ms]",
+                                  engine.position(), saved.c_str(), ms);
+                    badge("info", mbuf, pbuf);
                 }
             } else if (!prompt_cache_path.empty()) {
                 const auto tsc0 = std::chrono::steady_clock::now();
                 engine.save_prompt_cache(prompt_cache_path);
                 const auto tsc1 = std::chrono::steady_clock::now();
                 if (!quiet) {
-                    std::fprintf(stderr, "[Saved prompt cache (%d tok) to %s in %.1f ms]\n",
-                                 engine.position(), prompt_cache_path.c_str(),
-                                 std::chrono::duration<double, std::milli>(tsc1 - tsc0).count());
+                    const double ms = std::chrono::duration<double, std::milli>(tsc1 - tsc0).count();
+                    char mbuf[512], pbuf[512];
+                    std::snprintf(mbuf, sizeof(mbuf), "Saved prompt cache (%d tok) to %s in %s",
+                                  engine.position(), prompt_cache_path.c_str(),
+                                  rxinfer::tui::format_duration_compact(ms).c_str());
+                    std::snprintf(pbuf, sizeof(pbuf), "[Saved prompt cache (%d tok) to %s in %.1f ms]",
+                                  engine.position(), prompt_cache_path.c_str(), ms);
+                    badge("ok", mbuf, pbuf);
                 }
             }
         }
@@ -1836,12 +2899,22 @@ int main(int argc, char** argv) {
         if (!quiet && interactive && state.turns > 0) {
             const double sess_decode_tps =
                 (state.total_decode_ms > 0.0) ? (state.total_decode_calls * 1000.0 / state.total_decode_ms) : 0.0;
-            std::fprintf(stderr,
-                         "[Session: %d turns | prompt=%lld tok | gen=%lld tok | avg decode=%.2f tok/s]\n",
-                         state.turns,
-                         static_cast<long long>(state.total_prompt_tokens),
-                         static_cast<long long>(state.total_generated_tokens),
-                         sess_decode_tps);
+            if (theme.color) {
+                char mbuf[256];
+                std::snprintf(mbuf, sizeof(mbuf), "Session ended · %d turn%s · %lld prompt + %lld gen tok · avg %.2f tok/s",
+                              state.turns, state.turns == 1 ? "" : "s",
+                              static_cast<long long>(state.total_prompt_tokens),
+                              static_cast<long long>(state.total_generated_tokens),
+                              sess_decode_tps);
+                rxinfer::tui::print_status_badge(stderr, theme, "info", mbuf);
+            } else {
+                std::fprintf(stderr,
+                             "[Session: %d turns | prompt=%lld tok | gen=%lld tok | avg decode=%.2f tok/s]\n",
+                             state.turns,
+                             static_cast<long long>(state.total_prompt_tokens),
+                             static_cast<long long>(state.total_generated_tokens),
+                             sess_decode_tps);
+            }
         }
 
         return 0;
